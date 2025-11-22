@@ -1,0 +1,449 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================
+//  USER & ROLE MANAGEMENT
+// =====================================================
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  password  String
+  role      Role
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Manager relations
+  properties  Property[]
+  todos       ToDo[]
+  commissions ManagerCommission[] // Manager's commission earnings
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+}
+
+// =====================================================
+//  LANDLORD (CLIENTS) — Represent property owners
+// =====================================================
+
+model Landlord {
+  id         String     @id @default(uuid())
+  name       String
+  email      String?
+  phone      String?
+  address    String?
+  properties Property[]
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+}
+
+// =====================================================
+//  PROPERTY MANAGEMENT
+// =====================================================
+
+model Property {
+  id            String       @id @default(uuid())
+  name          String
+  address       String
+  lrNumber      String?
+  form          PropertyForm
+  usage         UsageType
+  landlordId    String?
+  landlord      Landlord?    @relation(fields: [landlordId], references: [id])
+  managerId     String?
+  manager       User?        @relation(fields: [managerId], references: [id])
+  commissionFee Float? // Manager's commission percentage for this property
+  image         String? // URL or path to property image
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  units            Unit[]
+  serviceProviders ServiceProvider[]
+  leads            Lead[]
+  incomes          Income[]
+  commissions      ManagerCommission[] // Commission records for this property
+}
+
+enum PropertyForm {
+  APARTMENT
+  BUNGALOW
+  VILLA
+  OFFICE
+  SHOP
+  DUPLEX
+  TOWNHOUSE
+  MAISONETTE
+  WAREHOUSE
+  INDUSTRIAL_BUILDING
+  RETAIL_CENTER
+}
+
+enum UsageType {
+  RESIDENTIAL
+  COMMERCIAL
+  INDUSTRIAL
+  INSTITUTIONAL
+  MIXED_USE
+}
+
+// =====================================================
+//  MANAGER COMMISSION TRACKING
+// =====================================================
+
+model ManagerCommission {
+  id               String           @id @default(uuid())
+  propertyId       String
+  property         Property         @relation(fields: [propertyId], references: [id])
+  managerId        String
+  manager          User             @relation(fields: [managerId], references: [id])
+  commissionFee    Float // Commission percentage for this property
+  incomeAmount     Float // Total income amount that commission is calculated from
+  commissionAmount Float // Actual commission earned (incomeAmount * commissionFee / 100)
+  periodStart      DateTime // Start of commission period (e.g., start of month)
+  periodEnd        DateTime // End of commission period (e.g., end of month)
+  status           CommissionStatus @default(PENDING)
+  paidDate         DateTime? // When commission was actually paid to manager
+  notes            String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@unique([managerId, propertyId, periodStart, periodEnd])
+  @@index([managerId, periodStart, periodEnd])
+  @@index([propertyId, periodStart, periodEnd])
+}
+
+enum CommissionStatus {
+  PENDING // Commission calculated but not yet paid
+  PAID // Commission has been paid to manager
+  PROCESSING // Commission is being processed for payment
+  CANCELLED // Commission was cancelled
+}
+
+// =====================================================
+//  UNIT & TENANT MANAGEMENT
+// =====================================================
+
+model Unit {
+  id         String     @id @default(uuid())
+  propertyId String
+  property   Property   @relation(fields: [propertyId], references: [id])
+  bedrooms   Int
+  bathrooms  Int
+  sizeSqFt   Int
+  type       String?
+  status     UnitStatus
+  rentType   RentType
+  rentAmount Float
+  tenant     Tenant?
+}
+
+enum UnitStatus {
+  VACANT
+  OCCUPIED
+}
+
+enum RentType {
+  // Standard Types
+  FIXED // Fixed total amount (e.g., ksh: 15000/month)
+  PER_SQFT // Price per square foot (e.g., $2.50/sqft → $2,500 for 1,000 sqft)
+
+  // Tiered & Dynamic Models
+  TIERED // Rent changes based on usage or occupancy tiers (e.g., base + extra for utilities or guests)
+  GRADUATED // Scheduled rent increases over time (e.g., +3% yearly)
+  INDEXED // Tied to an economic index (e.g., CPI, inflation)
+  PERCENT_OF_REVENUE // Common in retail: rent = % of tenant's gross sales
+
+  // Occupancy-Based
+  PER_ROOM // Common in shared housing or student accommodations
+  PER_OCCUPANT // Rent scales with number of tenants
+  PER_BED // Used in dorms, hostels, or shared housing
+
+  // Time-Based Flexibility
+  DAILY // Short-term/daily rate (e.g., vacation rentals)
+  WEEKLY // Weekly billing cycle
+  MONTHLY // Standard monthly (often used with FIXED, but can be explicit)
+  ANNUAL // Annual lump sum (common in commercial leases)
+
+  // Hybrid or Special
+  NEGOTIATED // Custom or non-standard agreement (e.g., barter, deferred payment)
+  PARTIAL_SUBSIDY // Partially subsidized (e.g., government or employer-assisted)
+  VARIABLE // Adjusts monthly based on market or internal policy
+}
+
+model Tenant {
+  id                  String               @id @default(uuid())
+  fullName            String
+  contact             String
+  KRAPin              String               @unique
+  POBox               String?
+  unitId              String               @unique
+  unit                Unit                 @relation(fields: [unitId], references: [id])
+  leaseTerm           String
+  rent                Float
+  escalationRate      Float? // e.g., 5.0 for 5%
+  escalationFrequency EscalationFrequency? // ANNUALLY or BI_ANNUALLY
+  termStart           DateTime
+  rentStart           DateTime
+  deposit             Float
+  serviceCharge       ServiceCharge?
+  paymentPolicy       PaymentPolicy
+  paymentReports      PaymentReport[]
+  incomes             Income[]
+  invoices            Invoice[]
+  bills               Bill[]
+}
+
+enum EscalationFrequency {
+  ANNUALLY
+  BI_ANNUALLY // underscores used since hyphens are invalid in enum names
+}
+
+// Service charge configuration
+model ServiceCharge {
+  id          String            @id @default(uuid())
+  tenantId    String            @unique
+  tenant      Tenant            @relation(fields: [tenantId], references: [id])
+  type        ServiceChargeType
+  fixedAmount Float? // Fixed amount (if type is FIXED)
+  percentage  Float? // Percentage of rent (if type is PERCENTAGE)
+  perSqFtRate Float? // Rate per square foot (if type is PER_SQ_FT)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+}
+
+enum ServiceChargeType {
+  FIXED
+  PERCENTAGE
+  PER_SQ_FT
+}
+
+enum PaymentPolicy {
+  MONTHLY
+  QUARTERLY
+  ANNUAL
+}
+
+// =====================================================
+//  FINANCIALS & PAYMENTS
+// =====================================================
+
+model PaymentReport {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  // Expected charges
+  rent          Float // Expected rent for the billing period
+  serviceCharge Float? // Optional service charge for shared services
+  vat           Float? // Value Added Tax (if applicable)
+  totalDue      Float // Total expected amount (rent + serviceCharge + vat)
+
+  // Payment details
+  amountPaid    Float // Actual amount paid by tenant
+  arrears       Float // Outstanding balance (totalDue - amountPaid)
+  status        PaymentStatus @default(UNPAID) // Payment state (PAID, PARTIAL, UNPAID)
+  paymentPeriod DateTime // Period this payment corresponds to (e.g. November 2025)
+  datePaid      DateTime      @default(now())
+  notes         String?
+  invoices      Invoice[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// -----------------------------------------------
+//  ENUM FOR PAYMENT STATUS
+// -----------------------------------------------
+enum PaymentStatus {
+  PAID // Fully settled
+  PARTIAL // Partially paid (some arrears remain)
+  UNPAID // No payment made for the period
+}
+
+model Income {
+  id         String          @id @default(uuid())
+  propertyId String?
+  tenantId   String?
+  property   Property?       @relation(fields: [propertyId], references: [id])
+  tenant     Tenant?         @relation(fields: [tenantId], references: [id])
+  amount     Float
+  frequency  IncomeFrequency
+  createdAt  DateTime        @default(now())
+}
+
+enum IncomeFrequency {
+  MONTHLY
+  QUARTERLY
+  ANNUAL
+}
+
+model Invoice {
+  id              String         @id @default(cuid())
+  invoiceNumber   String         @unique // Format: INV-YYYY-MM-XXXXXX
+  tenantId        String
+  tenant          Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  paymentReportId String?
+  paymentReport   PaymentReport? @relation(fields: [paymentReportId], references: [id])
+
+  // Invoice Details
+  issueDate     DateTime @default(now())
+  dueDate       DateTime
+  paymentPeriod String // e.g., "January 2024"
+
+  // Financial Details
+  rent          Float
+  serviceCharge Float? @default(0)
+  vat           Float? @default(0)
+  totalDue      Float
+  amountPaid    Float  @default(0)
+  balance       Float
+
+  // Status
+  status InvoiceStatus @default(UNPAID)
+
+  // PDF Storage
+  pdfUrl String?
+
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([invoiceNumber])
+  @@index([status])
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+// =====================================================
+//  OPERATIONS & SERVICE PROVIDERS
+// =====================================================
+
+model ServiceProvider {
+  id              String          @id @default(uuid())
+  propertyId      String
+  property        Property        @relation(fields: [propertyId], references: [id])
+  name            String
+  contact         String?
+  contractPeriod  String?
+  serviceContract String?
+  chargeAmount    Float // Base charge for the service (e.g., monthly fee)
+  chargeFrequency ChargeFrequency @default(MONTHLY)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+enum ChargeFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  ANNUAL
+}
+
+//Bills based on tenant
+model Bill {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  type            BillType // e.g., WATER, ELECTRICITY
+  description     String? // Optional human-readable note
+  previousReading Float // e.g., 1200 kWh or m³
+  currentReading  Float // e.g., 1250 kWh or m³
+  units           Float    @default(0) // Computed as currentReading - previousReading
+  chargePerUnit   Float // e.g., KES 25 per kWh or m³
+  totalAmount     Float // Computed: units * chargePerUnit
+  vatRate         Float? // e.g., 16.0 for 16% — optional
+  vatAmount       Float? // Computed: totalAmount * (vatRate / 100)
+  grandTotal      Float // totalAmount + vatAmount (or just totalAmount if no VAT)
+
+  amountPaid   Float     @default(0)
+  status   BillStatus @default(UNPAID)
+  issuedAt DateTime   @default(now())
+  dueDate  DateTime?
+  paidAt   DateTime?
+  notes    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([type, status])
+  @@index([issuedAt])
+}
+
+enum BillType {
+  WATER
+  ELECTRICITY
+}
+
+enum BillStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+// =====================================================
+//  MARKETING / LEADS
+// =====================================================
+
+model Lead {
+  id           String    @id @default(uuid())
+  name         String
+  phone        String
+  address      String?
+  natureOfLead String?
+  notes        String?
+  propertyId   String?
+  property     Property? @relation(fields: [propertyId], references: [id])
+  createdAt    DateTime  @default(now())
+}
+
+// =====================================================
+//  TASK MANAGEMENT (To-Do for Managers/Admins)
+// =====================================================
+
+model ToDo {
+  id          String     @id @default(uuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  title       String
+  description String?
+  status      ToDoStatus @default(PENDING)
+  dueDate     DateTime?
+  createdAt   DateTime   @default(now())
+}
+
+enum ToDoStatus {
+  PENDING
+  COMPLETED
+}
+
+// =====================================================
+//  ANNOUNCEMENTS / NEWS
+// =====================================================
+
+model News {
+  id          String   @id @default(uuid())
+  title       String
+  content     String
+  publishedAt DateTime @default(now())
+}
