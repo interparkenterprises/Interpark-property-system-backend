@@ -3,6 +3,19 @@ import { calculateEscalatedRent, getRentSchedule } from '../services/rentCalcula
 
 const prisma = new PrismaClient();
 
+// Helper function to update unit rent amount
+const updateUnitRent = async (unitId, newRent) => {
+  try {
+    await prisma.unit.update({
+      where: { id: unitId },
+      data: { rentAmount: parseFloat(newRent) }
+    });
+  } catch (error) {
+    console.error('Error updating unit rent:', error);
+    throw new Error('Failed to update unit rent amount');
+  }
+};
+
 // @desc    Get all tenants
 // @route   GET /api/tenants
 // @access  Private
@@ -50,7 +63,7 @@ export const getTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    //  Calculate escalated rent and schedule
+    // Calculate escalated rent and schedule
     const rentInfo = calculateEscalatedRent(tenant);
     const rentSchedule = getRentSchedule(tenant, 3); // next 3 escalations
 
@@ -78,19 +91,21 @@ export const createTenant = async (req, res) => {
       unitId,
       leaseTerm,
       rent,
-      escalationRate,        //  Updated field name
-      escalationFrequency,   //  New enum field
+      escalationRate,
+      escalationFrequency,
       termStart,
       rentStart,
       deposit,
       paymentPolicy,
+      vatRate,
+      vatType,
       serviceCharge
     } = req.body;
 
     // Validate required fields
     if (!fullName || !contact || !KRAPin || !unitId || !leaseTerm || rent == null || !termStart || !rentStart || deposit == null || !paymentPolicy) {
       return res.status(400).json({
-        message: 'All fields except POBox, escalationRate, escalationFrequency, and serviceCharge are required.'
+        message: 'All fields except POBox, escalationRate, escalationFrequency, vatRate, vatType, and serviceCharge are required.'
       });
     }
 
@@ -115,6 +130,34 @@ export const createTenant = async (req, res) => {
       }
     }
 
+    // Validate VAT type if provided
+    let normalizedVatType = 'NOT_APPLICABLE';
+    if (vatType !== undefined && vatType !== null) {
+      const validVatTypes = ['INCLUSIVE', 'EXCLUSIVE', 'NOT_APPLICABLE'];
+      normalizedVatType = vatType.toUpperCase();
+      if (!validVatTypes.includes(normalizedVatType)) {
+        return res.status(400).json({
+          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(', ')}`
+        });
+      }
+    }
+
+    // Validate VAT rate
+    let parsedVatRate = 0;
+    if (vatRate !== undefined && vatRate !== null) {
+      parsedVatRate = parseFloat(vatRate);
+      if (isNaN(parsedVatRate) || parsedVatRate < 0 || parsedVatRate > 100) {
+        return res.status(400).json({
+          message: 'VAT rate must be a number between 0 and 100'
+        });
+      }
+    }
+
+    // If VAT type is NOT_APPLICABLE, force vatRate to 0
+    if (normalizedVatType === 'NOT_APPLICABLE') {
+      parsedVatRate = 0;
+    }
+
     // Check if KRA Pin is unique
     const existingKRA = await prisma.tenant.findUnique({
       where: { KRAPin }
@@ -134,6 +177,9 @@ export const createTenant = async (req, res) => {
       return res.status(400).json({ message: 'Unit is already occupied' });
     }
 
+    // Parse rent amount
+    const parsedRent = parseFloat(rent);
+
     // Build tenant data
     const tenantData = {
       fullName,
@@ -142,13 +188,15 @@ export const createTenant = async (req, res) => {
       POBox: POBox || null,
       unitId,
       leaseTerm,
-      rent: parseFloat(rent),
+      rent: parsedRent,
       escalationRate: escalationRate != null ? parseFloat(escalationRate) : null,
-      escalationFrequency: normalizedEscalationFrequency, // null if not provided
+      escalationFrequency: normalizedEscalationFrequency,
       termStart: new Date(termStart),
       rentStart: new Date(rentStart),
       deposit: parseFloat(deposit),
-      paymentPolicy: normalizedPaymentPolicy
+      paymentPolicy: normalizedPaymentPolicy,
+      vatRate: parsedVatRate,
+      vatType: normalizedVatType
     };
 
     // Create tenant
@@ -162,6 +210,15 @@ export const createTenant = async (req, res) => {
       }
     });
 
+    // Update unit rent amount to match tenant's rent and set status to OCCUPIED
+    await prisma.unit.update({
+      where: { id: unitId },
+      data: { 
+        rentAmount: parsedRent,
+        status: 'OCCUPIED'
+      }
+    });
+
     // Handle service charge if provided
     if (serviceCharge) {
       const { type, fixedAmount, percentage, perSqFtRate } = serviceCharge;
@@ -172,7 +229,13 @@ export const createTenant = async (req, res) => {
       if (!normalizedType || !validServiceChargeTypes.includes(normalizedType)) {
         // Clean up on failure
         await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ where: { id: unitId }, data: { status: 'VACANT' } });
+        await prisma.unit.update({ 
+          where: { id: unitId }, 
+          data: { 
+            status: 'VACANT',
+            rentAmount: unit.rentAmount // Restore original rent amount
+          } 
+        });
         return res.status(400).json({
           message: `Invalid service charge type. Must be one of: ${validServiceChargeTypes.join(', ')}`
         });
@@ -181,19 +244,37 @@ export const createTenant = async (req, res) => {
       // Validate values by type
       if (normalizedType === 'FIXED' && (!fixedAmount || parseFloat(fixedAmount) <= 0)) {
         await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ where: { id: unitId }, data: { status: 'VACANT' } });
+        await prisma.unit.update({ 
+          where: { id: unitId }, 
+          data: { 
+            status: 'VACANT',
+            rentAmount: unit.rentAmount // Restore original rent amount
+          } 
+        });
         return res.status(400).json({ message: 'Fixed amount (> 0) is required for FIXED service charge' });
       }
 
       if (normalizedType === 'PERCENTAGE' && (!percentage || parseFloat(percentage) <= 0)) {
         await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ where: { id: unitId }, data: { status: 'VACANT' } });
+        await prisma.unit.update({ 
+          where: { id: unitId }, 
+          data: { 
+            status: 'VACANT',
+            rentAmount: unit.rentAmount // Restore original rent amount
+          } 
+        });
         return res.status(400).json({ message: 'Percentage (> 0) is required for PERCENTAGE service charge' });
       }
 
       if (normalizedType === 'PER_SQ_FT' && (!perSqFtRate || parseFloat(perSqFtRate) <= 0)) {
         await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ where: { id: unitId }, data: { status: 'VACANT' } });
+        await prisma.unit.update({ 
+          where: { id: unitId }, 
+          data: { 
+            status: 'VACANT',
+            rentAmount: unit.rentAmount // Restore original rent amount
+          } 
+        });
         return res.status(400).json({ message: 'Per sq. ft rate (> 0) is required for PER_SQ_FT service charge' });
       }
 
@@ -209,12 +290,6 @@ export const createTenant = async (req, res) => {
       });
     }
 
-    // Update unit status to OCCUPIED
-    await prisma.unit.update({
-      where: { id: unitId },
-      data: { status: 'OCCUPIED' }
-    });
-
     // Return full tenant with relations
     const completeTenant = await prisma.tenant.findUnique({
       where: { id: tenant.id },
@@ -227,7 +302,6 @@ export const createTenant = async (req, res) => {
     res.status(201).json(completeTenant);
   } catch (error) {
     console.error('Create tenant error:', error);
-    // Optional: rollback unit status if tenant creation failed partially
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
@@ -250,13 +324,18 @@ export const updateTenant = async (req, res) => {
       rentStart,
       deposit,
       paymentPolicy,
+      vatRate,
+      vatType,
       serviceCharge
     } = req.body;
 
     // Fetch existing tenant
     const existingTenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
-      include: { serviceCharge: true }
+      include: { 
+        serviceCharge: true,
+        unit: true 
+      }
     });
 
     if (!existingTenant) {
@@ -299,6 +378,49 @@ export const updateTenant = async (req, res) => {
       }
     }
 
+    // Validate VAT type
+    let normalizedVatType = undefined;
+    if (vatType !== undefined) {
+      const validVatTypes = ['INCLUSIVE', 'EXCLUSIVE', 'NOT_APPLICABLE'];
+      normalizedVatType = vatType.toUpperCase();
+      if (!validVatTypes.includes(normalizedVatType)) {
+        return res.status(400).json({
+          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(', ')}`
+        });
+      }
+    }
+
+    // Validate VAT rate
+    let parsedVatRate = undefined;
+    if (vatRate !== undefined) {
+      if (vatRate === null) {
+        parsedVatRate = 0;
+      } else {
+        parsedVatRate = parseFloat(vatRate);
+        if (isNaN(parsedVatRate) || parsedVatRate < 0 || parsedVatRate > 100) {
+          return res.status(400).json({
+            message: 'VAT rate must be a number between 0 and 100'
+          });
+        }
+      }
+    }
+
+    // If VAT type is being changed to NOT_APPLICABLE, force vatRate to 0
+    if (normalizedVatType === 'NOT_APPLICABLE') {
+      parsedVatRate = 0;
+    }
+
+    // Parse rent amount if provided
+    let parsedRent = undefined;
+    if (rent !== undefined) {
+      parsedRent = parseFloat(rent);
+      if (isNaN(parsedRent) || parsedRent < 0) {
+        return res.status(400).json({
+          message: 'Rent must be a positive number'
+        });
+      }
+    }
+
     // Parse numeric fields conditionally
     const updateData = {
       fullName,
@@ -306,15 +428,17 @@ export const updateTenant = async (req, res) => {
       KRAPin,
       POBox,
       leaseTerm,
-      rent: rent != null ? parseFloat(rent) : undefined,
+      rent: parsedRent,
       escalationRate: escalationRate != null 
         ? (escalationRate === null ? null : parseFloat(escalationRate)) 
         : undefined,
-      escalationFrequency: normalizedEscalationFrequency, // could be string, null, or undefined
+      escalationFrequency: normalizedEscalationFrequency,
       termStart: termStart ? new Date(termStart) : undefined,
       rentStart: rentStart ? new Date(rentStart) : undefined,
       deposit: deposit != null ? parseFloat(deposit) : undefined,
-      paymentPolicy: normalizedPaymentPolicy
+      paymentPolicy: normalizedPaymentPolicy,
+      vatRate: parsedVatRate,
+      vatType: normalizedVatType
     };
 
     // Remove undefined fields to avoid overwriting with null/undefined
@@ -324,7 +448,7 @@ export const updateTenant = async (req, res) => {
       }
     });
 
-    // Perform update
+    // Perform tenant update
     const updatedTenant = await prisma.tenant.update({
       where: { id: req.params.id },
       data: updateData,
@@ -333,6 +457,11 @@ export const updateTenant = async (req, res) => {
         serviceCharge: true
       }
     });
+
+    // If rent was updated, also update the unit's rentAmount
+    if (rent !== undefined && parsedRent !== existingTenant.rent) {
+      await updateUnitRent(existingTenant.unitId, parsedRent);
+    }
 
     // Handle service charge update or creation
     if (serviceCharge) {
@@ -415,6 +544,9 @@ export const deleteTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
+    // Store the unit's original rent amount before tenant deletion
+    const originalUnitRent = tenant.unit.rentAmount;
+
     // Delete service charge if exists
     if (tenant.serviceCharge) {
       await prisma.serviceCharge.delete({
@@ -422,10 +554,13 @@ export const deleteTenant = async (req, res) => {
       });
     }
 
-    // Update unit status to vacant
+    // Update unit status to vacant and restore original rent amount
     await prisma.unit.update({
       where: { id: tenant.unitId },
-      data: { status: 'VACANT' }
+      data: { 
+        status: 'VACANT',
+        rentAmount: originalUnitRent // Restore the unit's original rent amount
+      }
     });
 
     await prisma.tenant.delete({

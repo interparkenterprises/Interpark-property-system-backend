@@ -6,7 +6,9 @@ import {
   getCommissionStats,
   getCommissionById,
   updateCommissionStatus,
-  getCommissionsByProperty
+  getCommissionsByProperty,
+  markAsProcessing,
+  markAsPaid
 } from '../controllers/commission.controller.js';
 
 const router = express.Router();
@@ -28,5 +30,10 @@ router.get('/:id', getCommissionById);
 
 // Update commission status (admin only)
 router.patch('/:id', authorize('ADMIN'), updateCommissionStatus);
+
+// Mark commission as processsing
+router.patch('/:id/processing', authorize('ADMIN', 'MANAGER'), markAsProcessing);
+// Mark commission as paid
+router.patch('/:id/paid', authorize('ADMIN', 'MANAGER'), markAsPaid);
 
 export default router;

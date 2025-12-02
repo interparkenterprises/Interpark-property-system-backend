@@ -41,7 +41,9 @@ model Landlord {
   email      String?
   phone      String?
   address    String?
+  idNumber      String? 
   properties Property[]
+  offerLetters    OfferLetter[]
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
 }
@@ -58,20 +60,30 @@ model Property {
   form          PropertyForm
   usage         UsageType
   landlordId    String?
-  landlord      Landlord?    @relation(fields: [landlordId], references: [id])
+  landlord      Landlord? @relation(fields: [landlordId], references: [id])
   managerId     String?
-  manager       User?        @relation(fields: [managerId], references: [id])
-  commissionFee Float? // Manager's commission percentage for this property
-  image         String? // URL or path to property image
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  manager       User? @relation(fields: [managerId], references: [id])
+  commissionFee Float?
+  image         String?
 
-  units            Unit[]
+  // Bank fields inline
+  accountNo     String?
+  accountName   String?
+  bank          String?
+  branch        String?
+  branchCode    String?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  units          Unit[]
   serviceProviders ServiceProvider[]
-  leads            Lead[]
-  incomes          Income[]
-  commissions      ManagerCommission[] // Commission records for this property
+  leads          Lead[]
+  incomes        Income[]
+  commissions    ManagerCommission[]
+  offerLetters   OfferLetter[]
 }
+
 
 enum PropertyForm {
   APARTMENT
@@ -136,14 +148,35 @@ model Unit {
   id         String     @id @default(uuid())
   propertyId String
   property   Property   @relation(fields: [propertyId], references: [id])
-  bedrooms   Int
-  bathrooms  Int
-  sizeSqFt   Int
-  type       String?
-  status     UnitStatus
+  unitNo     String?    // Unit number/identifier (e.g., "7", "A-12")
+  floor      String?    // Floor level (e.g., "3rd Floor", "Ground Floor", "Basement")
+  
+  // Unit specifications based on usage type
+  unitType   UnitType   // RESIDENTIAL or COMMERCIAL (for mixed-use properties)
+  
+  // Commercial-specific field - free text input for business type
+  usage      String?    // Type of business for commercial units (e.g., "Boutique", "Cosmetic shop", "Bank", etc.)
+  
+  // Residential-specific fields
+  bedrooms   Int?       // Only applicable for residential units
+  bathrooms  Int?       // Only applicable for residential units
+  
+  // Size field (applicable to all units)
+  sizeSqFt   Int        // Size in square feet
+  
+  // Common fields
+  type       String?    // General unit type description
+  status     UnitStatus @default(VACANT)
   rentType   RentType
   rentAmount Float
   tenant     Tenant?
+  offerLetters    OfferLetter[]
+}
+
+
+enum UnitType {
+  RESIDENTIAL
+  COMMERCIAL
 }
 
 enum UnitStatus {
@@ -194,19 +227,33 @@ model Tenant {
   termStart           DateTime
   rentStart           DateTime
   deposit             Float
+  
+  // VAT Configuration
+  vatRate             Float?               @default(0) // VAT percentage (e.g., 16.0 for 16%)
+  vatType             VATType              @default(NOT_APPLICABLE) // INCLUSIVE, EXCLUSIVE, or NOT_APPLICABLE
+  
   serviceCharge       ServiceCharge?
   paymentPolicy       PaymentPolicy
   paymentReports      PaymentReport[]
   incomes             Income[]
   invoices            Invoice[]
   bills               Bill[]
+  billInvoices        BillInvoice[]
+  
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+}
+
+enum VATType {
+  INCLUSIVE       // VAT is included in the rent amount
+  EXCLUSIVE       // VAT is added on top of rent amount
+  NOT_APPLICABLE  // No VAT applies (vatRate = 0)
 }
 
 enum EscalationFrequency {
   ANNUALLY
-  BI_ANNUALLY // underscores used since hyphens are invalid in enum names
+  BI_ANNUALLY
 }
-
 // Service charge configuration
 model ServiceCharge {
   id          String            @id @default(uuid())
@@ -239,7 +286,7 @@ enum PaymentPolicy {
 model PaymentReport {
   id       String @id @default(uuid())
   tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   // Expected charges
   rent          Float // Expected rent for the billing period
@@ -255,6 +302,7 @@ model PaymentReport {
   datePaid      DateTime      @default(now())
   notes         String?
   invoices      Invoice[]
+  billInvoices  BillInvoice[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -330,6 +378,57 @@ enum InvoiceStatus {
   CANCELLED
 }
 
+model BillInvoice {
+  id                  String        @id @default(uuid())
+  invoiceNumber       String        @unique // Format: BILL-INV-YYYY-MM-XXXXXX
+  
+  // Bill Reference
+  billId              String
+  bill                Bill          @relation(fields: [billId], references: [id], onDelete: Cascade)
+  billReferenceNumber String        // Reference to original bill number
+  billReferenceDate   DateTime      // Date when bill was issued
+  
+  // Tenant Reference
+  tenantId            String
+  tenant              Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Payment Report Reference
+  paymentReportId     String?
+  paymentReport       PaymentReport? @relation(fields: [paymentReportId], references: [id])
+  
+  // Invoice Details
+  issueDate           DateTime      @default(now())
+  dueDate             DateTime      // When payment is expected
+  
+  // Financial Details (copied from bill for historical record)
+  billType            BillType
+  previousReading     Float
+  currentReading      Float
+  units               Float
+  chargePerUnit       Float
+  totalAmount         Float
+  vatRate             Float?
+  vatAmount           Float?
+  grandTotal          Float
+  
+  // Payment tracking
+  amountPaid          Float         @default(0)
+  balance             Float
+  status              InvoiceStatus @default(UNPAID)
+  
+  // PDF Storage
+  pdfUrl              String?
+  
+  notes               String?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  
+  @@index([billId])
+  @@index([tenantId])
+  @@index([invoiceNumber])
+  @@index([status])
+  @@index([billReferenceNumber])
+}
+
 // =====================================================
 //  OPERATIONS & SERVICE PROVIDERS
 // =====================================================
@@ -360,7 +459,7 @@ enum ChargeFrequency {
 model Bill {
   id       String @id @default(uuid())
   tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   type            BillType // e.g., WATER, ELECTRICITY
   description     String? // Optional human-readable note
@@ -372,6 +471,8 @@ model Bill {
   vatRate         Float? // e.g., 16.0 for 16% — optional
   vatAmount       Float? // Computed: totalAmount * (vatRate / 100)
   grandTotal      Float // totalAmount + vatAmount (or just totalAmount if no VAT)
+
+  billInvoices BillInvoice[] 
 
   amountPaid   Float     @default(0)
   status   BillStatus @default(UNPAID)
@@ -406,16 +507,83 @@ enum BillStatus {
 // =====================================================
 
 model Lead {
-  id           String    @id @default(uuid())
+  id           String        @id @default(uuid())
   name         String
+  email        String?       // Added email field
   phone        String
   address      String?
+  idNumber      String?  // ADD THIS - For ID number
+  companyName   String? 
   natureOfLead String?
   notes        String?
   propertyId   String?
-  property     Property? @relation(fields: [propertyId], references: [id])
-  createdAt    DateTime  @default(now())
+  property     Property?     @relation(fields: [propertyId], references: [id])
+  offerLetters OfferLetter[] // Relation to offer letters
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
 }
+
+//  OFFER LETTER MANAGEMENT
+// =====================================================
+
+model OfferLetter {
+  id              String   @id @default(uuid())
+  offerNumber     String   @unique
+  
+  leadId          String
+  lead            Lead @relation(fields: [leadId], references: [id])
+  
+  propertyId      String
+  property        Property @relation(fields: [propertyId], references: [id])
+  
+  unitId          String?
+  unit            Unit? @relation(fields: [unitId], references: [id])
+  
+  landlordId      String
+  landlord        Landlord @relation(fields: [landlordId], references: [id])
+  
+  letterType      LetterType
+  usageType       UsageType
+  
+  rentAmount      Float
+  deposit         Float
+  leaseTerm       String
+  serviceCharge   Float?
+  escalationRate  Float?
+  
+  issueDate       DateTime @default(now())
+  leaseStartDate  DateTime?
+  rentStartDate   DateTime?
+  expiryDate      DateTime?
+  
+  status          OfferStatus @default(DRAFT)
+  documentUrl     String?
+  
+  additionalTerms String?
+  notes           String?
+  
+  metadata        Json?  // ADD THIS - For storing additional template data
+  
+  createdById     String           // User who created the offer
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+enum OfferStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+  CONVERTED
+}
+
+enum LetterType {
+  COMMERCIAL
+  RESIDENTIAL
+}
+
 
 // =====================================================
 //  TASK MANAGEMENT (To-Do for Managers/Admins)

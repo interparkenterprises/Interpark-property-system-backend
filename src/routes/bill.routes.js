@@ -23,12 +23,12 @@ router.get('/', authorize('ADMIN', 'MANAGER', ), getAllBills);
 // GET /bills/:id - ADMIN, MANAGER can see any, TENANT can only see their own
 router.get('/:id', authorize('ADMIN', 'MANAGER'), getBillById);
 
-// PUT /bills/:id - Only ADMIN or MANAGER can update bills
-router.put('/:id', authorize('ADMIN', 'MANAGER'), updateBill);
+// PUT /bills/:id - Only ADMIN can update bills
+router.put('/:id', authorize('ADMIN'), updateBill);
 // POST /bills/:id/pay - ADMIN,MANAGER can mark as paid
 router.post('/:id/pay', authorize( 'ADMIN', 'MANAGER'), payBill);
 
 // DELETE /bills/:id - Only ADMIN can delete bills
-router.delete('/:id', authorize('ADMIN', 'MANAGER'), deleteBill);
+router.delete('/:id', authorize('ADMIN', 'MANAGER' ), deleteBill);
 
 export default router;

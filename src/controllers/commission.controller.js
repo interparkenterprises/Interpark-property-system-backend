@@ -163,7 +163,9 @@ export const getCommissionStats = async (req, res) => {
         acc[propertyName] = {
           totalCommissions: 0,
           totalAmount: 0,
-          pendingAmount: 0
+          pendingAmount: 0,
+          processingAmount: 0,
+          paidAmount: 0
         };
       }
       
@@ -172,6 +174,10 @@ export const getCommissionStats = async (req, res) => {
       
       if (commission.status === 'PENDING') {
         acc[propertyName].pendingAmount += commission.commissionAmount;
+      } else if (commission.status === 'PROCESSING') {
+        acc[propertyName].processingAmount += commission.commissionAmount;
+      } else if (commission.status === 'PAID') {
+        acc[propertyName].paidAmount += commission.commissionAmount;
       }
       
       return acc;
@@ -293,6 +299,32 @@ export const updateCommissionStatus = async (req, res) => {
       });
     }
 
+    // Check if user is admin or the manager who owns the commission
+    if (req.user.role !== 'ADMIN' && req.user.id !== existingCommission.managerId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You can only update your own commissions.'
+      });
+    }
+
+    // Managers can only update to PROCESSING or PAID, and only for their own commissions
+    if (req.user.role !== 'ADMIN') {
+      if (status && !['PROCESSING', 'PAID'].includes(status)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Managers can only mark commissions as PROCESSING or PAID'
+        });
+      }
+      
+      // Managers cannot update notes or paidDate
+      if (notes !== undefined || paidDate !== undefined) {
+        return res.status(403).json({
+          success: false,
+          message: 'Managers cannot update notes or paid date'
+        });
+      }
+    }
+
     const updateData = {};
     if (status) updateData.status = status;
     if (notes !== undefined) updateData.notes = notes;
@@ -412,6 +444,161 @@ export const getCommissionsByProperty = async (req, res) => {
 
   } catch (error) {
     console.error('Error fetching property commissions:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Mark commission as processing (manager action)
+ */
+export const markAsProcessing = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existingCommission = await prisma.managerCommission.findUnique({
+      where: { id }
+    });
+
+    if (!existingCommission) {
+      return res.status(404).json({
+        success: false,
+        message: 'Commission not found'
+      });
+    }
+
+    // Check if manager owns this commission
+    if (req.user.role !== 'ADMIN' && req.user.id !== existingCommission.managerId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You can only update your own commissions.'
+      });
+    }
+
+    // Check if commission can be marked as processing
+    if (existingCommission.status !== 'PENDING') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only PENDING commissions can be marked as PROCESSING'
+      });
+    }
+
+    const updatedCommission = await prisma.managerCommission.update({
+      where: { id },
+      data: {
+        status: 'PROCESSING',
+        notes: existingCommission.notes ? `${existingCommission.notes}\nMarked as processing by manager on ${new Date().toLocaleDateString()}` : `Marked as processing by manager on ${new Date().toLocaleDateString()}`
+      },
+      include: {
+        property: {
+          select: {
+            name: true
+          }
+        },
+        manager: {
+          select: {
+            name: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Commission marked as processing',
+      data: updatedCommission
+    });
+
+  } catch (error) {
+    console.error('Error marking commission as processing:', error);
+    if (error.code === 'P2025') {
+      return res.status(404).json({
+        success: false,
+        message: 'Commission not found'
+      });
+    }
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Mark commission as paid (manager action)
+ */
+export const markAsPaid = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existingCommission = await prisma.managerCommission.findUnique({
+      where: { id }
+    });
+
+    if (!existingCommission) {
+      return res.status(404).json({
+        success: false,
+        message: 'Commission not found'
+      });
+    }
+
+    // Check if manager owns this commission
+    if (req.user.role !== 'ADMIN' && req.user.id !== existingCommission.managerId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You can only update your own commissions.'
+      });
+    }
+
+    // Check if commission can be marked as paid
+    if (!['PENDING', 'PROCESSING'].includes(existingCommission.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Only PENDING or PROCESSING commissions can be marked as PAID'
+      });
+    }
+
+    const updatedCommission = await prisma.managerCommission.update({
+      where: { id },
+      data: {
+        status: 'PAID',
+        paidDate: new Date(),
+        notes: existingCommission.notes ? `${existingCommission.notes}\nMarked as paid by manager on ${new Date().toLocaleDateString()}` : `Marked as paid by manager on ${new Date().toLocaleDateString()}`
+      },
+      include: {
+        property: {
+          select: {
+            name: true
+          }
+        },
+        manager: {
+          select: {
+            name: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Commission marked as paid',
+      data: updatedCommission
+    });
+
+  } catch (error) {
+    console.error('Error marking commission as paid:', error);
+    if (error.code === 'P2025') {
+      return res.status(404).json({
+        success: false,
+        message: 'Commission not found'
+      });
+    }
     res.status(500).json({
       success: false,
       message: 'Internal server error',

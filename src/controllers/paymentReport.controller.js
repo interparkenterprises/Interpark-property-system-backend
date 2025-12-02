@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import { processCommissionForIncome } from '../services/commissionService.js';
+import { generateInvoiceNumber, generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 
 const prisma = new PrismaClient();
 
@@ -26,11 +27,23 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
 
   // Determine expected rent (account for escalation if needed)
   let expectedRent = tenant.rent;
-  if (tenant.escalation && new Date(tenant.rentStart) <= periodStartOfMonth) {
-    const yearsElapsed = Math.floor(
-      (periodStartOfMonth - new Date(tenant.rentStart)) / (365.25 * 24 * 60 * 60 * 1000)
+  
+  // Check for escalation
+  if (tenant.escalationRate && tenant.escalationFrequency && new Date(tenant.rentStart) <= periodStartOfMonth) {
+    const monthsElapsed = Math.floor(
+      (periodStartOfMonth - new Date(tenant.rentStart)) / (30.44 * 24 * 60 * 60 * 1000)
     );
-    expectedRent = tenant.rent * Math.pow(1 + tenant.escalation / 100, yearsElapsed);
+    
+    let escalationIntervalMonths = 12; // Default ANNUALLY
+    if (tenant.escalationFrequency === 'BI_ANNUALLY') {
+      escalationIntervalMonths = 6;
+    }
+    
+    const escalationsApplied = Math.floor(monthsElapsed / escalationIntervalMonths);
+    
+    if (escalationsApplied > 0) {
+      expectedRent = tenant.rent * Math.pow(1 + tenant.escalationRate / 100, escalationsApplied);
+    }
   }
 
   // Compute service charge
@@ -53,15 +66,39 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     }
   }
 
-  // VAT (e.g., 16% in Kenya — configurable)
-  const vatRate = 0.16;
-  const vat = (expectedRent + serviceCharge) * vatRate;
-  const totalDue = expectedRent + serviceCharge + vat;
+  // Calculate VAT based on tenant's VAT configuration
+  let vat = 0;
+  let baseAmount = expectedRent + serviceCharge;
+  
+  if (tenant.vatType === 'EXCLUSIVE') {
+    // VAT is added on top of rent + service charge
+    vat = baseAmount * (tenant.vatRate || 0) / 100;
+  } else if (tenant.vatType === 'INCLUSIVE') {
+    // VAT is already included in the rent amount
+    // Extract VAT from the inclusive amount: VAT = Amount × (VAT Rate / (100 + VAT Rate))
+    const vatRate = tenant.vatRate || 0;
+    vat = baseAmount * (vatRate / (100 + vatRate));
+    // Note: The rent already includes VAT, so we don't add it to totalDue
+  } else {
+    // NOT_APPLICABLE - no VAT
+    vat = 0;
+  }
+
+  // Calculate total due
+  let totalDue;
+  if (tenant.vatType === 'EXCLUSIVE') {
+    totalDue = expectedRent + serviceCharge + vat;
+  } else {
+    // For INCLUSIVE and NOT_APPLICABLE, totalDue is just rent + service charge
+    totalDue = expectedRent + serviceCharge;
+  }
 
   return {
     rent: parseFloat(expectedRent.toFixed(2)),
     serviceCharge: parseFloat(serviceCharge.toFixed(2)),
     vat: parseFloat(vat.toFixed(2)),
+    vatType: tenant.vatType,
+    vatRate: tenant.vatRate || 0,
     totalDue: parseFloat(totalDue.toFixed(2)),
     periodStart: periodStartOfMonth,
     periodEnd: periodEndOfMonth
@@ -71,7 +108,7 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
 // Utility: Parse & validate pagination params
 function getPaginationParams(query) {
   const page = Math.max(1, parseInt(query.page) || 1);
-  const limit = Math.max(1, Math.min(100, parseInt(query.limit) || 10)); // cap at 100
+  const limit = Math.max(1, Math.min(100, parseInt(query.limit) || 10));
   const skip = (page - 1) * limit;
   return { page, limit, skip };
 }
@@ -109,14 +146,14 @@ export const getPaymentReports = async (req, res) => {
       };
     }
 
-    // Filter by payment period range (e.g., Nov 2025 payments)
+    // Filter by payment period range
     if (dateFrom || dateTo) {
       where.paymentPeriod = {};
       if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
       if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
     }
 
-    // Count total matching records (for pagination meta)
+    // Count total matching records
     const total = await prisma.paymentReport.count({ where });
 
     // Fetch paginated data
@@ -128,6 +165,10 @@ export const getPaymentReports = async (req, res) => {
             id: true,
             fullName: true,
             contact: true,
+            vatType: true,
+            vatRate: true,
+            escalationRate: true,
+            escalationFrequency: true,
             unit: {
               include: {
                 property: {
@@ -135,6 +176,28 @@ export const getPaymentReports = async (req, res) => {
                 }
               }
             }
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
+          }
+        },
+        billInvoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            grandTotal: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
           }
         }
       },
@@ -179,6 +242,10 @@ export const getPaymentsByTenant = async (req, res) => {
           select: {
             id: true,
             fullName: true,
+            vatType: true,
+            vatRate: true,
+            escalationRate: true,
+            escalationFrequency: true,
             unit: {
               include: {
                 property: {
@@ -186,6 +253,28 @@ export const getPaymentsByTenant = async (req, res) => {
                 }
               }
             }
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
+          }
+        },
+        billInvoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            grandTotal: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
           }
         }
       },
@@ -215,7 +304,16 @@ export const getPaymentsByTenant = async (req, res) => {
 // @access  Private (ADMIN, MANAGER)
 export const createPaymentReport = async (req, res) => {
   try {
-    const { tenantId, amountPaid, paymentPeriod, notes } = req.body;
+    const { 
+      tenantId, 
+      amountPaid, 
+      paymentPeriod, 
+      notes, 
+      billIds, // Changed from billInvoiceIds to billIds (Bill IDs, not BillInvoice IDs)
+      createRentInvoice = true,
+      rentInvoiceDueDate,
+      autoGenerateBalanceInvoice = false // NEW: Flag for balance invoice generation
+    } = req.body;
 
     if (!tenantId) {
       return res.status(400).json({ success: false, message: 'tenantId is required' });
@@ -229,7 +327,7 @@ export const createPaymentReport = async (req, res) => {
       return res.status(400).json({ success: false, message: 'amountPaid cannot be negative' });
     }
 
-    // Fetch tenant + property (needed for income & commission)
+    // Fetch tenant + property
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
@@ -250,6 +348,7 @@ export const createPaymentReport = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Tenant must be assigned to a unit with a property' });
     }
 
+    // Compute expected charges with VAT
     const expected = await computeExpectedCharges(
       tenantId,
       paymentPeriod ? new Date(paymentPeriod) : null
@@ -262,9 +361,9 @@ export const createPaymentReport = async (req, res) => {
         ? 'PARTIAL'
         : 'UNPAID';
 
-    //  Transaction: PaymentReport + Income + Commission
+    // Transaction: PaymentReport + Income + Commission + Invoices + BillInvoices
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Create PaymentReport (with safe include)
+      // 1. Create PaymentReport
       const report = await tx.paymentReport.create({
         data: {
           tenantId,
@@ -285,6 +384,10 @@ export const createPaymentReport = async (req, res) => {
               id: true,
               fullName: true,
               contact: true,
+              vatType: true,
+              vatRate: true,
+              escalationRate: true,
+              escalationFrequency: true,
               unit: {
                 include: {
                   property: {
@@ -297,7 +400,75 @@ export const createPaymentReport = async (req, res) => {
         }
       });
 
-      // 2. Create Income
+      // 2. Create Rent Invoice if requested
+      let rentInvoice = null;
+      if (createRentInvoice) {
+        const invoiceNumber = await generateInvoiceNumber();
+        const issueDate = new Date();
+        const dueDate = rentInvoiceDueDate ? new Date(rentInvoiceDueDate) : new Date(issueDate.setDate(issueDate.getDate() + 30));
+
+        const paymentPeriodStr = expected.periodStart.toLocaleDateString('en-US', { 
+          month: 'long', 
+          year: 'numeric' 
+        });
+
+        const rentBalance = arrears > 0 ? arrears : 0;
+
+        rentInvoice = await tx.invoice.create({
+          data: {
+            invoiceNumber,
+            tenantId,
+            paymentReportId: report.id,
+            issueDate: new Date(), // Current date
+            dueDate,
+            paymentPeriod: paymentPeriodStr,
+            rent: expected.rent,
+            serviceCharge: expected.serviceCharge || 0,
+            vat: expected.vat || 0,
+            totalDue: expected.totalDue,
+            amountPaid: parsedAmountPaid,
+            balance: rentBalance,
+            status: status === 'PAID' ? 'PAID' : status === 'PARTIAL' ? 'PARTIAL' : 'UNPAID',
+            notes: notes || null
+          }
+        });
+      }
+
+      // 2.5 Auto-generate balance invoice if payment is partial (OPTIONAL)
+      let balanceInvoice = null;
+      if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice) {
+        const balanceInvoiceNumber = await generateInvoiceNumber();
+        const balanceIssueDate = new Date();
+        const balanceDueDate = rentInvoiceDueDate 
+          ? new Date(rentInvoiceDueDate) 
+          : new Date(balanceIssueDate.setDate(balanceIssueDate.getDate() + 30));
+
+        const paymentPeriodStr = expected.periodStart.toLocaleDateString('en-US', { 
+          month: 'long', 
+          year: 'numeric' 
+        });
+
+        balanceInvoice = await tx.invoice.create({
+          data: {
+            invoiceNumber: balanceInvoiceNumber,
+            tenantId,
+            paymentReportId: report.id,
+            issueDate: new Date(),
+            dueDate: balanceDueDate,
+            paymentPeriod: paymentPeriodStr,
+            rent: expected.rent,
+            serviceCharge: expected.serviceCharge || 0,
+            vat: expected.vat || 0,
+            totalDue: arrears, // Only the balance
+            amountPaid: 0,
+            balance: arrears,
+            status: 'UNPAID',
+            notes: `Balance invoice for partial payment of ${paymentPeriodStr}`
+          }
+        });
+      }
+
+      // 3. Create Income
       const income = await tx.income.create({
         data: {
           propertyId: tenant.unit.propertyId,
@@ -307,19 +478,87 @@ export const createPaymentReport = async (req, res) => {
         }
       });
 
-      // 3. Process commission
+      // 4. Create Bill Invoices if bill IDs provided
+      let createdBillInvoices = [];
+      if (billIds && Array.isArray(billIds) && billIds.length > 0) {
+        // Fetch the bills to create invoices from
+        const bills = await tx.bill.findMany({
+          where: {
+            id: { in: billIds },
+            tenantId
+          }
+        });
+
+        if (bills.length > 0) {
+          // You can distribute payment or handle as needed
+          // For now, we'll create invoices without payment distribution
+          for (const bill of bills) {
+            const billInvoiceNumber = await generateBillInvoiceNumber();
+            const issueDate = new Date();
+            const dueDate = bill.dueDate || new Date(issueDate.setDate(issueDate.getDate() + 30));
+
+            const billBalance = parseFloat((bill.grandTotal - bill.amountPaid).toFixed(2));
+            const billStatus = bill.amountPaid >= bill.grandTotal
+              ? 'PAID'
+              : bill.amountPaid > 0
+                ? 'PARTIAL'
+                : 'UNPAID';
+
+            const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
+
+            const billInvoice = await tx.billInvoice.create({
+              data: {
+                invoiceNumber: billInvoiceNumber,
+                billId: bill.id,
+                billReferenceNumber,
+                billReferenceDate: bill.issuedAt,
+                tenantId,
+                paymentReportId: report.id,
+                issueDate: new Date(), // Current date
+                dueDate,
+                billType: bill.type,
+                previousReading: bill.previousReading,
+                currentReading: bill.currentReading,
+                units: bill.units,
+                chargePerUnit: bill.chargePerUnit,
+                totalAmount: bill.totalAmount,
+                vatRate: bill.vatRate,
+                vatAmount: bill.vatAmount,
+                grandTotal: bill.grandTotal,
+                amountPaid: bill.amountPaid,
+                balance: billBalance,
+                status: billStatus,
+                notes: notes || null
+              }
+            });
+
+            createdBillInvoices.push(billInvoice);
+          }
+        }
+      }
+
+      // 5. Process commission
       const commission = await processCommissionForIncome(tx, income.id);
 
-      return { report, income, commission };
+      return { 
+        report, 
+        income, 
+        commission, 
+        rentInvoice, 
+        billInvoices: createdBillInvoices,
+        balanceInvoice // NEW: Include balance invoice in transaction result
+      };
     });
 
-    // Manual response shaping (avoids Prisma select/include conflicts)
+    // Format response
     const formattedReport = {
       id: result.report.id,
-      tenantId: result.report.tenantId,
+      tenantId: result.report.tenant,
       rent: result.report.rent,
       serviceCharge: result.report.serviceCharge,
       vat: result.report.vat,
+      vatType: result.report.tenant.vatType,
+      vatRate: result.report.tenant.vatRate,
       totalDue: result.report.totalDue,
       amountPaid: result.report.amountPaid,
       arrears: result.report.arrears,
@@ -333,6 +572,8 @@ export const createPaymentReport = async (req, res) => {
         id: result.report.tenant.id,
         fullName: result.report.tenant.fullName,
         contact: result.report.tenant.contact,
+        vatType: result.report.tenant.vatType,
+        vatRate: result.report.tenant.vatRate,
         unit: {
           property: {
             id: result.report.tenant.unit.property.id,
@@ -353,6 +594,38 @@ export const createPaymentReport = async (req, res) => {
         frequency: result.income.frequency,
         createdAt: result.income.createdAt
       },
+      rentInvoice: result.rentInvoice ? {
+        id: result.rentInvoice.id,
+        invoiceNumber: result.rentInvoice.invoiceNumber,
+        issueDate: result.rentInvoice.issueDate,
+        dueDate: result.rentInvoice.dueDate,
+        paymentPeriod: result.rentInvoice.paymentPeriod,
+        totalDue: result.rentInvoice.totalDue,
+        amountPaid: result.rentInvoice.amountPaid,
+        balance: result.rentInvoice.balance,
+        status: result.rentInvoice.status
+      } : null,
+      balanceInvoice: result.balanceInvoice ? {  // NEW: Include balance invoice in response
+        id: result.balanceInvoice.id,
+        invoiceNumber: result.balanceInvoice.invoiceNumber,
+        issueDate: result.balanceInvoice.issueDate,
+        dueDate: result.balanceInvoice.dueDate,
+        totalDue: result.balanceInvoice.totalDue,
+        balance: result.balanceInvoice.balance,
+        status: result.balanceInvoice.status
+      } : null,
+      billInvoices: result.billInvoices.map(bi => ({
+        id: bi.id,
+        invoiceNumber: bi.invoiceNumber,
+        issueDate: bi.issueDate,
+        dueDate: bi.dueDate,
+        billType: bi.billType,
+        billReferenceNumber: bi.billReferenceNumber,
+        grandTotal: bi.grandTotal,
+        amountPaid: bi.amountPaid,
+        balance: bi.balance,
+        status: bi.status
+      })),
       commission: result.commission
         ? {
             id: result.commission.id,
@@ -369,8 +642,8 @@ export const createPaymentReport = async (req, res) => {
           }
         : null,
       message: result.commission
-        ? 'Payment, income, and commission recorded'
-        : 'Payment and income recorded (no commission configured)'
+        ? 'Payment, income, invoices, and commission recorded'
+        : 'Payment, income, and invoices recorded (no commission configured)'
     });
 
   } catch (error) {
@@ -411,6 +684,10 @@ export const getIncomeReports = async (req, res) => {
           select: {
             id: true,
             fullName: true,
+            vatType: true,
+            vatRate: true,
+            escalationRate: true,
+            escalationFrequency: true,
             unit: { select: { id: true, type: true } }
           }
         }
@@ -463,6 +740,10 @@ export const createIncome = async (req, res) => {
           select: {
             id: true,
             fullName: true,
+            vatType: true,
+            vatRate: true,
+            escalationRate: true,
+            escalationFrequency: true,
             unit: { select: { id: true, type: true } }
           }
         }
@@ -495,7 +776,7 @@ export const previewPayment = async (req, res) => {
 export const updatePaymentReportWithIncome = async (req, res) => {
   try {
     const { id } = req.params;
-    const { amountPaid, paymentPeriod, notes } = req.body;
+    const { amountPaid, paymentPeriod, notes, billIds } = req.body;
 
     const result = await prisma.$transaction(async (tx) => {
       // Find existing payment report
@@ -510,7 +791,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
                 }
               }
             }
-          }
+          },
+          billInvoices: true,
+          invoices: true
         }
       });
 
@@ -535,6 +818,8 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         rent: existingReport.rent,
         serviceCharge: existingReport.serviceCharge,
         vat: existingReport.vat,
+        vatType: existingReport.tenant.vatType,
+        vatRate: existingReport.tenant.vatRate,
         totalDue: existingReport.totalDue,
         periodStart: existingReport.paymentPeriod,
         periodEnd: new Date(new Date(existingReport.paymentPeriod).getFullYear(), new Date(existingReport.paymentPeriod).getMonth() + 1, 0)
@@ -542,7 +827,7 @@ export const updatePaymentReportWithIncome = async (req, res) => {
 
       if (paymentPeriod) {
         expected = await computeExpectedCharges(
-          existingReport.tenantId,
+          existingReport.tenant,
           paymentPeriod
         );
       }
@@ -576,6 +861,10 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               id: true,
               fullName: true,
               contact: true,
+              vatType: true,
+              vatRate: true,
+              escalationRate: true,
+              escalationFrequency: true,
               unit: {
                 include: {
                   property: {
@@ -584,14 +873,57 @@ export const updatePaymentReportWithIncome = async (req, res) => {
                 }
               }
             }
+          },
+          invoices: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              totalDue: true,
+              amountPaid: true,
+              status: true,
+              issueDate: true,
+              dueDate: true
+            }
+          },
+          billInvoices: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              grandTotal: true,
+              amountPaid: true,
+              status: true,
+              issueDate: true,
+              dueDate: true
+            }
           }
         }
       });
 
+      // Update existing rent invoice if it exists
+      if (existingReport.invoices && existingReport.invoices.length > 0) {
+        const rentInvoice = existingReport.invoices[0];
+        const rentBalance = arrears > 0 ? arrears : 0;
+        
+        await tx.invoice.update({
+          where: { id: rentInvoice.id },
+          data: {
+            rent: expected.rent,
+            serviceCharge: expected.serviceCharge || 0,
+            vat: expected.vat || 0,
+            totalDue: expected.totalDue,
+            amountPaid: parsedAmountPaid,
+            balance: rentBalance,
+            status: status === 'PAID' ? 'PAID' : status === 'PARTIAL' ? 'PARTIAL' : 'UNPAID',
+            notes: notes !== undefined ? notes : rentInvoice.notes,
+            updatedAt: new Date()
+          }
+        });
+      }
+
       // Update related income record if it exists
       const income = await tx.income.findFirst({
         where: {
-          tenantId: existingReport.tenantId,
+          tenantId: existingReport.tenant,
           propertyId: existingReport.tenant.unit.propertyId,
           createdAt: {
             gte: new Date(existingReport.paymentPeriod),
@@ -616,13 +948,76 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         }
       }
 
-      return { updatedReport, updatedIncome };
+      // Create new bill invoices if bill IDs provided
+      let newBillInvoices = [];
+      if (billIds && Array.isArray(billIds) && billIds.length > 0) {
+        const bills = await tx.bill.findMany({
+          where: {
+            id: { in: billIds },
+            tenantId: existingReport.tenantId
+          }
+        });
+
+        for (const bill of bills) {
+          const billInvoiceNumber = await generateBillInvoiceNumber();
+          const issueDate = new Date();
+          const dueDate = bill.dueDate || new Date(issueDate.setDate(issueDate.getDate() + 30));
+
+          const billBalance = parseFloat((bill.grandTotal - bill.amountPaid).toFixed(2));
+          const billStatus = bill.amountPaid >= bill.grandTotal
+            ? 'PAID'
+            : bill.amountPaid > 0
+              ? 'PARTIAL'
+              : 'UNPAID';
+
+          const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
+
+          const billInvoice = await tx.billInvoice.create({
+            data: {
+              invoiceNumber: billInvoiceNumber,
+              billId: bill.id,
+              billReferenceNumber,
+              billReferenceDate: bill.issuedAt,
+              tenantId: existingReport.tenantId,
+              paymentReportId: updatedReport.id,
+              issueDate: new Date(),
+              dueDate,
+              billType: bill.type,
+              previousReading: bill.previousReading,
+              currentReading: bill.currentReading,
+              units: bill.units,
+              chargePerUnit: bill.chargePerUnit,
+              totalAmount: bill.totalAmount,
+              vatRate: bill.vatRate,
+              vatAmount: bill.vatAmount,
+              grandTotal: bill.grandTotal,
+              amountPaid: bill.amountPaid,
+              balance: billBalance,
+              status: billStatus,
+              notes: notes || null
+            }
+          });
+
+          newBillInvoices.push(billInvoice);
+        }
+      }
+
+      return { updatedReport, updatedIncome, newBillInvoices };
     });
 
     res.json({
       success: true,
       data: result.updatedReport,
       income: result.updatedIncome,
+      newBillInvoices: result.newBillInvoices.map(bi => ({
+        id: bi.id,
+        invoiceNumber: bi.invoiceNumber,
+        issueDate: bi.issueDate,
+        dueDate: bi.dueDate,
+        billType: bi.billType,
+        grandTotal: bi.grandTotal,
+        status: bi.status
+      })),
       message: 'Payment report and related records updated successfully'
     });
 
@@ -634,3 +1029,215 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     });
   }
 };
+
+// @desc    Get arrears for a property
+// @route   GET /api/payments/arrears/:propertyId
+// @access  Private
+export async function getPropertyArrears(req, res) {
+  try {
+    const { propertyId } = req.params;
+
+    if (!propertyId) {
+      return res.status(400).json({ error: 'Property ID is required' });
+    }
+
+    // Fetch all units with their tenants for this property
+    const units = await prisma.unit.findMany({
+      where: {
+        propertyId: propertyId,
+        status: 'OCCUPIED',
+        tenant: {
+          isNot: null
+        }
+      },
+      include: {
+        tenant: {
+          include: {
+            // Get unpaid/partial invoices
+            invoices: {
+              where: {
+                status: {
+                  in: ['UNPAID', 'PARTIAL']
+                }
+              },
+              orderBy: {
+                dueDate: 'asc'
+              }
+            },
+            // Get unpaid/partial bill invoices
+            billInvoices: {
+              where: {
+                status: {
+                  in: ['UNPAID', 'PARTIAL']
+                }
+              },
+              orderBy: {
+                dueDate: 'asc'
+              }
+            },
+            // Get payment reports for calculation
+            paymentReports: {
+              orderBy: {
+                paymentPeriod: 'desc'
+              }
+            }
+          }
+        },
+        property: {
+          select: {
+            name: true
+          }
+        }
+      }
+    });
+
+    // Process arrears data
+    const arrearsData = [];
+
+    for (const unit of units) {
+      if (!unit.tenant) continue;
+
+      const tenant = unit.tenant;
+      
+      // Process rent invoices (unpaid/partial)
+      for (const invoice of tenant.invoices) {
+        if (invoice.balance > 0) {
+          arrearsData.push({
+            id: `invoice-${invoice.id}`,
+            tenantId: tenant.id,
+            tenantName: tenant.fullName,
+            tenantContact: tenant.contact,
+            unitType: unit.type || 'Unit',
+            unitNo: unit.unitNo || 'N/A',
+            floor: unit.floor || 'N/A',
+            invoiceNumber: invoice.invoiceNumber, // Use actual invoice number
+            invoiceType: 'RENT',
+            expectedAmount: invoice.totalDue,
+            paidAmount: invoice.amountPaid,
+            balance: invoice.balance,
+            dueDate: invoice.dueDate,
+            status: invoice.status,
+            description: `Rent for ${unit.property.name} - ${unit.type || 'Unit'} ${unit.unitNo || ''}`,
+            invoiceId: invoice.id,
+            paymentPeriod: invoice.paymentPeriod
+          });
+        }
+      }
+
+      // Process bill invoices (unpaid/partial)
+      for (const billInvoice of tenant.billInvoices) {
+        if (billInvoice.balance > 0) {
+          arrearsData.push({
+            id: `bill-invoice-${billInvoice.id}`,
+            tenantId: tenant.id,
+            tenantName: tenant.fullName,
+            tenantContact: tenant.contact,
+            unitType: unit.type || 'Unit',
+            unitNo: unit.unitNo || 'N/A',
+            floor: unit.floor || 'N/A',
+            invoiceNumber: billInvoice.invoiceNumber, // Use actual bill invoice number
+            invoiceType: 'BILL',
+            billType: billInvoice.billType,
+            expectedAmount: billInvoice.grandTotal,
+            paidAmount: billInvoice.amountPaid,
+            balance: billInvoice.balance,
+            dueDate: billInvoice.dueDate,
+            status: billInvoice.status,
+            description: `${billInvoice.billType} charge - ${billInvoice.billReferenceNumber || ''}`,
+            billInvoiceId: billInvoice.id,
+            billReferenceNumber: billInvoice.billReferenceNumber
+          });
+        }
+      }
+
+      // Calculate current rent arrears (for the current period if no invoice exists yet)
+      const expectedMonthlyRent = tenant.rent;
+      
+      // Calculate service charge if applicable
+      let serviceChargeAmount = 0;
+      if (tenant.serviceCharge) {
+        if (tenant.serviceCharge.type === 'PERCENTAGE') {
+          serviceChargeAmount = (expectedMonthlyRent * tenant.serviceCharge.percentage) / 100;
+        } else if (tenant.serviceCharge.type === 'FIXED') {
+          serviceChargeAmount = tenant.serviceCharge.fixedAmount || 0;
+        } else if (tenant.serviceCharge.type === 'PER_SQ_FT') {
+          serviceChargeAmount = (unit.sizeSqFt || 0) * (tenant.serviceCharge.perSqFtRate || 0);
+        }
+      }
+
+      const totalExpectedAmount = expectedMonthlyRent + serviceChargeAmount;
+
+      // Calculate total paid from payment reports for current period
+      const currentPeriodStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+      const currentPeriodPaid = tenant.paymentReports
+        .filter(report => new Date(report.paymentPeriod) >= currentPeriodStart)
+        .reduce((sum, report) => sum + report.amountPaid, 0);
+
+      const currentRentBalance = totalExpectedAmount - currentPeriodPaid;
+
+      // Only add current rent arrears if there's a balance AND no existing invoice for current period
+      const currentPeriodInvoiceExists = tenant.invoices.some(invoice => {
+        const invoicePeriod = new Date(invoice.paymentPeriod);
+        return invoicePeriod >= currentPeriodStart && invoice.balance > 0;
+      });
+
+      if (currentRentBalance > 0 && !currentPeriodInvoiceExists) {
+        arrearsData.push({
+          id: `current-rent-${tenant.id}`,
+          tenantId: tenant.id,
+          tenantName: tenant.fullName,
+          tenantContact: tenant.contact,
+          unitType: unit.type || 'Unit',
+          unitNo: unit.unitNo || 'N/A',
+          floor: unit.floor || 'N/A',
+          invoiceNumber: `PENDING-RENT-${tenant.id.substring(0, 8).toUpperCase()}`, // Placeholder for pending invoice
+          invoiceType: 'RENT',
+          expectedAmount: totalExpectedAmount,
+          paidAmount: currentPeriodPaid,
+          balance: currentRentBalance,
+          dueDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1), // 1st of next month
+          status: currentPeriodPaid > 0 ? 'PARTIAL' : 'UNPAID',
+          description: `Current period rent for ${unit.property.name}`,
+          isPendingInvoice: true
+        });
+      }
+    }
+
+    // Sort by due date (oldest first) then by balance (highest first)
+    arrearsData.sort((a, b) => {
+      // First sort by due date (oldest first)
+      const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
+      if (dateDiff !== 0) return dateDiff;
+      
+      // Then by balance (highest first)
+      return b.balance - a.balance;
+    });
+
+    // Calculate totals
+    const totalArrears = arrearsData.reduce((sum, item) => sum + item.balance, 0);
+    const totalExpected = arrearsData.reduce((sum, item) => sum + item.expectedAmount, 0);
+    const totalPaid = arrearsData.reduce((sum, item) => sum + item.paidAmount, 0);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        arrears: arrearsData,
+        summary: {
+          totalArrears,
+          totalExpected,
+          totalPaid,
+          itemCount: arrearsData.length,
+          pendingInvoicesCount: arrearsData.filter(item => item.isPendingInvoice).length
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property arrears:', error);
+    return res.status(500).json({ 
+      success: false,
+      message: 'Failed to fetch arrears data',
+      details: error.message 
+    });
+  }
+}

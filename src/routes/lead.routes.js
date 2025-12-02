@@ -3,6 +3,7 @@ import {
   getLeads,
   getLead,
   createLead,
+  createLeadWithOffer,
   updateLead,
   deleteLead
 } from '../controllers/lead.controller.js';
@@ -16,6 +17,7 @@ router.use(protect);
 router.route('/')
   .get(getLeads)
   .post(authorize('ADMIN', 'MANAGER'), createLead);
+router.post('/with-offer', authorize('ADMIN', 'MANAGER'), createLeadWithOffer);
 
 router.route('/:id')
   .get(getLead)

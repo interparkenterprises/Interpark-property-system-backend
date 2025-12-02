@@ -116,7 +116,12 @@ export const createProperty = async (req, res) => {
       landlordId, 
       landlord, 
       managerId, 
-      commissionFee
+      commissionFee,
+      accountNo,
+      accountName,
+      bank,
+      branch,
+      branchCode
     } = req.body;
     
     const currentUser = req.user;
@@ -155,37 +160,56 @@ export const createProperty = async (req, res) => {
       });
     }
 
-    // 🔐 Enforce: MANAGER must associate property with a landlord (existing or new)
+    // Enforce: MANAGER must associate property with a landlord (existing or new)
     if (currentUser.role === 'MANAGER' && !landlordId && !landlord) {
       return res.status(400).json({
         message: 'A landlord (ID or details) is required when creating a property.'
       });
     }
 
-    let finalLandlordId = null;
+    // Prepare data object for Prisma
+    const propertyData = {
+      name,
+      address,
+      lrNumber: lrNumber || null,
+      form: formattedForm,
+      usage: formattedUsage,
+      commissionFee: commissionFee ? parseFloat(commissionFee) : null,
+      // Bank details
+      accountNo: accountNo || null,
+      accountName: accountName || null,
+      bank: bank || null,
+      branch: branch || null,
+      branchCode: branchCode || null
+    };
 
-    // 🧾 Case 1: Create new landlord inline
+    // Handle image file
+    if (req.file) {
+      propertyData.image = req.file.path;
+    }
+
+    // Handle landlord relation
     if (landlord) {
+      // Case 1: Create new landlord inline
       const landlordData = typeof landlord === 'string' ? JSON.parse(landlord) : landlord;
-      const { name: landlordName, email, phone, address: landlordAddress } = landlordData;
+      const { name: landlordName, email, phone, address: landlordAddress, idNumber } = landlordData;
 
       // Validate required landlord fields
       if (!landlordName) {
         return res.status(400).json({ message: 'Landlord name is required.' });
       }
 
-      const newLandlord = await prisma.landlord.create({
-        data: {
+      propertyData.landlord = {
+        create: {
           name: landlordName,
           email: email || null,
           phone: phone || null,
-          address: landlordAddress || null
+          address: landlordAddress || null,
+          idNumber: idNumber || null
         }
-      });
-      finalLandlordId = newLandlord.id;
-    }
-    // 🧾 Case 2: Use existing landlord
-    else if (landlordId) {
+      };
+    } else if (landlordId) {
+      // Case 2: Connect to existing landlord
       // Verify landlord exists
       const existingLandlord = await prisma.landlord.findUnique({
         where: { id: landlordId }
@@ -193,43 +217,33 @@ export const createProperty = async (req, res) => {
       if (!existingLandlord) {
         return res.status(400).json({ message: 'Landlord not found.' });
       }
-      finalLandlordId = landlordId;
+      
+      propertyData.landlord = {
+        connect: { id: landlordId }
+      };
     }
-    // 🧾 Case 3: No landlord — only allowed for ADMIN
+    // Case 3: No landlord - only allowed for ADMIN
     else if (currentUser.role !== 'ADMIN') {
       return res.status(400).json({
         message: 'Only ADMIN can create a property without a landlord.'
       });
     }
 
-    // 👤 Auto-assign manager if MANAGER
-    let finalManagerId = null;
+    // Handle manager assignment
     if (currentUser.role === 'MANAGER') {
-      finalManagerId = currentUser.id;
+      propertyData.manager = {
+        connect: { id: currentUser.id }
+      };
     } else if (currentUser.role === 'ADMIN' && managerId) {
       // Admin can assign to a specific manager
-      finalManagerId = managerId;
+      propertyData.manager = {
+        connect: { id: managerId }
+      };
     }
 
-    // Handle image file
-    let imagePath = null;
-    if (req.file) {
-      imagePath = req.file.path; // Store the file path
-    }
-
-    // 🏠 Create the property
+    // Create the property
     const property = await prisma.property.create({
-      data: {
-        name,
-        address,
-        lrNumber: lrNumber || null,
-        form: formattedForm, // Use the uppercase formatted value
-        usage: formattedUsage, // Use the uppercase formatted value
-        landlordId: finalLandlordId,
-        managerId: finalManagerId,
-        commissionFee: commissionFee ? parseFloat(commissionFee) : null,
-        image: imagePath
-      },
+      data: propertyData,
       include: {
         landlord: true,
         manager: { select: { id: true, name: true, email: true } },
@@ -238,7 +252,11 @@ export const createProperty = async (req, res) => {
       }
     });
 
-    res.status(201).json(property);
+    res.status(201).json({
+      success: true,
+      message: 'Property created successfully',
+      data: property
+    });
   } catch (error) {
     console.error('Create property error:', error);
     
@@ -247,7 +265,10 @@ export const createProperty = async (req, res) => {
       fs.unlinkSync(req.file.path);
     }
     
-    res.status(400).json({ message: error.message });
+    res.status(400).json({ 
+      success: false,
+      message: error.message 
+    });
   }
 };
 
@@ -264,12 +285,20 @@ export const updateProperty = async (req, res) => {
       usage, 
       landlordId, 
       managerId, 
-      commissionFee
+      commissionFee,
+      accountNo,
+      accountName,
+      bank,
+      branch,
+      branchCode
     } = req.body;
 
     // Check if property exists
     const existingProperty = await prisma.property.findUnique({
-      where: { id: req.params.id }
+      where: { id: req.params.id },
+      include: {
+        units: true
+      }
     });
 
     if (!existingProperty) {
@@ -288,6 +317,10 @@ export const updateProperty = async (req, res) => {
     if (form) {
       const validForms = ['APARTMENT', 'BUNGALOW', 'VILLA', 'OFFICE', 'SHOP', 'DUPLEX', 'TOWNHOUSE', 'MAISONETTE', 'WAREHOUSE', 'INDUSTRIAL_BUILDING', 'RETAIL_CENTER'];
       if (!validForms.includes(formattedForm)) {
+        // Clean up uploaded file if validation fails
+        if (req.file && fs.existsSync(req.file.path)) {
+          fs.unlinkSync(req.file.path);
+        }
         return res.status(400).json({
           message: `Invalid form value. Must be one of: ${validForms.join(', ')}`
         });
@@ -297,9 +330,47 @@ export const updateProperty = async (req, res) => {
     if (usage) {
       const validUsages = ['RESIDENTIAL', 'COMMERCIAL', 'INDUSTRIAL', 'INSTITUTIONAL', 'MIXED_USE'];
       if (!validUsages.includes(formattedUsage)) {
+        // Clean up uploaded file if validation fails
+        if (req.file && fs.existsSync(req.file.path)) {
+          fs.unlinkSync(req.file.path);
+        }
         return res.status(400).json({
           message: `Invalid usage value. Must be one of: ${validUsages.join(', ')}`
         });
+      }
+    }
+
+    // Check if usage type is changing
+    if (usage && formattedUsage !== existingProperty.usage) {
+      // Validate existing units against new usage type
+      const hasUnits = existingProperty.units.length > 0;
+      
+      if (hasUnits) {
+        // Check if there are issues with existing units based on the new usage type
+        const residentialUnits = existingProperty.units.filter(u => u.unitType === 'RESIDENTIAL');
+        const commercialUnits = existingProperty.units.filter(u => u.unitType === 'COMMERCIAL');
+        
+        // If changing to pure RESIDENTIAL and there are COMMERCIAL units
+        if (formattedUsage === 'RESIDENTIAL' && commercialUnits.length > 0) {
+          // Clean up uploaded file if validation fails
+          if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          return res.status(400).json({
+            message: 'Cannot change to RESIDENTIAL usage type. Property has COMMERCIAL units. Please update or remove them first.'
+          });
+        }
+        
+        // If changing to COMMERCIAL/INDUSTRIAL/INSTITUTIONAL and there are RESIDENTIAL units
+        if (['COMMERCIAL', 'INDUSTRIAL', 'INSTITUTIONAL'].includes(formattedUsage) && residentialUnits.length > 0) {
+          // Clean up uploaded file if validation fails
+          if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          return res.status(400).json({
+            message: `Cannot change to ${formattedUsage} usage type. Property has RESIDENTIAL units. Please update or remove them first.`
+          });
+        }
       }
     }
 
@@ -324,19 +395,87 @@ export const updateProperty = async (req, res) => {
       imagePath = req.file.path;
     }
 
+    // Prepare update data object
+    const updateData = {
+      name: name !== undefined ? name : undefined,
+      address: address !== undefined ? address : undefined,
+      lrNumber: lrNumber !== undefined ? lrNumber : undefined,
+      form: formattedForm,
+      usage: formattedUsage,
+      commissionFee: commissionFee !== undefined ? parseFloat(commissionFee) : undefined,
+      image: imagePath,
+      // Bank details
+      accountNo: accountNo !== undefined ? accountNo : undefined,
+      accountName: accountName !== undefined ? accountName : undefined,
+      bank: bank !== undefined ? bank : undefined,
+      branch: branch !== undefined ? branch : undefined,
+      branchCode: branchCode !== undefined ? branchCode : undefined
+    };
+
+    // Handle landlord relation if provided
+    if (landlordId !== undefined) {
+      if (landlordId === null || landlordId === '') {
+        // Remove landlord association
+        updateData.landlord = {
+          disconnect: true
+        };
+      } else {
+        // Verify landlord exists before connecting
+        const existingLandlord = await prisma.landlord.findUnique({
+          where: { id: landlordId }
+        });
+        if (!existingLandlord) {
+          // Clean up uploaded file if validation fails
+          if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          return res.status(400).json({ message: 'Landlord not found.' });
+        }
+        
+        // Connect to existing landlord
+        updateData.landlord = {
+          connect: { id: landlordId }
+        };
+      }
+    }
+
+    // Handle manager relation if provided
+    if (managerId !== undefined) {
+      if (managerId === null || managerId === '') {
+        // Remove manager association
+        updateData.manager = {
+          disconnect: true
+        };
+      } else {
+        // Verify manager exists before connecting
+        const existingManager = await prisma.user.findUnique({
+          where: { id: managerId }
+        });
+        if (!existingManager) {
+          // Clean up uploaded file if validation fails
+          if (req.file && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          return res.status(400).json({ message: 'Manager not found.' });
+        }
+        
+        // Connect to existing manager
+        updateData.manager = {
+          connect: { id: managerId }
+        };
+      }
+    }
+
+    // Remove undefined values from updateData
+    Object.keys(updateData).forEach(key => {
+      if (updateData[key] === undefined) {
+        delete updateData[key];
+      }
+    });
+
     const property = await prisma.property.update({
       where: { id: req.params.id },
-      data: {
-        name,
-        address,
-        lrNumber,
-        form: formattedForm,
-        usage: formattedUsage,
-        landlordId,
-        managerId,
-        commissionFee: commissionFee ? parseFloat(commissionFee) : null,
-        image: imagePath
-      },
+      data: updateData,
       include: {
         landlord: true,
         manager: { select: { id: true, name: true, email: true } },
@@ -353,13 +492,21 @@ export const updateProperty = async (req, res) => {
       }
     });
 
-    res.json(property);
+    res.json({
+      success: true,
+      message: 'Property updated successfully',
+      data: property
+    });
   } catch (error) {
+    console.error('Update property error:', error);
     // Clean up uploaded file if update fails
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
-    res.status(400).json({ message: error.message });
+    res.status(400).json({ 
+      success: false,
+      message: error.message 
+    });
   }
 };
 

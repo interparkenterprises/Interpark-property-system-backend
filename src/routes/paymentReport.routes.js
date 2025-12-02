@@ -6,7 +6,8 @@ import {
   getIncomeReports,
   createIncome,
   previewPayment, // added
-  updatePaymentReportWithIncome
+  updatePaymentReportWithIncome,
+  getPropertyArrears
 } from '../controllers/paymentReport.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
@@ -24,6 +25,8 @@ router.get('/tenant/:tenantId', getPaymentsByTenant);
 
 // Preview expected charges (useful for frontend before submitting)
 router.get('/preview/:tenantId', authorize('ADMIN', 'MANAGER'), previewPayment);
+//get Property Arrears
+router.get('/properties/:propertyId/arrears', authorize('ADMIN', 'MANAGER'), getPropertyArrears);
 
 // Income Reports
 router.route('/income')
