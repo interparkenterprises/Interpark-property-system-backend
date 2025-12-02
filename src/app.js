@@ -28,7 +28,13 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    "https://interpark-property-system-frontend-chi.vercel.app",
+    "https://interparkpropertysystem.co.ke"
+  ],
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
