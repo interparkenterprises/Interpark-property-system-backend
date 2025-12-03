@@ -16,24 +16,81 @@ const updateUnitRent = async (unitId, newRent) => {
   }
 };
 
+// Helper function to check if manager has access to tenant
+const checkManagerTenantAccess = async (userId, tenantId) => {
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    include: {
+      unit: {
+        include: {
+          property: true
+        }
+      }
+    }
+  });
+
+  if (!tenant) {
+    return { hasAccess: false, tenant: null };
+  }
+
+  if (tenant.unit.property.managerId !== userId) {
+    return { hasAccess: false, tenant };
+  }
+
+  return { hasAccess: true, tenant };
+};
+
 // @desc    Get all tenants
 // @route   GET /api/tenants
 // @access  Private
 export const getTenants = async (req, res) => {
   try {
-    const tenants = await prisma.tenant.findMany({
-      include: {
-        unit: {
-          include: {
-            property: true
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let tenants;
+
+    if (userRole === 'ADMIN') {
+      // Admin sees all tenants
+      tenants = await prisma.tenant.findMany({
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          },
+          paymentReports: true,
+          serviceCharge: true,
+          incomes: true
+        },
+        orderBy: { fullName: 'asc' }
+      });
+    } else if (userRole === 'MANAGER') {
+      // Manager sees only tenants in properties they manage
+      tenants = await prisma.tenant.findMany({
+        where: {
+          unit: {
+            property: {
+              managerId: userId
+            }
           }
         },
-        paymentReports: true,
-        serviceCharge: true,
-        incomes: true
-      },
-      orderBy: { fullName: 'asc' }
-    });
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          },
+          paymentReports: true,
+          serviceCharge: true,
+          incomes: true
+        },
+        orderBy: { fullName: 'asc' }
+      });
+    } else {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
     res.json(tenants);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -45,6 +102,9 @@ export const getTenants = async (req, res) => {
 // @access  Private
 export const getTenant = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
     const tenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: {
@@ -63,14 +123,19 @@ export const getTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
+    // Check access for managers
+    if (userRole === 'MANAGER' && tenant.unit.property.managerId !== userId) {
+      return res.status(403).json({ message: 'Access denied to this tenant' });
+    }
+
     // Calculate escalated rent and schedule
     const rentInfo = calculateEscalatedRent(tenant);
-    const rentSchedule = getRentSchedule(tenant, 3); // next 3 escalations
+    const rentSchedule = getRentSchedule(tenant, 3);
 
     res.json({
       ...tenant,
-      rentInfo,          // { currentRent, nextEscalationDate, escalationsApplied }
-      rentSchedule       // [{ period, date, rent }, ...]
+      rentInfo,
+      rentSchedule
     });
   } catch (error) {
     console.error('Get tenant error:', error);
@@ -83,6 +148,9 @@ export const getTenant = async (req, res) => {
 // @access  Private
 export const createTenant = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
     const {
       fullName,
       contact,
@@ -107,6 +175,25 @@ export const createTenant = async (req, res) => {
       return res.status(400).json({
         message: 'All fields except POBox, escalationRate, escalationFrequency, vatRate, vatType, and serviceCharge are required.'
       });
+    }
+
+    // Check if unit exists and verify manager has access
+    const unit = await prisma.unit.findUnique({
+      where: { id: unitId },
+      include: { property: true }
+    });
+
+    if (!unit) {
+      return res.status(404).json({ message: 'Unit not found' });
+    }
+
+    // Check access for managers
+    if (userRole === 'MANAGER' && unit.property.managerId !== userId) {
+      return res.status(403).json({ message: 'Access denied to this unit' });
+    }
+
+    if (unit.status === 'OCCUPIED') {
+      return res.status(400).json({ message: 'Unit is already occupied' });
     }
 
     // Validate payment policy enum
@@ -166,17 +253,6 @@ export const createTenant = async (req, res) => {
       return res.status(400).json({ message: 'KRA Pin already exists' });
     }
 
-    // Check if unit exists and is vacant
-    const unit = await prisma.unit.findUnique({
-      where: { id: unitId }
-    });
-    if (!unit) {
-      return res.status(404).json({ message: 'Unit not found' });
-    }
-    if (unit.status === 'OCCUPIED') {
-      return res.status(400).json({ message: 'Unit is already occupied' });
-    }
-
     // Parse rent amount
     const parsedRent = parseFloat(rent);
 
@@ -233,7 +309,7 @@ export const createTenant = async (req, res) => {
           where: { id: unitId }, 
           data: { 
             status: 'VACANT',
-            rentAmount: unit.rentAmount // Restore original rent amount
+            rentAmount: unit.rentAmount
           } 
         });
         return res.status(400).json({
@@ -248,7 +324,7 @@ export const createTenant = async (req, res) => {
           where: { id: unitId }, 
           data: { 
             status: 'VACANT',
-            rentAmount: unit.rentAmount // Restore original rent amount
+            rentAmount: unit.rentAmount
           } 
         });
         return res.status(400).json({ message: 'Fixed amount (> 0) is required for FIXED service charge' });
@@ -260,7 +336,7 @@ export const createTenant = async (req, res) => {
           where: { id: unitId }, 
           data: { 
             status: 'VACANT',
-            rentAmount: unit.rentAmount // Restore original rent amount
+            rentAmount: unit.rentAmount
           } 
         });
         return res.status(400).json({ message: 'Percentage (> 0) is required for PERCENTAGE service charge' });
@@ -272,7 +348,7 @@ export const createTenant = async (req, res) => {
           where: { id: unitId }, 
           data: { 
             status: 'VACANT',
-            rentAmount: unit.rentAmount // Restore original rent amount
+            rentAmount: unit.rentAmount
           } 
         });
         return res.status(400).json({ message: 'Per sq. ft rate (> 0) is required for PER_SQ_FT service charge' });
@@ -311,6 +387,17 @@ export const createTenant = async (req, res) => {
 // @access  Private
 export const updateTenant = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check access for managers
+    if (userRole === 'MANAGER') {
+      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
+      if (!hasAccess) {
+        return res.status(403).json({ message: 'Access denied to this tenant' });
+      }
+    }
+
     const {
       fullName,
       contact,
@@ -532,6 +619,17 @@ export const updateTenant = async (req, res) => {
 // @access  Private
 export const deleteTenant = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check access for managers
+    if (userRole === 'MANAGER') {
+      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
+      if (!hasAccess) {
+        return res.status(403).json({ message: 'Access denied to this tenant' });
+      }
+    }
+
     const tenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: { 
@@ -559,7 +657,7 @@ export const deleteTenant = async (req, res) => {
       where: { id: tenant.unitId },
       data: { 
         status: 'VACANT',
-        rentAmount: originalUnitRent // Restore the unit's original rent amount
+        rentAmount: originalUnitRent
       }
     });
 
@@ -578,6 +676,17 @@ export const deleteTenant = async (req, res) => {
 // @access  Private
 export const updateServiceCharge = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check access for managers
+    if (userRole === 'MANAGER') {
+      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
+      if (!hasAccess) {
+        return res.status(403).json({ message: 'Access denied to this tenant' });
+      }
+    }
+
     const { type, fixedAmount, percentage, perSqFtRate } = req.body;
 
     // Check if tenant exists
@@ -636,6 +745,17 @@ export const updateServiceCharge = async (req, res) => {
 // @access  Private
 export const removeServiceCharge = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check access for managers
+    if (userRole === 'MANAGER') {
+      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
+      if (!hasAccess) {
+        return res.status(403).json({ message: 'Access denied to this tenant' });
+      }
+    }
+
     const existingTenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: { serviceCharge: true }

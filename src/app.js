@@ -31,7 +31,8 @@ const app = express();
 app.use(cors({
   origin: [
     "https://interpark-property-system-frontend-chi.vercel.app",
-    "https://interparkpropertysystem.co.ke"
+    "https://interparkpropertysystem.co.ke",
+    "http://localhost:3000"
   ],
   credentials: true
 }));

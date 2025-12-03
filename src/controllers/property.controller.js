@@ -45,21 +45,52 @@ export const upload = multer({
 // @access  Private
 export const getProperties = async (req, res) => {
   try {
-    const properties = await prisma.property.findMany({
-      include: {
-        landlord: true,
-        manager: { select: { id: true, name: true, email: true } },
-        units: true,
-        serviceProviders: true,
-        _count: {
-          select: {
-            units: true,
-            leads: true
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let properties;
+
+    if (userRole === 'ADMIN') {
+      // Admin sees all properties
+      properties = await prisma.property.findMany({
+        include: {
+          landlord: true,
+          manager: { select: { id: true, name: true, email: true } },
+          units: true,
+          serviceProviders: true,
+          _count: {
+            select: {
+              units: true,
+              leads: true
+            }
           }
-        }
-      },
-      orderBy: { createdAt: 'desc' }
-    });
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+    } else if (userRole === 'MANAGER') {
+      // Manager sees only properties they manage
+      properties = await prisma.property.findMany({
+        where: {
+          managerId: userId
+        },
+        include: {
+          landlord: true,
+          manager: { select: { id: true, name: true, email: true } },
+          units: true,
+          serviceProviders: true,
+          _count: {
+            select: {
+              units: true,
+              leads: true
+            }
+          }
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+    } else {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
     res.json(properties);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -71,6 +102,9 @@ export const getProperties = async (req, res) => {
 // @access  Private
 export const getProperty = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
     const property = await prisma.property.findUnique({
       where: { id: req.params.id },
       include: {
@@ -94,6 +128,11 @@ export const getProperty = async (req, res) => {
 
     if (!property) {
       return res.status(404).json({ message: 'Property not found' });
+    }
+
+    // Check access for managers
+    if (userRole === 'MANAGER' && property.managerId !== userId) {
+      return res.status(403).json({ message: 'Access denied to this property' });
     }
 
     res.json(property);
