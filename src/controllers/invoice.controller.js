@@ -328,15 +328,52 @@ async function generateInvoicePDF(invoice, tenant) {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // Company Header
-      doc.fontSize(20)
-        .fillColor('#2563eb')
-        .text(invoice.tenant.unit?.property?.name || 'Property Management', { align: 'center' });
+      // ===== ADD LETTERHEAD IMAGE =====
+      // Path is relative to the invoice.controller.js file location
+      // From src/controllers/invoice.controller.js to src/letterHeads/letter-head.jpg
+      // So we go up one directory, then into letterHeads
+      const letterheadPath = '../letterHeads/letter-head.jpg';
       
-      doc.fontSize(10)
-        .fillColor('#666')
-        .text('Property Management System', { align: 'center' })
-        .moveDown();
+      try {
+        // Add letterhead image at the top
+        doc.image(letterheadPath, 50, 30, { 
+          width: 500, 
+          height: 80
+        });
+        
+        // Adjust the Y position to start below the letterhead
+        // 30 (top margin) + 80 (image height) + 10 (padding) = 120
+        const startY = 120;
+        doc.y = startY;
+      } catch (imageError) {
+        console.warn('Could not load letterhead image:', imageError.message);
+        console.log('Trying alternative path...');
+        
+        // Try alternative path - relative to project root
+        try {
+          const altPath = './src/letterHeads/letter-head.jpg';
+          doc.image(altPath, 50, 30, { 
+            width: 500, 
+            height: 80
+          });
+          const startY = 120;
+          doc.y = startY;
+        } catch (altError) {
+          console.warn('Alternative path also failed:', altError.message);
+          // Fallback: start at default position if image fails to load
+          const startY = 140;
+          doc.y = startY;
+          
+          // Add a placeholder header instead
+          doc.fontSize(20)
+            .fillColor('#1e293b')
+            .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
+            .moveDown(0.5);
+        }
+      }
+
+      // Move cursor below letterhead
+      doc.moveDown(2);
 
       // Invoice Title
       doc.fontSize(28)
@@ -355,38 +392,20 @@ async function generateInvoicePDF(invoice, tenant) {
         .text(`Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`, 50, topY + 30)
         .text(`Payment Period: ${invoice.paymentPeriod}`, 50, topY + 45);
 
-      // VAT Information - moved to right column for better visibility
+      // VAT Information - right column
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
         doc.text(`VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`, 300, topY + 15);
       }
 
-      // Status Badge - moved to top right for better visibility
-      const statusWidth = 100;
-      const statusX = 500 - statusWidth;
-      doc.rect(statusX, topY, statusWidth, 25)
-        .fillAndStroke(
-          invoice.status === 'PAID' ? '#10b981' : 
-          invoice.status === 'PARTIAL' ? '#f59e0b' : '#ef4444',
-          invoice.status === 'PAID' ? '#10b981' : 
-          invoice.status === 'PARTIAL' ? '#f59e0b' : '#ef4444'
-        );
-      
-      doc.fillColor('#fff')
-        .fontSize(12)
-        .text(
-          invoice.status, 
-          statusX, 
-          topY + 7, 
-          { width: statusWidth, align: 'center' }
-        );
-
       doc.moveDown(3);
 
-      // Tenant Information
+      // Tenant Information Section
       const tenantY = doc.y;
+      
+      // Left side - BILL TO
       doc.fontSize(12)
         .fillColor('#1e293b')
-        .text('BILL TO:', { underline: true })
+        .text('BILL TO:', 50, tenantY, { underline: true })
         .moveDown(0.5);
 
       doc.fontSize(10)
@@ -395,6 +414,19 @@ async function generateInvoicePDF(invoice, tenant) {
         .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
         .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 55)
         .text(`Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`, 50, tenantY + 70);
+
+      // Right side - Property/Landlord Information
+      doc.fontSize(12)
+        .fillColor('#1e293b')
+        .text('FROM:', 300, tenantY, { underline: true })
+        .moveDown(0.5);
+
+      doc.fontSize(10)
+        .fillColor('#374151')
+        .text('Interpark Enterprises Limited', 300, tenantY + 25)
+        .text('Tel: 0110 060 088', 300, tenantY + 40)
+        .text('Email: info@interparkenterprises.co.ke', 300, tenantY + 55)
+        .text('Website: www.interparkenterprises.co.ke', 300, tenantY + 70);
 
       doc.moveDown(4);
 
@@ -476,14 +508,6 @@ async function generateInvoicePDF(invoice, tenant) {
         currentY += 20;
       }
 
-      // Balance - Clear and prominent
-      doc.fontSize(12)
-        .fillColor(invoice.balance > 0 ? '#dc2626' : '#10b981')
-        .text('BALANCE DUE:', descX, currentY, { bold: true })
-        .text(`Ksh ${invoice.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY, { width: 80, align: 'right', bold: true });
-
-      currentY += 40;
-
       // Notes Section (if any)
       if (invoice.notes) {
         doc.fontSize(10)
@@ -494,16 +518,27 @@ async function generateInvoicePDF(invoice, tenant) {
         currentY = doc.y + 20;
       }
 
-      // Footer
-      const footerY = doc.page.height - 80;
+      // Footer with company information
+      const footerY = doc.page.height - 100;
+      
+      // Separator line above footer
+      doc.rect(50, footerY - 10, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
+      
       doc.fontSize(9)
         .fillColor('#6b7280')
         .text(
-          'Thank you for your business! For any inquiries, please contact the property management office.',
+          'Thank you for your business!',
           50,
           footerY,
           { align: 'center', width: 500 }
         )
+        .moveDown(0.5)
+        .fontSize(8)
+        .text(
+          'Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke',
+          { align: 'center', width: 500 }
+        )
+        .moveDown(0.3)
         .text(
           `Generated on ${new Date().toLocaleDateString('en-US')}`,
           { align: 'center', width: 500 }
@@ -515,6 +550,7 @@ async function generateInvoicePDF(invoice, tenant) {
     }
   });
 }
+
 
 // @desc    Generate invoice for partial payment balance
 // @route   POST /api/invoices/generate-from-partial

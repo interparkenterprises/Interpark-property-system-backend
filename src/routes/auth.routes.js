@@ -4,7 +4,10 @@ import {
   loginUser, 
   getProfile, 
   registerAdmin,
-  updateUserRole 
+  updateUserRole,
+  approveUser,
+  getPendingUsers,
+  getAllUsers
 } from '../controllers/auth.controller.js';
 import { protect, adminProtect } from '../middleware/authMiddleware.js';
 
@@ -18,7 +21,10 @@ router.post('/login', loginUser);
 router.get('/profile', protect, getProfile);
 
 // Admin only routes
-router.post('/register-admin', protect, adminProtect, registerAdmin);
+router.post('/register-admin',  registerAdmin);
+router.get('/users', protect, adminProtect, getAllUsers);
+router.get('/users/pending', protect, adminProtect, getPendingUsers);
 router.put('/users/:id/role', protect, adminProtect, updateUserRole);
+router.put('/users/:id/approve', protect, adminProtect, approveUser);
 
 export default router;
