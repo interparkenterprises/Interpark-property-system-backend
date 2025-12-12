@@ -770,18 +770,51 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // Company Header
-      doc.fontSize(20)
-        .fillColor('#2563eb')
-        .text(invoice.tenant.unit?.property?.name || 'Property Management', { align: 'center' });
+      // ===== ADD LETTERHEAD IMAGE =====
+      const letterheadPath = '../letterHeads/letter-head.jpg';
       
-      doc.fontSize(10)
-        .fillColor('#666')
-        .text('Property Management System', { align: 'center' })
-        .moveDown();
+      try {
+        // Add letterhead image at the top
+        doc.image(letterheadPath, 50, 30, { 
+          width: 500, 
+          height: 80
+        });
+        
+        // Adjust the Y position to start below the letterhead
+        const startY = 120;
+        doc.y = startY;
+      } catch (imageError) {
+        console.warn('Could not load letterhead image:', imageError.message);
+        console.log('Trying alternative path...');
+        
+        // Try alternative path - relative to project root
+        try {
+          const altPath = './src/letterHeads/letter-head.jpg';
+          doc.image(altPath, 50, 30, { 
+            width: 500, 
+            height: 80
+          });
+          const startY = 120;
+          doc.y = startY;
+        } catch (altError) {
+          console.warn('Alternative path also failed:', altError.message);
+          // Fallback: start at default position if image fails to load
+          const startY = 140;
+          doc.y = startY;
+          
+          // Add a placeholder header instead
+          doc.fontSize(20)
+            .fillColor('#1e293b')
+            .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
+            .moveDown(0.5);
+        }
+      }
+
+      // Move cursor below letterhead
+      doc.moveDown(2);
 
       // Invoice Title with BALANCE badge
-      doc.fontSize(24)
+      doc.fontSize(28)
         .fillColor('#dc2626')
         .text('BALANCE INVOICE', { align: 'center' })
         .moveDown(0.5);
@@ -829,9 +862,11 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       // Tenant Information
       const tenantY = doc.y;
+      
+      // Left side - BILL TO
       doc.fontSize(12)
         .fillColor('#1e293b')
-        .text('BILL TO:', { underline: true })
+        .text('BILL TO:', 50, tenantY, { underline: true })
         .moveDown(0.5);
 
       doc.fontSize(10)
@@ -840,6 +875,19 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
         .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 55)
         .text(`Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`, 50, tenantY + 70);
+
+      // Right side - Property/Landlord Information
+      doc.fontSize(12)
+        .fillColor('#1e293b')
+        .text('FROM:', 300, tenantY, { underline: true })
+        .moveDown(0.5);
+
+      doc.fontSize(10)
+        .fillColor('#374151')
+        .text('Interpark Enterprises Limited', 300, tenantY + 25)
+        .text('Tel: 0110 060 088', 300, tenantY + 40)
+        .text('Email: info@interparkenterprises.co.ke', 300, tenantY + 55)
+        .text('Website: www.interparkenterprises.co.ke', 300, tenantY + 70);
 
       doc.moveDown(4);
 
@@ -933,16 +981,27 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text('⚠️  IMPORTANT NOTICE', 60, currentY + 8, { bold: true })
         .text('Please settle this outstanding balance by the due date to avoid additional charges.', 60, currentY + 25, { width: 480 });
 
-      // Footer
-      const footerY = doc.page.height - 80;
+      // Footer with company information (consistent with first function)
+      const footerY = doc.page.height - 100;
+      
+      // Separator line above footer
+      doc.rect(50, footerY - 10, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
+      
       doc.fontSize(9)
         .fillColor('#6b7280')
         .text(
-          'For payment inquiries or assistance, please contact the property management office.',
+          'Thank you for your business!',
           50,
           footerY,
           { align: 'center', width: 500 }
         )
+        .moveDown(0.5)
+        .fontSize(8)
+        .text(
+          'Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke',
+          { align: 'center', width: 500 }
+        )
+        .moveDown(0.3)
         .text(
           `Balance Invoice generated on ${new Date().toLocaleDateString('en-US')}`,
           { align: 'center', width: 500 }

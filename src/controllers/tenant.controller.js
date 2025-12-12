@@ -153,6 +153,7 @@ export const createTenant = async (req, res) => {
 
     const {
       fullName,
+      email,
       contact,
       KRAPin,
       POBox,
@@ -171,60 +172,99 @@ export const createTenant = async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!fullName || !contact || !KRAPin || !unitId || !leaseTerm || rent == null || !termStart || !rentStart || deposit == null || !paymentPolicy) {
+    if (
+      !fullName ||
+      !email ||
+      !contact ||
+      !KRAPin ||
+      !unitId ||
+      !leaseTerm ||
+      rent == null ||
+      !termStart ||
+      !rentStart ||
+      deposit == null ||
+      !paymentPolicy
+    ) {
       return res.status(400).json({
-        message: 'All fields except POBox, escalationRate, escalationFrequency, vatRate, vatType, and serviceCharge are required.'
+        message:
+          "All fields except POBox, escalationRate, escalationFrequency, vatRate, vatType, and serviceCharge are required.",
       });
     }
 
-    // Check if unit exists and verify manager has access
+    // Check email uniqueness
+    const existingEmail = await prisma.tenant.findUnique({
+      where: { email },
+    });
+
+    if (existingEmail) {
+      return res.status(400).json({
+        message: "Email already exists",
+      });
+    }
+
+    // Check if KRA Pin is unique
+    const existingKRA = await prisma.tenant.findUnique({
+      where: { KRAPin },
+    });
+
+    if (existingKRA) {
+      return res.status(400).json({ message: "KRA Pin already exists" });
+    }
+
+    // Check if unit exists
     const unit = await prisma.unit.findUnique({
       where: { id: unitId },
-      include: { property: true }
+      include: { property: true },
     });
 
     if (!unit) {
-      return res.status(404).json({ message: 'Unit not found' });
+      return res.status(404).json({ message: "Unit not found" });
     }
 
-    // Check access for managers
-    if (userRole === 'MANAGER' && unit.property.managerId !== userId) {
-      return res.status(403).json({ message: 'Access denied to this unit' });
+    // Manager access control
+    if (userRole === "MANAGER" && unit.property.managerId !== userId) {
+      return res.status(403).json({ message: "Access denied to this unit" });
     }
 
-    if (unit.status === 'OCCUPIED') {
-      return res.status(400).json({ message: 'Unit is already occupied' });
+    if (unit.status === "OCCUPIED") {
+      return res.status(400).json({ message: "Unit is already occupied" });
     }
 
     // Validate payment policy enum
-    const validPaymentPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
+    const validPaymentPolicies = ["MONTHLY", "QUARTERLY", "ANNUAL"];
     const normalizedPaymentPolicy = paymentPolicy.toUpperCase();
     if (!validPaymentPolicies.includes(normalizedPaymentPolicy)) {
       return res.status(400).json({
-        message: `Invalid payment policy. Must be one of: ${validPaymentPolicies.join(', ')}`
+        message: `Invalid payment policy. Must be one of: ${validPaymentPolicies.join(
+          ", "
+        )}`,
       });
     }
 
-    // Validate escalationFrequency if provided
+    // Validate escalationFrequency
     let normalizedEscalationFrequency = null;
     if (escalationFrequency !== undefined && escalationFrequency !== null) {
-      const validEscalations = ['ANNUALLY', 'BI_ANNUALLY'];
+      const validEscalations = ["ANNUALLY", "BI_ANNUALLY"];
       normalizedEscalationFrequency = escalationFrequency.toUpperCase();
       if (!validEscalations.includes(normalizedEscalationFrequency)) {
         return res.status(400).json({
-          message: `Invalid escalation frequency. Must be one of: ${validEscalations.join(', ')}, or null`
+          message: `Invalid escalation frequency. Must be one of: ${validEscalations.join(
+            ", "
+          )}, or null`,
         });
       }
     }
 
-    // Validate VAT type if provided
-    let normalizedVatType = 'NOT_APPLICABLE';
+    // Validate VAT type
+    let normalizedVatType = "NOT_APPLICABLE";
     if (vatType !== undefined && vatType !== null) {
-      const validVatTypes = ['INCLUSIVE', 'EXCLUSIVE', 'NOT_APPLICABLE'];
+      const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
       normalizedVatType = vatType.toUpperCase();
       if (!validVatTypes.includes(normalizedVatType)) {
         return res.status(400).json({
-          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(', ')}`
+          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(
+            ", "
+          )}`,
         });
       }
     }
@@ -235,152 +275,100 @@ export const createTenant = async (req, res) => {
       parsedVatRate = parseFloat(vatRate);
       if (isNaN(parsedVatRate) || parsedVatRate < 0 || parsedVatRate > 100) {
         return res.status(400).json({
-          message: 'VAT rate must be a number between 0 and 100'
+          message: "VAT rate must be a number between 0 and 100",
         });
       }
     }
 
-    // If VAT type is NOT_APPLICABLE, force vatRate to 0
-    if (normalizedVatType === 'NOT_APPLICABLE') {
+    // If VAT type is NOT_APPLICABLE, force vatRate = 0
+    if (normalizedVatType === "NOT_APPLICABLE") {
       parsedVatRate = 0;
     }
 
-    // Check if KRA Pin is unique
-    const existingKRA = await prisma.tenant.findUnique({
-      where: { KRAPin }
-    });
-    if (existingKRA) {
-      return res.status(400).json({ message: 'KRA Pin already exists' });
-    }
-
-    // Parse rent amount
     const parsedRent = parseFloat(rent);
 
     // Build tenant data
     const tenantData = {
       fullName,
+      email,
       contact,
       KRAPin,
       POBox: POBox || null,
       unitId,
       leaseTerm,
       rent: parsedRent,
-      escalationRate: escalationRate != null ? parseFloat(escalationRate) : null,
+      escalationRate:
+        escalationRate != null ? parseFloat(escalationRate) : null,
       escalationFrequency: normalizedEscalationFrequency,
       termStart: new Date(termStart),
       rentStart: new Date(rentStart),
       deposit: parseFloat(deposit),
       paymentPolicy: normalizedPaymentPolicy,
       vatRate: parsedVatRate,
-      vatType: normalizedVatType
+      vatType: normalizedVatType,
     };
 
     // Create tenant
     const tenant = await prisma.tenant.create({
       data: tenantData,
       include: {
-        unit: {
-          include: { property: true }
-        },
-        serviceCharge: true
-      }
+        unit: { include: { property: true } },
+        serviceCharge: true,
+      },
     });
 
-    // Update unit rent amount to match tenant's rent and set status to OCCUPIED
+    // Update unit
     await prisma.unit.update({
       where: { id: unitId },
-      data: { 
+      data: {
         rentAmount: parsedRent,
-        status: 'OCCUPIED'
-      }
+        status: "OCCUPIED",
+      },
     });
 
-    // Handle service charge if provided
+    // Handle service charge
     if (serviceCharge) {
       const { type, fixedAmount, percentage, perSqFtRate } = serviceCharge;
 
-      // Validate service charge type
-      const validServiceChargeTypes = ['FIXED', 'PERCENTAGE', 'PER_SQ_FT'];
+      const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
       const normalizedType = type?.toUpperCase();
-      if (!normalizedType || !validServiceChargeTypes.includes(normalizedType)) {
-        // Clean up on failure
-        await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ 
-          where: { id: unitId }, 
-          data: { 
-            status: 'VACANT',
-            rentAmount: unit.rentAmount
-          } 
-        });
+
+      if (!normalizedType || !validTypes.includes(normalizedType)) {
         return res.status(400).json({
-          message: `Invalid service charge type. Must be one of: ${validServiceChargeTypes.join(', ')}`
+          message: `Invalid service charge type. Must be: ${validTypes.join(
+            ", "
+          )}`,
         });
       }
 
-      // Validate values by type
-      if (normalizedType === 'FIXED' && (!fixedAmount || parseFloat(fixedAmount) <= 0)) {
-        await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ 
-          where: { id: unitId }, 
-          data: { 
-            status: 'VACANT',
-            rentAmount: unit.rentAmount
-          } 
-        });
-        return res.status(400).json({ message: 'Fixed amount (> 0) is required for FIXED service charge' });
-      }
-
-      if (normalizedType === 'PERCENTAGE' && (!percentage || parseFloat(percentage) <= 0)) {
-        await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ 
-          where: { id: unitId }, 
-          data: { 
-            status: 'VACANT',
-            rentAmount: unit.rentAmount
-          } 
-        });
-        return res.status(400).json({ message: 'Percentage (> 0) is required for PERCENTAGE service charge' });
-      }
-
-      if (normalizedType === 'PER_SQ_FT' && (!perSqFtRate || parseFloat(perSqFtRate) <= 0)) {
-        await prisma.tenant.delete({ where: { id: tenant.id } });
-        await prisma.unit.update({ 
-          where: { id: unitId }, 
-          data: { 
-            status: 'VACANT',
-            rentAmount: unit.rentAmount
-          } 
-        });
-        return res.status(400).json({ message: 'Per sq. ft rate (> 0) is required for PER_SQ_FT service charge' });
-      }
-
-      // Create service charge
       await prisma.serviceCharge.create({
         data: {
           tenantId: tenant.id,
           type: normalizedType,
           fixedAmount: fixedAmount ? parseFloat(fixedAmount) : null,
           percentage: percentage ? parseFloat(percentage) : null,
-          perSqFtRate: perSqFtRate ? parseFloat(perSqFtRate) : null
-        }
+          perSqFtRate: perSqFtRate ? parseFloat(perSqFtRate) : null,
+        },
       });
     }
 
-    // Return full tenant with relations
-    const completeTenant = await prisma.tenant.findUnique({
-      where: { id: tenant.id },
-      include: {
-        unit: { include: { property: true } },
-        serviceCharge: true
-      }
-    });
-
-    res.status(201).json(completeTenant);
+    res.status(201).json(
+      await prisma.tenant.findUnique({
+        where: { id: tenant.id },
+        include: {
+          unit: { include: { property: true } },
+          serviceCharge: true,
+        },
+      })
+    );
   } catch (error) {
-    console.error('Create tenant error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error("Create tenant error:", error);
+    res
+      .status(500)
+      .json({ message: "Server error", error: error.message });
   }
 };
+
 
 // @desc    Update tenant
 // @route   PUT /api/tenants/:id
@@ -390,16 +378,19 @@ export const updateTenant = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Check access for managers
-    if (userRole === 'MANAGER') {
-      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
+    if (userRole === "MANAGER") {
+      const { hasAccess } = await checkManagerTenantAccess(
+        userId,
+        req.params.id
+      );
       if (!hasAccess) {
-        return res.status(403).json({ message: 'Access denied to this tenant' });
+        return res.status(403).json({ message: "Access denied to this tenant" });
       }
     }
 
     const {
       fullName,
+      email,
       contact,
       KRAPin,
       POBox,
@@ -413,38 +404,48 @@ export const updateTenant = async (req, res) => {
       paymentPolicy,
       vatRate,
       vatType,
-      serviceCharge
+      serviceCharge,
     } = req.body;
 
     // Fetch existing tenant
     const existingTenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
-      include: { 
+      include: {
         serviceCharge: true,
-        unit: true 
-      }
+        unit: true,
+      },
     });
 
     if (!existingTenant) {
-      return res.status(404).json({ message: 'Tenant not found' });
+      return res.status(404).json({ message: "Tenant not found" });
     }
 
-    // Check KRA uniqueness if updating
+    // Check email uniqueness
+    if (email && email !== existingTenant.email) {
+      const existing = await prisma.tenant.findUnique({ where: { email } });
+      if (existing) {
+        return res.status(400).json({ message: "Email already exists" });
+      }
+    }
+
+    // Check KRA uniqueness
     if (KRAPin && KRAPin !== existingTenant.KRAPin) {
       const existingKRA = await prisma.tenant.findUnique({ where: { KRAPin } });
       if (existingKRA) {
-        return res.status(400).json({ message: 'KRA Pin already exists' });
+        return res.status(400).json({ message: "KRA Pin already exists" });
       }
     }
 
     // Validate payment policy
     let normalizedPaymentPolicy = undefined;
     if (paymentPolicy !== undefined) {
-      const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
+      const validPolicies = ["MONTHLY", "QUARTERLY", "ANNUAL"];
       normalizedPaymentPolicy = paymentPolicy.toUpperCase();
       if (!validPolicies.includes(normalizedPaymentPolicy)) {
         return res.status(400).json({
-          message: `Invalid payment policy. Must be one of: ${validPolicies.join(', ')}`
+          message: `Invalid payment policy. Must be one of: ${validPolicies.join(
+            ", "
+          )}`,
         });
       }
     }
@@ -455,11 +456,13 @@ export const updateTenant = async (req, res) => {
       if (escalationFrequency === null) {
         normalizedEscalationFrequency = null;
       } else {
-        const validEscalations = ['ANNUALLY', 'BI_ANNUALLY'];
+        const validEscalations = ["ANNUALLY", "BI_ANNUALLY"];
         normalizedEscalationFrequency = escalationFrequency.toUpperCase();
         if (!validEscalations.includes(normalizedEscalationFrequency)) {
           return res.status(400).json({
-            message: `Invalid escalation frequency. Must be one of: ${validEscalations.join(', ')}, or null`
+            message: `Invalid escalation frequency. Must be: ${validEscalations.join(
+              ", "
+            )}, or null`,
           });
         }
       }
@@ -468,11 +471,11 @@ export const updateTenant = async (req, res) => {
     // Validate VAT type
     let normalizedVatType = undefined;
     if (vatType !== undefined) {
-      const validVatTypes = ['INCLUSIVE', 'EXCLUSIVE', 'NOT_APPLICABLE'];
+      const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
       normalizedVatType = vatType.toUpperCase();
       if (!validVatTypes.includes(normalizedVatType)) {
         return res.status(400).json({
-          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(', ')}`
+          message: `Invalid VAT type. Must be: ${validVatTypes.join(", ")}`,
         });
       }
     }
@@ -486,133 +489,154 @@ export const updateTenant = async (req, res) => {
         parsedVatRate = parseFloat(vatRate);
         if (isNaN(parsedVatRate) || parsedVatRate < 0 || parsedVatRate > 100) {
           return res.status(400).json({
-            message: 'VAT rate must be a number between 0 and 100'
+            message: "VAT rate must be between 0 and 100",
           });
         }
       }
     }
 
-    // If VAT type is being changed to NOT_APPLICABLE, force vatRate to 0
-    if (normalizedVatType === 'NOT_APPLICABLE') {
+    if (normalizedVatType === "NOT_APPLICABLE") {
       parsedVatRate = 0;
     }
 
-    // Parse rent amount if provided
+    // Rent
     let parsedRent = undefined;
     if (rent !== undefined) {
       parsedRent = parseFloat(rent);
       if (isNaN(parsedRent) || parsedRent < 0) {
         return res.status(400).json({
-          message: 'Rent must be a positive number'
+          message: "Rent must be a positive number",
         });
       }
     }
 
-    // Parse numeric fields conditionally
+    // Build updateData
     const updateData = {
       fullName,
+      email,
       contact,
       KRAPin,
       POBox,
       leaseTerm,
       rent: parsedRent,
-      escalationRate: escalationRate != null 
-        ? (escalationRate === null ? null : parseFloat(escalationRate)) 
-        : undefined,
+      escalationRate:
+        escalationRate != null
+          ? escalationRate === null
+            ? null
+            : parseFloat(escalationRate)
+          : undefined,
       escalationFrequency: normalizedEscalationFrequency,
       termStart: termStart ? new Date(termStart) : undefined,
       rentStart: rentStart ? new Date(rentStart) : undefined,
       deposit: deposit != null ? parseFloat(deposit) : undefined,
       paymentPolicy: normalizedPaymentPolicy,
       vatRate: parsedVatRate,
-      vatType: normalizedVatType
+      vatType: normalizedVatType,
     };
 
-    // Remove undefined fields to avoid overwriting with null/undefined
-    Object.keys(updateData).forEach(key => {
-      if (updateData[key] === undefined) {
-        delete updateData[key];
-      }
+    // Remove undefined fields
+    Object.keys(updateData).forEach((key) => {
+      if (updateData[key] === undefined) delete updateData[key];
     });
 
-    // Perform tenant update
+    // Apply update
     const updatedTenant = await prisma.tenant.update({
       where: { id: req.params.id },
       data: updateData,
       include: {
         unit: { include: { property: true } },
-        serviceCharge: true
-      }
+        serviceCharge: true,
+      },
     });
 
-    // If rent was updated, also update the unit's rentAmount
+    // Update unit rent if changed
     if (rent !== undefined && parsedRent !== existingTenant.rent) {
-      await updateUnitRent(existingTenant.unitId, parsedRent);
+      await prisma.unit.update({
+        where: { id: existingTenant.unitId },
+        data: { rentAmount: parsedRent },
+      });
     }
 
-    // Handle service charge update or creation
+    // Handle service charge update
     if (serviceCharge) {
       const { type, fixedAmount, percentage, perSqFtRate } = serviceCharge;
 
       let normalizedType = undefined;
       if (type !== undefined) {
-        const validTypes = ['FIXED', 'PERCENTAGE', 'PER_SQ_FT'];
+        const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
         normalizedType = type.toUpperCase();
         if (!validTypes.includes(normalizedType)) {
           return res.status(400).json({
-            message: `Invalid service charge type. Must be one of: ${validTypes.join(', ')}`
+            message: `Invalid service charge type. Must be: ${validTypes.join(
+              ", "
+            )}`,
           });
         }
       }
 
-      // Prepare service charge update data
       const serviceChargeData = {
         type: normalizedType,
-        fixedAmount: fixedAmount != null ? (fixedAmount === null ? null : parseFloat(fixedAmount)) : undefined,
-        percentage: percentage != null ? (percentage === null ? null : parseFloat(percentage)) : undefined,
-        perSqFtRate: perSqFtRate != null ? (perSqFtRate === null ? null : parseFloat(perSqFtRate)) : undefined
+        fixedAmount:
+          fixedAmount != null
+            ? fixedAmount === null
+              ? null
+              : parseFloat(fixedAmount)
+            : undefined,
+        percentage:
+          percentage != null
+            ? percentage === null
+              ? null
+              : parseFloat(percentage)
+            : undefined,
+        perSqFtRate:
+          perSqFtRate != null
+            ? perSqFtRate === null
+              ? null
+              : parseFloat(perSqFtRate)
+            : undefined,
       };
 
-      // Remove undefined
-      Object.keys(serviceChargeData).forEach(k => serviceChargeData[k] === undefined && delete serviceChargeData[k]);
+      Object.keys(serviceChargeData).forEach((k) => {
+        if (serviceChargeData[k] === undefined) delete serviceChargeData[k];
+      });
 
       if (Object.keys(serviceChargeData).length > 0) {
         if (existingTenant.serviceCharge) {
-          // Update existing
           await prisma.serviceCharge.update({
             where: { tenantId: req.params.id },
-            data: serviceChargeData
+            data: serviceChargeData,
           });
         } else if (normalizedType) {
-          // Create new (only if type is provided)
           await prisma.serviceCharge.create({
             data: {
               tenantId: req.params.id,
               type: normalizedType,
               fixedAmount: serviceChargeData.fixedAmount ?? null,
               percentage: serviceChargeData.percentage ?? null,
-              perSqFtRate: serviceChargeData.perSqFtRate ?? null
-            }
+              perSqFtRate: serviceChargeData.perSqFtRate ?? null,
+            },
           });
         }
       }
     }
 
-    // Fetch final updated tenant
     const finalTenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: {
         unit: { include: { property: true } },
-        serviceCharge: true
-      }
+        serviceCharge: true,
+      },
     });
 
     res.json(finalTenant);
   } catch (error) {
-    console.error('Update tenant error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    console.error("Update tenant error:", error);
+    res
+      .status(500)
+      .json({ message: "Server error", error: error.message });
   }
 };
+
 
 // @desc    Delete tenant
 // @route   DELETE /api/tenants/:id

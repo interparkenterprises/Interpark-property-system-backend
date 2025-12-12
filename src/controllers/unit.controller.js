@@ -97,8 +97,18 @@ export const getUnits = async (req, res) => {
 // @access  Private
 export const getUnitsByProperty = async (req, res) => {
   try {
+    const { propertyId } = req.params;
+    const { status } = req.query; // Get status from query parameters
+    
+    // Build where clause
+    const whereClause = { propertyId };
+    
+    if (status) {
+      whereClause.status = status;
+    }
+    
     const units = await prisma.unit.findMany({
-      where: { propertyId: req.params.propertyId },
+      where: whereClause,
       include: {
         property: {
           select: {

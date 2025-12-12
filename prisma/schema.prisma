@@ -115,6 +115,7 @@ model Tenant {
   fullName            String
   KRAPin              String               @unique
   POBox               String?
+  email               String?              @unique
   paymentPolicy       PaymentPolicy
   escalationFrequency EscalationFrequency?
   escalationRate      Float?
