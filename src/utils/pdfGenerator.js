@@ -1,42 +1,48 @@
-import PDFDocument from 'pdfkit';
-
+import puppeteer from 'puppeteer';
 
 /**
- * Generate PDF from HTML using PDFKit (pure Node.js)
+ * Generate PDF from HTML using Puppeteer (proper HTML/CSS rendering)
  * @param {string} htmlContent 
  * @param {object} options 
  * @returns {Promise<Buffer>}
  */
 export const generatePDF = async (htmlContent, options = {}) => {
-  return new Promise((resolve, reject) => {
-    try {
-      // Create a document
-      const doc = new PDFDocument({
-        size: 'A4',
-        margins: { top: 20, bottom: 20, left: 15, right: 15 },
-        ...options.pdfkitOptions
-      });
-      
-      const buffers = [];
-      doc.on('data', buffers.push.bind(buffers));
-      doc.on('end', () => {
-        const pdfBuffer = Buffer.concat(buffers);
-        resolve(pdfBuffer);
-      });
-      
-      // For HTML to PDF, you'll need additional processing
-      // Basic text rendering (for simple cases)
-      doc.fontSize(10);
-      doc.text(htmlContent.replace(/<[^>]*>/g, ' '), {
-        align: 'left',
-        width: doc.page.width - 30 // Account for margins
-      });
-      
-      doc.end();
-      
-    } catch (error) {
-      console.error('PDF generation error:', error);
-      reject(new Error(`Failed to generate PDF: ${error.message}`));
+  let browser;
+  try {
+    // Launch browser
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const page = await browser.newPage();
+    
+    // Set the HTML content
+    await page.setContent(htmlContent, {
+      waitUntil: 'networkidle0'
+    });
+    
+    // Generate PDF
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      margin: {
+        top: '2.5cm',
+        right: '2cm',
+        bottom: '2.5cm',
+        left: '2cm'
+      },
+      printBackground: true,
+      ...options
+    });
+    
+    await browser.close();
+    return pdfBuffer;
+    
+  } catch (error) {
+    console.error('PDF generation error:', error);
+    if (browser) {
+      await browser.close();
     }
-  });
+    throw new Error(`Failed to generate PDF: ${error.message}`);
+  }
 };

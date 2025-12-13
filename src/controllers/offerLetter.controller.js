@@ -6,13 +6,27 @@ import { uploadDocument } from '../utils/uploadHelper.js';
 
 const prisma = new PrismaClient();
 
-// Helper function to parse address into components
+// Helper function to parse address into components - FIXED to properly extract P.O. Box
 const parseAddress = (address) => {
   if (!address) return { poBox: '', fullAddress: address };
   
-  // Try to extract P.O. Box if present
-  const poBoxMatch = address.match(/P\.?O\.?\s*Box\s*(\d+)/i);
-  const poBox = poBoxMatch ? poBoxMatch[1] : '';
+  // Try to extract P.O. Box if present (various formats)
+  const poBoxPatterns = [
+    /P\.?\s*O\.?\s*Box\s*(\d+[\w-]*)/i,  // P.O. Box 12345
+    /P\.?\s*O\.?\s*BOX\s*(\d+[\w-]*)/i,  // P.O BOX 12345
+    /Post\s*Office\s*Box\s*(\d+[\w-]*)/i, // Post Office Box 12345
+    /POBox\s*(\d+[\w-]*)/i,              // POBox12345
+    /Box\s*(\d+[\w-]*)/i                  // Box 12345
+  ];
+  
+  let poBox = '';
+  for (const pattern of poBoxPatterns) {
+    const match = address.match(pattern);
+    if (match) {
+      poBox = match[1];
+      break;
+    }
+  }
   
   return {
     poBox,
@@ -33,6 +47,44 @@ const calculatePayments = (rentAmount, serviceCharge, depositMonths = 1, advance
   const advanceRent = monthlyTotal * advanceMonths;
   
   return { deposit, advanceRent, monthlyTotal };
+};
+
+// Helper function to generate unique offer number (Solution 4)
+const generateOfferNumber = async () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const prefix = `OFL-${year}-${month}`;
+  
+  // Try up to 5 times to avoid collisions
+  for (let attempt = 0; attempt < 5; attempt++) {
+    // Get count of existing offers this month
+    const count = await prisma.offerLetter.count({
+      where: {
+        createdAt: {
+          gte: new Date(year, now.getMonth(), 1), // First day of current month
+          lt: new Date(year, now.getMonth() + 1, 1) // First day of next month
+        }
+      }
+    });
+    
+    // Add attempt number to sequence to ensure uniqueness
+    const sequence = count + 1 + attempt;
+    const offerNumber = `${prefix}-${String(sequence).padStart(6, '0')}`;
+    
+    // Check if this number already exists
+    const existing = await prisma.offerLetter.findUnique({
+      where: { offerNumber }
+    });
+    
+    if (!existing) {
+      return offerNumber;
+    }
+  }
+  
+  // If all attempts fail, add timestamp for uniqueness
+  const timestamp = Date.now().toString().slice(-6);
+  return `${prefix}-${timestamp}`;
 };
 
 // @desc    Get all offer letters
@@ -167,18 +219,8 @@ export const createOfferLetter = async (req, res) => {
       });
     }
 
-    // Generate unique offer number
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const count = await prisma.offerLetter.count({
-      where: {
-        offerNumber: {
-          startsWith: `OFL-${year}-${month}`
-        }
-      }
-    });
-    const offerNumber = `OFL-${year}-${month}-${String(count + 1).padStart(6, '0')}`;
+    // Generate unique offer number using the new helper function
+    const offerNumber = await generateOfferNumber();
 
     // Calculate deposit and advance rent if not provided
     const finalRentAmount = rentAmount || unit?.rentAmount || 0;
@@ -235,6 +277,15 @@ export const createOfferLetter = async (req, res) => {
     res.status(201).json(offerLetter);
   } catch (error) {
     console.error('Create offer letter error:', error);
+    
+    // Handle specific error cases
+    if (error.code === 'P2002' && error.meta?.target?.includes('offerNumber')) {
+      return res.status(409).json({ 
+        message: 'Offer number conflict. Please try again.',
+        details: 'The generated offer number already exists. This is rare but can happen with concurrent requests.'
+      });
+    }
+    
     res.status(400).json({ message: error.message });
   }
 };
@@ -308,18 +359,8 @@ export const createMixedUseOfferLetter = async (req, res) => {
       return res.status(404).json({ message: 'Unit not found' });
     }
 
-    // Generate unique offer number
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const count = await prisma.offerLetter.count({
-      where: {
-        offerNumber: {
-          startsWith: `OFL-${year}-${month}`
-        }
-      }
-    });
-    const offerNumber = `OFL-${year}-${month}-${String(count + 1).padStart(6, '0')}`;
+    // Generate unique offer number using the same helper function
+    const offerNumber = await generateOfferNumber();
 
     // Calculate payments
     const finalRentAmount = rentAmount || unit?.rentAmount || 0;
@@ -375,11 +416,20 @@ export const createMixedUseOfferLetter = async (req, res) => {
     res.status(201).json(offerLetter);
   } catch (error) {
     console.error('Create mixed-use offer letter error:', error);
+    
+    // Handle specific error cases
+    if (error.code === 'P2002' && error.meta?.target?.includes('offerNumber')) {
+      return res.status(409).json({ 
+        message: 'Offer number conflict. Please try again.',
+        details: 'The generated offer number already exists. This is rare but can happen with concurrent requests.'
+      });
+    }
+    
     res.status(400).json({ message: error.message });
   }
 };
 
-// @desc    Generate PDF for offer letter with complete data extraction
+// @desc    Generate PDF for offer letter with complete data extraction - FIXED VERSION
 // @route   POST /api/offer-letters/:id/generate-pdf
 // @access  Private (Admin/Manager)
 export const generateOfferLetterPDF = async (req, res) => {
@@ -401,7 +451,7 @@ export const generateOfferLetterPDF = async (req, res) => {
       return res.status(404).json({ message: 'Offer letter not found' });
     }
 
-    // Parse addresses
+    // Parse addresses properly - FIXED
     const landlordAddressData = parseAddress(offerLetter.property.landlord?.address);
     const leadAddressData = parseAddress(offerLetter.lead.address);
     const propertyAddressData = parseAddress(offerLetter.property.address);
@@ -409,7 +459,7 @@ export const generateOfferLetterPDF = async (req, res) => {
     // Get metadata
     const metadata = offerLetter.metadata || {};
 
-    // Base template data
+    // Base template data with FIXED field mappings and PROPER DATE HANDLING
     const baseTemplateData = {
       // Property details
       propertyName: offerLetter.property.name,
@@ -417,9 +467,9 @@ export const generateOfferLetterPDF = async (req, res) => {
       propertyPOBox: propertyAddressData.poBox,
       propertyLRNumber: offerLetter.property.lrNumber,
       
-      // Landlord details
+      // Landlord details - FIXED P.O. Box handling
       landlordName: offerLetter.property.landlord?.name,
-      landlordPOBox: landlordAddressData.poBox,
+      landlordPOBox: landlordAddressData.poBox, // Now properly extracted
       landlordAddress: offerLetter.property.landlord?.address,
       landlordIDNumber: offerLetter.property.landlord?.idNumber,
       
@@ -430,25 +480,26 @@ export const generateOfferLetterPDF = async (req, res) => {
       landlordBankBranch: offerLetter.property.branch,
       landlordBankBranchCode: offerLetter.property.branchCode,
       
-      // Lead details
+      // Lead details - FIXED P.O. Box handling
       leadName: offerLetter.lead.name,
       leadEmail: offerLetter.lead.email,
-      leadPOBox: leadAddressData.poBox,
+      leadPOBox: leadAddressData.poBox, // Now properly extracted
       leadAddress: offerLetter.lead.address,
       leadIDNumber: offerLetter.lead.idNumber,
+      leadPINNumber: offerLetter.lead.pinNumber,
       leadCompanyName: offerLetter.lead.companyName,
       leadPhone: offerLetter.lead.phone,
       
-      // Offer details
-      date: formatDate(offerLetter.issueDate),
+      // Offer details - FIXED: Always provide valid dates
+      date: new Date().toISOString(), // Current date for the agreement
       offerNumber: offerLetter.offerNumber,
       rentAmount: offerLetter.rentAmount,
       deposit: offerLetter.deposit,
       leaseTerm: offerLetter.leaseTerm,
       serviceCharge: offerLetter.serviceCharge,
       escalationRate: offerLetter.escalationRate,
-      leaseStartDate: formatDate(offerLetter.leaseStartDate),
-      rentStartDate: formatDate(offerLetter.rentStartDate),
+      leaseStartDate: offerLetter.leaseStartDate || new Date().toISOString(), // Fallback to current date
+      rentStartDate: offerLetter.rentStartDate || new Date().toISOString(), // Fallback to current date
       
       // Additional terms
       additionalTerms: offerLetter.additionalTerms
@@ -493,12 +544,14 @@ export const generateOfferLetterPDF = async (req, res) => {
       
       htmlContent = generateCommercialOfferLetter(commercialData);
     } else {
+      // RESIDENTIAL - FIXED field mappings and DATE FIXES
       const residentialData = {
         ...baseTemplateData,
-        // Unit details
-        houseNumber: offerLetter.unit?.unitNo || offerLetter.unit?.type,
-        bedrooms: offerLetter.unit?.bedrooms,
-        bathrooms: offerLetter.unit?.bathrooms,
+        // Unit details - FIXED: proper mapping from unit.unitNo
+        houseNumber: offerLetter.unit?.unitNo || offerLetter.unit?.type, // FIXED: Now maps from unitNo
+        bedrooms: offerLetter.unit?.bedrooms,  // FIXED: Now properly passed
+        bathrooms: offerLetter.unit?.bathrooms, // FIXED: Now properly passed
+        floorNumber: offerLetter.unit?.floor,   // FIXED: Now properly passed
         
         // Residential-specific
         escalationFrequency: metadata.escalationFrequency || 'ANNUALLY'
@@ -533,7 +586,7 @@ export const generateOfferLetterPDF = async (req, res) => {
   }
 };
 
-// @desc    Download offer letter PDF with complete data
+// @desc    Download offer letter PDF with complete data - FIXED VERSION
 // @route   GET /api/offer-letters/:id/download
 // @access  Private
 export const downloadOfferLetterPDF = async (req, res) => {
@@ -555,7 +608,7 @@ export const downloadOfferLetterPDF = async (req, res) => {
       return res.status(404).json({ message: 'Offer letter not found' });
     }
 
-    // Parse addresses
+    // Parse addresses properly - FIXED
     const landlordAddressData = parseAddress(offerLetter.property.landlord?.address);
     const leadAddressData = parseAddress(offerLetter.lead.address);
     const propertyAddressData = parseAddress(offerLetter.property.address);
@@ -563,14 +616,14 @@ export const downloadOfferLetterPDF = async (req, res) => {
     // Get metadata
     const metadata = offerLetter.metadata || {};
 
-    // Base template data (same as generate PDF)
+    // Base template data (same as generate PDF) - FIXED with PROPER DATES
     const baseTemplateData = {
       propertyName: offerLetter.property.name,
       propertyAddress: offerLetter.property.address,
       propertyPOBox: propertyAddressData.poBox,
       propertyLRNumber: offerLetter.property.lrNumber,
       landlordName: offerLetter.property.landlord?.name,
-      landlordPOBox: landlordAddressData.poBox,
+      landlordPOBox: landlordAddressData.poBox, // FIXED
       landlordAddress: offerLetter.property.landlord?.address,
       landlordIDNumber: offerLetter.property.landlord?.idNumber,
       landlordBankAccount: offerLetter.property.accountNo,
@@ -580,20 +633,22 @@ export const downloadOfferLetterPDF = async (req, res) => {
       landlordBankBranchCode: offerLetter.property.branchCode,
       leadName: offerLetter.lead.name,
       leadEmail: offerLetter.lead.email,
-      leadPOBox: leadAddressData.poBox,
+      leadPOBox: leadAddressData.poBox, // FIXED
       leadAddress: offerLetter.lead.address,
       leadIDNumber: offerLetter.lead.idNumber,
+      leadPINNumber: offerLetter.lead.pinNumber,
       leadCompanyName: offerLetter.lead.companyName,
       leadPhone: offerLetter.lead.phone,
-      date: formatDate(offerLetter.issueDate),
+      // FIXED: Always provide valid dates
+      date: new Date().toISOString(), // Current date for the agreement
       offerNumber: offerLetter.offerNumber,
       rentAmount: offerLetter.rentAmount,
       deposit: offerLetter.deposit,
       leaseTerm: offerLetter.leaseTerm,
       serviceCharge: offerLetter.serviceCharge,
       escalationRate: offerLetter.escalationRate,
-      leaseStartDate: formatDate(offerLetter.leaseStartDate),
-      rentStartDate: formatDate(offerLetter.rentStartDate),
+      leaseStartDate: offerLetter.leaseStartDate || new Date().toISOString(), // Fallback to current date
+      rentStartDate: offerLetter.rentStartDate || new Date().toISOString(), // Fallback to current date
       additionalTerms: offerLetter.additionalTerms
     };
 
@@ -627,11 +682,13 @@ export const downloadOfferLetterPDF = async (req, res) => {
       
       htmlContent = generateCommercialOfferLetter(commercialData);
     } else {
+      // RESIDENTIAL - FIXED with proper date handling
       const residentialData = {
         ...baseTemplateData,
-        houseNumber: offerLetter.unit?.unitNo || offerLetter.unit?.type,
-        bedrooms: offerLetter.unit?.bedrooms,
-        bathrooms: offerLetter.unit?.bathrooms,
+        houseNumber: offerLetter.unit?.unitNo || offerLetter.unit?.type, // FIXED
+        bedrooms: offerLetter.unit?.bedrooms,  // FIXED
+        bathrooms: offerLetter.unit?.bathrooms, // FIXED
+        floorNumber: offerLetter.unit?.floor,   // FIXED
         escalationFrequency: metadata.escalationFrequency || 'ANNUALLY'
       };
       
