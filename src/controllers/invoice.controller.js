@@ -2,6 +2,8 @@ import prisma from '../lib/prisma.js';
 import PDFDocument from 'pdfkit';
 import { uploadToStorage } from '../utils/storage.js'; // You'll need to implement this
 import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
+import fs from 'fs'; 
+import path from 'path'; 
 
 // @desc    Generate invoice for tenant
 // @route   POST /api/invoices/generate
@@ -328,49 +330,92 @@ async function generateInvoicePDF(invoice, tenant) {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // ===== ADD LETTERHEAD IMAGE =====
-      // Path is relative to the invoice.controller.js file location
-      // From src/controllers/invoice.controller.js to src/letterHeads/letter-head.jpg
-      // So we go up one directory, then into letterHeads
-      const letterheadPath = '../letterHeads/letter-head.jpg';
+      // ===== IMPROVED LETTERHEAD IMAGE HANDLING =====
       
-      try {
-        // Add letterhead image at the top
-        doc.image(letterheadPath, 50, 30, { 
-          width: 500, 
-          height: 80
-        });
+      // Get project root directory
+      const projectRoot = process.cwd();
+      
+      // Define multiple possible paths for the letterhead based on your exact server structure
+      const possiblePaths = [
+        // Exact path based on your server structure
+        path.join(projectRoot, 'src', 'letterHeads', 'letter head-02.jpg'),
+        path.join(projectRoot, 'src', 'letterHeads', 'letter-head.jpg'),
+        path.join(projectRoot, 'src', 'letterHeads', 'letter_head.jpg'),
         
-        // Adjust the Y position to start below the letterhead
-        // 30 (top margin) + 80 (image height) + 10 (padding) = 120
-        const startY = 120;
-        doc.y = startY;
-      } catch (imageError) {
-        console.warn('Could not load letterhead image:', imageError.message);
-        console.log('Trying alternative path...');
+        // Alternative paths in case you're running from a different directory
+        path.join(__dirname, 'letterHeads', 'letter head-02.jpg'),
+        path.join(__dirname, '..', 'letterHeads', 'letter head-02.jpg'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letter head-02.jpg'),
         
-        // Try alternative path - relative to project root
+        // Common fallback paths
+        '/root/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        '/var/www/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+      ];
+
+      let letterheadPath = null;
+      let imageLoaded = false;
+      const startY = 120; // Default starting position below letterhead
+
+      // Debug logging
+      console.log('=== Regular Invoice PDF Generation Debug Info ===');
+      console.log('Project Root (cwd):', projectRoot);
+      console.log('Current File Directory (__dirname):', __dirname);
+      console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
+
+      // Try each possible path
+      for (const possiblePath of possiblePaths) {
         try {
-          const altPath = './src/letterHeads/letter-head.jpg';
-          doc.image(altPath, 50, 30, { 
+          if (fs.existsSync(possiblePath)) {
+            letterheadPath = possiblePath;
+            console.log(`✓ Found letterhead at: ${possiblePath}`);
+            break;
+          } else {
+            console.log(`✗ Not found: ${possiblePath}`);
+          }
+        } catch (err) {
+          console.log(`✗ Error checking: ${possiblePath} - ${err.message}`);
+          continue;
+        }
+      }
+
+      // Add letterhead if found
+      if (letterheadPath) {
+        try {
+          // Add letterhead image at the top
+          doc.image(letterheadPath, 50, 30, { 
             width: 500, 
             height: 80
           });
-          const startY = 120;
-          doc.y = startY;
-        } catch (altError) {
-          console.warn('Alternative path also failed:', altError.message);
-          // Fallback: start at default position if image fails to load
-          const startY = 140;
-          doc.y = startY;
           
-          // Add a placeholder header instead
-          doc.fontSize(20)
-            .fillColor('#1e293b')
-            .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
-            .moveDown(0.5);
+          // Adjust the Y position to start below the letterhead
+          doc.y = startY;
+          imageLoaded = true;
+          console.log('✓ Letterhead image loaded successfully');
+        } catch (imageError) {
+          console.warn('✗ Could not load letterhead image:', imageError.message);
+          console.warn('Image path that failed:', letterheadPath);
+          imageLoaded = false;
         }
+      } else {
+        console.warn('✗ Letterhead image not found in any of the searched paths');
       }
+
+      // Fallback if no image loaded
+      if (!imageLoaded) {
+        console.warn('Using fallback text header');
+        
+        // Fallback: start at adjusted position
+        doc.y = 100;
+        
+        // Add a placeholder header instead
+        doc.fontSize(20)
+          .fillColor('#1e293b')
+          .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
+          .moveDown(0.5);
+      }
+
+      console.log('=== End Debug Info ===\n');
 
       // Move cursor below letterhead
       doc.moveDown(2);
@@ -770,45 +815,92 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // ===== ADD LETTERHEAD IMAGE =====
-      const letterheadPath = '../letterHeads/letter-head.jpg';
+      // ===== IMPROVED LETTERHEAD IMAGE HANDLING =====
       
-      try {
-        // Add letterhead image at the top
-        doc.image(letterheadPath, 50, 30, { 
-          width: 500, 
-          height: 80
-        });
+      // Get project root directory
+      const projectRoot = process.cwd();
+      
+      // Define multiple possible paths for the letterhead based on your exact server structure
+      const possiblePaths = [
+        // Exact path based on your server structure
+        path.join(projectRoot, 'src', 'letterHeads', 'letter head-02.jpg'),
+        path.join(projectRoot, 'src', 'letterHeads', 'letter-head.jpg'),
+        path.join(projectRoot, 'src', 'letterHeads', 'letter_head.jpg'),
         
-        // Adjust the Y position to start below the letterhead
-        const startY = 120;
-        doc.y = startY;
-      } catch (imageError) {
-        console.warn('Could not load letterhead image:', imageError.message);
-        console.log('Trying alternative path...');
+        // Alternative paths in case you're running from a different directory
+        path.join(__dirname, 'letterHeads', 'letter head-02.jpg'),
+        path.join(__dirname, '..', 'letterHeads', 'letter head-02.jpg'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letter head-02.jpg'),
         
-        // Try alternative path - relative to project root
+        // Common fallback paths
+        '/root/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        '/var/www/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+      ];
+
+      let letterheadPath = null;
+      let imageLoaded = false;
+      const startY = 120; // Default starting position below letterhead
+
+      // Debug logging (remove in production if desired)
+      console.log('=== PDF Generation Debug Info ===');
+      console.log('Project Root (cwd):', projectRoot);
+      console.log('Current File Directory (__dirname):', __dirname);
+      console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
+
+      // Try each possible path
+      for (const possiblePath of possiblePaths) {
         try {
-          const altPath = './src/letterHeads/letter-head.jpg';
-          doc.image(altPath, 50, 30, { 
+          if (fs.existsSync(possiblePath)) {
+            letterheadPath = possiblePath;
+            console.log(`✓ Found letterhead at: ${possiblePath}`);
+            break;
+          } else {
+            console.log(`✗ Not found: ${possiblePath}`);
+          }
+        } catch (err) {
+          console.log(`✗ Error checking: ${possiblePath} - ${err.message}`);
+          continue;
+        }
+      }
+
+      // Add letterhead if found
+      if (letterheadPath) {
+        try {
+          // Add letterhead image at the top
+          doc.image(letterheadPath, 50, 30, { 
             width: 500, 
             height: 80
           });
-          const startY = 120;
-          doc.y = startY;
-        } catch (altError) {
-          console.warn('Alternative path also failed:', altError.message);
-          // Fallback: start at default position if image fails to load
-          const startY = 140;
-          doc.y = startY;
           
-          // Add a placeholder header instead
-          doc.fontSize(20)
-            .fillColor('#1e293b')
-            .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
-            .moveDown(0.5);
+          // Adjust the Y position to start below the letterhead
+          doc.y = startY;
+          imageLoaded = true;
+          console.log('✓ Letterhead image loaded successfully');
+        } catch (imageError) {
+          console.warn('✗ Could not load letterhead image:', imageError.message);
+          console.warn('Image path that failed:', letterheadPath);
+          imageLoaded = false;
         }
+      } else {
+        console.warn('✗ Letterhead image not found in any of the searched paths');
       }
+
+      // Fallback if no image loaded
+      if (!imageLoaded) {
+        console.warn('Using fallback text header');
+        
+        // Fallback: start at adjusted position
+        doc.y = 100;
+        
+        // Add a placeholder header instead
+        doc.fontSize(20)
+          .fillColor('#1e293b')
+          .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
+          .moveDown(0.5);
+      }
+
+      console.log('=== End Debug Info ===\n');
 
       // Move cursor below letterhead
       doc.moveDown(2);

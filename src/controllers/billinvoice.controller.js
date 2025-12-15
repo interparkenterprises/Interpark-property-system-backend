@@ -2,6 +2,8 @@ import { PrismaClient } from '@prisma/client';
 import PDFDocument from 'pdfkit';
 import { uploadToStorage } from '../utils/storage.js';
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
+import fs from 'fs';
+import path from 'path';
 
 const prisma = new PrismaClient();
 
@@ -632,15 +634,85 @@ async function generateBillInvoicePDF(billInvoice) {
   return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ 
-        margin: 40, // Reduced margin from 50 to 40
-        size: 'A4',
-        bufferPages: true 
+        margin: 40,
+        size: 'A4'
       });
       const chunks = [];
 
       doc.on('data', (chunk) => chunks.push(chunk));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
+
+      // ===== ADD LETTERHEAD IMAGE =====
+
+      
+      // Get project root directory
+      const projectRoot = process.cwd();
+      
+      // Define multiple possible paths for the letterhead
+      const possiblePaths = [
+        // Exact path based on your server structure
+        path.join(projectRoot, 'src', 'letterHeads', 'letter head-02.jpg'),
+        path.join(projectRoot, 'src', 'letterHeads', 'letter-head.jpg'),
+        path.join(projectRoot, 'src', 'letterHeads', 'letter_head.jpg'),
+        
+        // Alternative paths in case you're running from a different directory
+        path.join(__dirname, 'letterHeads', 'letter head-02.jpg'),
+        path.join(__dirname, '..', 'letterHeads', 'letter head-02.jpg'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letter head-02.jpg'),
+        
+        // Common fallback paths
+        '/root/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        '/var/www/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+      ];
+
+      let letterheadPath = null;
+      let imageLoaded = false;
+      const startY = 100; // Starting position below letterhead
+
+      // Try each possible path
+      for (const possiblePath of possiblePaths) {
+        try {
+          if (fs.existsSync(possiblePath)) {
+            letterheadPath = possiblePath;
+            console.log(`✓ Found letterhead at: ${possiblePath}`);
+            break;
+          }
+        } catch (err) {
+          continue;
+        }
+      }
+
+      // Add letterhead if found
+      if (letterheadPath) {
+        try {
+          // Add letterhead image at the top
+          doc.image(letterheadPath, 40, 15, { 
+            width: 510, 
+            height: 70
+          });
+          
+          // Adjust the Y position to start below the letterhead
+          doc.y = startY;
+          imageLoaded = true;
+        } catch (imageError) {
+          console.warn('Could not load letterhead image:', imageError.message);
+          imageLoaded = false;
+        }
+      }
+
+      // Fallback if no image loaded
+      if (!imageLoaded) {
+        doc.y = 40;
+        doc.fontSize(18)
+          .fillColor('#2563eb')
+          .font('Helvetica-Bold')
+          .text('INTERPARK ENTERPRISES LIMITED', { 
+            align: 'center'
+          });
+        doc.moveDown(0.5);
+      }
 
       // Safe number formatting functions
       const safeNum = (val) => {
@@ -649,22 +721,21 @@ async function generateBillInvoicePDF(billInvoice) {
       };
       
       const safeStr = (val) => safeNum(val).toFixed(2);
-      const formatCurrency = (val) => `Ksh ${safeNum(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigels: 2 })}`;
+      const formatCurrency = (val) => `Ksh ${safeNum(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-      // Helper function to move down with overflow check
+      // Helper function to move down with overflow check (simplified for single page)
       const moveDownWithCheck = (lines = 1) => {
         const lineHeight = doc.currentLineHeight();
         const newY = doc.y + (lineHeight * lines);
         
-        // Check if we're near the bottom of the page (leave 100px for footer)
-        if (newY > doc.page.height - 100) {
-          doc.addPage();
-          doc.y = 40; // Reset to top margin on new page
-          return true; // Page was added
+        // Check if we're near the bottom of the page
+        if (newY > doc.page.height - 80) {
+          // Try to compress content instead of adding new page
+          doc.moveDown(lines * 0.7); // Reduce spacing
+          return;
         }
         
         doc.moveDown(lines);
-        return false;
       };
 
       // Extract safe values
@@ -681,216 +752,179 @@ async function generateBillInvoicePDF(billInvoice) {
       const status = billInvoice.status || 'UNPAID';
 
       // ===========================================
-      // HEADER SECTION - Compact
+      // INVOICE TITLE
       // ===========================================
       
-      // Company Logo/Name
-      doc.fontSize(18) // Reduced from 20
-         .fillColor('#2563eb')
-         .font('Helvetica-Bold')
-         .text(billInvoice.tenant?.unit?.property?.name || 'PROPERTY MANAGEMENT', { 
-           align: 'center'
-         });
-      
-      // Company Address
-      doc.fontSize(9) // Reduced from 10
-         .fillColor('#666666')
-         .font('Helvetica')
-         .text(billInvoice.tenant?.unit?.property?.address || 'Professional Property Management Services', { 
-           align: 'center' 
-         });
-      
-      moveDownWithCheck(0.3); // Reduced from 0.5
-
-      // Invoice Title
-      doc.fontSize(20) // Reduced from 24
+      doc.fontSize(20)
          .fillColor('#1e293b')
          .font('Helvetica-Bold')
          .text('UTILITY BILL INVOICE', { 
            align: 'center'
          });
       
-      moveDownWithCheck(0.5); // Reduced from 1
+      moveDownWithCheck(0.5);
 
       // ===========================================
-      // INVOICE & STATUS SECTION - Side by side
+      // INVOICE DETAILS & BILLED TO - SIDE BY SIDE
       // ===========================================
       
       const infoTop = doc.y;
       
       // Left Column - Invoice Details
-      doc.fontSize(9) // Reduced from 10
+      doc.fontSize(9)
          .fillColor('#374151')
          .font('Helvetica-Bold')
          .text('INVOICE DETAILS:', 40, infoTop, { underline: true });
       
       doc.font('Helvetica')
-         .fontSize(8.5) // Smaller for details
-         .text(`Invoice Number: ${billInvoice.invoiceNumber || 'N/A'}`, 40, infoTop + 12)
+         .fontSize(8.5)
+         .text(`Invoice No: ${billInvoice.invoiceNumber || 'N/A'}`, 40, infoTop + 12)
          .text(`Issue Date: ${billInvoice.issueDate ? new Date(billInvoice.issueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 24)
          .text(`Due Date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 36)
-         .text(`Bill Reference: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, infoTop + 48)
+         .text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, infoTop + 48)
          .text(`Bill Date: ${billInvoice.billReferenceDate ? new Date(billInvoice.billReferenceDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 60);
 
-      // Right Column - Status Badge
+      // Right Column - Billed To
+      const billedToTop = infoTop;
+      doc.fontSize(9)
+         .fillColor('#374151')
+         .font('Helvetica-Bold')
+         .text('BILLED TO:', 280, billedToTop, { underline: true });
+      
+      doc.font('Helvetica')
+         .fontSize(8.5)
+         .text(billInvoice.tenant?.fullName || 'N/A', 280, billedToTop + 12)
+         .text(`Contact: ${billInvoice.tenant?.contact || 'N/A'}`, 280, billedToTop + 24)
+         .text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 280, billedToTop + 36)
+         .text(`Property: ${billInvoice.tenant?.unit?.property?.name || 'N/A'}`, 280, billedToTop + 48);
+
+      // Status Badge - placed at the right side above both columns
       const statusColor = 
         status === 'PAID' ? '#10b981' : 
         status === 'PARTIAL' ? '#f59e0b' : 
         status === 'OVERDUE' ? '#dc2626' : 
         status === 'CANCELLED' ? '#6b7280' : '#ef4444';
 
-      // Status box - compact
       const statusBoxTop = infoTop;
-      const statusBoxHeight = status === 'OVERDUE' ? 38 : 28; // Reduced height
+      const statusBoxWidth = 100;
+      const statusBoxHeight = 25;
+      const statusBoxX = 510 - statusBoxWidth;
       
-      doc.rect(420, statusBoxTop, 130, statusBoxHeight)
+      doc.rect(statusBoxX, statusBoxTop, statusBoxWidth, statusBoxHeight)
          .fillAndStroke(statusColor, statusColor);
       
       doc.fillColor('#ffffff')
-         .fontSize(11) // Reduced from 12
+         .fontSize(10)
          .font('Helvetica-Bold')
-         .text(status.toUpperCase(), 420, statusBoxTop + 8, { 
-           width: 130, 
+         .text(status.toUpperCase(), statusBoxX, statusBoxTop + 7, { 
+           width: statusBoxWidth, 
            align: 'center' 
          });
 
-      if (status === 'OVERDUE') {
-        doc.fillColor('#ffffff')
-           .fontSize(7.5) // Reduced from 8
-           .text('PAYMENT OVERDUE', 420, statusBoxTop + 24, { 
-             width: 130, 
-             align: 'center' 
-           });
-      }
-
       // Move Y position to after the invoice details section
-      doc.y = Math.max(infoTop + 72, statusBoxTop + statusBoxHeight + 10);
+      doc.y = Math.max(infoTop + 72, billedToTop + 60);
       
-      moveDownWithCheck(0.5); // Reduced spacing
+      moveDownWithCheck(0.3);
 
       // ===========================================
-      // TENANT INFORMATION - Compact
-      // ===========================================
-      
-      const tenantSectionTop = doc.y;
-      
-      doc.fillColor('#1e293b')
-         .fontSize(10) // Reduced from 12
-         .font('Helvetica-Bold')
-         .text('BILLED TO:', 40, tenantSectionTop, { underline: true });
-      
-      doc.y = tenantSectionTop + 14; // Reduced spacing
-      
-      doc.fillColor('#374151')
-         .fontSize(8.5) // Reduced from 10
-         .font('Helvetica')
-         .text(billInvoice.tenant?.fullName || 'N/A', 40, doc.y)
-         .text(`Contact: ${billInvoice.tenant?.contact || 'N/A'}`, 40, doc.y + 12)
-         .text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 40, doc.y + 24)
-         .text(`Property: ${billInvoice.tenant?.unit?.property?.name || 'N/A'}`, 40, doc.y + 36);
-      
-      doc.y += 48; // Reduced from 60
-      moveDownWithCheck(0.7); // Reduced from 1.5
-
-      // ===========================================
-      // BILL TYPE & METER READINGS - Compact
+      // BILL TYPE & METER READINGS
       // ===========================================
       
       doc.fillColor('#2563eb')
-         .fontSize(11) // Reduced from 14
+         .fontSize(12)
          .font('Helvetica-Bold')
          .text(`BILL TYPE: ${billInvoice.billType || 'N/A'}`, { underline: true });
       
-      moveDownWithCheck(0.5); // Reduced from 1
+      moveDownWithCheck(0.5);
 
       // Meter Readings Table
       const readingsTop = doc.y;
       
       doc.fillColor('#1e293b')
-         .fontSize(10) // Reduced from 11
+         .fontSize(11)
          .font('Helvetica-Bold')
          .text('METER READING DETAILS', { underline: true });
       
-      moveDownWithCheck(0.3); // Reduced from 0.5
+      moveDownWithCheck(0.3);
 
-      // Table headers with better visibility
-      const tableRowHeight = 16; // Reduced from 20
+      // Table headers
+      const tableRowHeight = 18;
       let currentRowY = doc.y;
       
-      doc.fillColor('#1e293b') // Changed from #374151 for better visibility
-         .fontSize(9) // Maintained size but bold
+      doc.fillColor('#1e293b')
+         .fontSize(9)
          .font('Helvetica-Bold')
          .text('Description', 40, currentRowY)
          .text('Reading', 250, currentRowY)
-         .text('Unit', 350, currentRowY);
+         .text('Unit', 400, currentRowY);
 
       // Separator line
-      currentRowY += 12; // Reduced from 15
+      currentRowY += 12;
       doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
       
-      // Previous Reading - Improved visibility
-      currentRowY += 8; // Reduced from 10
-      doc.fillColor('#374151') // Darker for better visibility
+      // Previous Reading
+      currentRowY += 8;
+      doc.fillColor('#374151')
          .fontSize(8.5)
          .font('Helvetica')
          .text('Previous Reading', 40, currentRowY)
          .text(safeStr(previousReading), 250, currentRowY)
-         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 350, currentRowY);
+         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 400, currentRowY);
 
-      // Current Reading - Improved visibility
+      // Current Reading
       currentRowY += tableRowHeight;
-      doc.fillColor('#374151') // Darker for better visibility
+      doc.fillColor('#374151')
          .text('Current Reading', 40, currentRowY)
          .text(safeStr(currentReading), 250, currentRowY)
-         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 350, currentRowY);
+         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 400, currentRowY);
 
       // Separator line
-      currentRowY += 12; // Reduced from 15
+      currentRowY += 12;
       doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
       
       // Total Units Consumed
-      currentRowY += 8; // Reduced from 10
+      currentRowY += 8;
       doc.fillColor('#1e293b')
-         .fontSize(9.5) // Slightly larger for emphasis
+         .fontSize(9.5)
          .font('Helvetica-Bold')
          .text('Total Units Consumed', 40, currentRowY)
          .text(safeStr(units), 250, currentRowY)
-         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 350, currentRowY);
+         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 400, currentRowY);
 
       // Update doc.y to continue after the table
-      doc.y = currentRowY + tableRowHeight + 8; // Reduced from 10
-      moveDownWithCheck(0.8); // Reduced from 2
+      doc.y = currentRowY + tableRowHeight + 10;
+      moveDownWithCheck(0.5);
 
       // ===========================================
-      // BILL CALCULATION & CHARGES - Compact
+      // BILL CALCULATION & CHARGES
       // ===========================================
       
       doc.fillColor('#1e293b')
-         .fontSize(10) // Reduced from 12
+         .fontSize(11)
          .font('Helvetica-Bold')
          .text('BILL CALCULATION', { underline: true });
       
-      moveDownWithCheck(0.3); // Reduced from 0.5
+      moveDownWithCheck(0.3);
 
       const chargesTop = doc.y;
       currentRowY = chargesTop;
       
-      // Table headers with better visibility
-      doc.fillColor('#1e293b') // Changed from #374151
+      // Table headers
+      doc.fillColor('#1e293b')
          .fontSize(9)
          .font('Helvetica-Bold')
          .text('Description', 40, currentRowY)
          .text('Rate/Amount', 300, currentRowY)
-         .text('Total (Ksh)', 450, currentRowY);
+         .text('Amount (Ksh)', 450, currentRowY);
 
       // Separator line
-      currentRowY += 12; // Reduced from 15
+      currentRowY += 12;
       doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
       
-      currentRowY += 8; // Reduced from 10
+      currentRowY += 8;
 
-      // Units Charge - Improved visibility
-      doc.fillColor('#374151') // Darker color
+      // Units Charge
+      doc.fillColor('#374151')
          .fontSize(8.5)
          .font('Helvetica')
          .text(`${safeStr(units)} units consumed`, 40, currentRowY)
@@ -899,10 +933,9 @@ async function generateBillInvoicePDF(billInvoice) {
 
       currentRowY += tableRowHeight;
 
-      // VAT (if applicable) - Improved visibility
+      // VAT (if applicable)
       if (vatAmount > 0 && vatRate > 0) {
-        doc.fillColor('#374151') // Darker color for better visibility
-           .text(`VAT (${safeStr(vatRate)}%)`, 40, currentRowY)
+        doc.text(`VAT (${safeStr(vatRate)}%)`, 40, currentRowY)
            .text('', 300, currentRowY)
            .text(formatCurrency(vatAmount), 450, currentRowY);
         currentRowY += tableRowHeight;
@@ -911,16 +944,16 @@ async function generateBillInvoicePDF(billInvoice) {
       // Separator line before total
       currentRowY += 5;
       doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
-      currentRowY += 8; // Reduced from 10
+      currentRowY += 10;
 
       // Grand Total
       doc.fillColor('#1e293b')
-         .fontSize(10.5) // Slightly larger
+         .fontSize(11)
          .font('Helvetica-Bold')
          .text('GRAND TOTAL', 40, currentRowY)
          .text(formatCurrency(grandTotal), 450, currentRowY);
 
-      currentRowY += tableRowHeight + 5;
+      currentRowY += tableRowHeight + 8;
 
       // Amount Paid (if any)
       if (amountPaid > 0) {
@@ -929,177 +962,92 @@ async function generateBillInvoicePDF(billInvoice) {
            .font('Helvetica-Bold')
            .text('Amount Paid', 40, currentRowY)
            .text(formatCurrency(amountPaid), 450, currentRowY);
-        currentRowY += tableRowHeight;
+        currentRowY += tableRowHeight + 5;
       }
 
-      // Balance Due - Keep heading and value together
+      // Balance Due
       const balanceColor = balance === 0 ? '#10b981' : 
                           status === 'OVERDUE' ? '#dc2626' : '#ef4444';
       
-      // Check if we need a new page for balance
-      if (currentRowY > doc.page.height - 150) {
-        doc.addPage();
-        currentRowY = 40;
-      }
-      
       doc.fillColor(balanceColor)
-         .fontSize(10) // Increased for visibility
+         .fontSize(11)
          .font('Helvetica-Bold')
-         .text('BALANCE DUE', 40, currentRowY);
-      
-      // Value on the same line
-      doc.text(formatCurrency(balance), 450, currentRowY);
+         .text('BALANCE DUE', 40, currentRowY)
+         .text(formatCurrency(balance), 450, currentRowY);
 
       // Update doc.y to continue after the calculations table
-      doc.y = currentRowY + tableRowHeight + 8;
-      moveDownWithCheck(0.8); // Reduced from 2
+      doc.y = currentRowY + tableRowHeight + 10;
+      moveDownWithCheck(0.5);
 
       // ===========================================
-      // PAYMENT STATUS & INSTRUCTIONS - Compact
+      // PAYMENT INSTRUCTIONS (only for unpaid invoices)
       // ===========================================
       
-      doc.fillColor('#1e293b')
-         .fontSize(10) // Reduced from 12
-         .font('Helvetica-Bold')
-         .text('PAYMENT STATUS', { underline: true });
-      
-      moveDownWithCheck(0.3); // Reduced from 0.5
-
-      doc.fillColor('#374151')
-         .fontSize(8.5) // Reduced from 10
-         .font('Helvetica');
-
-      // Status-specific messages
-      const statusMessages = [];
-      switch (status) {
-        case 'PAID':
-          statusMessages.push('✅ Payment Completed - Thank you for your payment!');
-          statusMessages.push(`Paid on: ${billInvoice.updatedAt ? new Date(billInvoice.updatedAt).toLocaleDateString('en-US') : 'N/A'}`);
-          break;
-        case 'PARTIAL':
-          statusMessages.push('⚠️ Partial Payment Received');
-          statusMessages.push(`Amount paid: ${formatCurrency(amountPaid)} | Remaining balance: ${formatCurrency(balance)}`);
-          break;
-        case 'OVERDUE':
-          statusMessages.push('🚨 PAYMENT OVERDUE - Immediate attention required!');
-          statusMessages.push(`Original due date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`);
-          break;
-        case 'UNPAID':
-          statusMessages.push('⏳ Payment Pending - No payment has been received for this invoice.');
-          break;
-        case 'CANCELLED':
-          statusMessages.push('❌ Invoice Cancelled - This invoice is no longer valid for payment.');
-          break;
-      }
-
-      // Write status messages with compact spacing
-      statusMessages.forEach((msg, index) => {
-        doc.text(msg);
-        if (index < statusMessages.length - 1) {
-          moveDownWithCheck(0.2); // Reduced from 0.3
-        }
-      });
-
-      moveDownWithCheck(0.7); // Reduced from 1.5
-
-      // Payment Instructions for unpaid invoices - Compact
       if (['UNPAID', 'PARTIAL', 'OVERDUE'].includes(status)) {
         doc.fillColor('#1e293b')
-           .fontSize(9.5) // Reduced from 11
+           .fontSize(10)
            .font('Helvetica-Bold')
            .text('PAYMENT INSTRUCTIONS', { underline: true });
         
-        moveDownWithCheck(0.3); // Reduced from 0.5
+        moveDownWithCheck(0.3);
 
         doc.fillColor('#374151')
-           .fontSize(8) // Reduced from 10
+           .fontSize(9)
            .font('Helvetica')
-           .text(`• Payment due: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'} | Reference: ${billInvoice.invoiceNumber}`)
-           .text('• Payment methods: Bank transfer, Mobile money, or Cash at office')
-           .text('• Contact property management for payment details and assistance');
+           .text(`• Please pay by: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`)
+           .text(`• Reference Number: ${billInvoice.invoiceNumber}`)
+           .text('• Payment Methods: Bank Transfer, Mobile Money, or Cash')
+           .text('• For assistance, contact property management');
         
-        moveDownWithCheck(0.7); // Reduced from 1.5
+        moveDownWithCheck(0.5);
       }
 
       // ===========================================
-      // NOTES SECTION - Compact
+      // NOTES SECTION
       // ===========================================
       
       if (billInvoice.notes) {
         doc.fillColor('#1e293b')
-           .fontSize(9.5) // Reduced from 11
+           .fontSize(10)
            .font('Helvetica-Bold')
-           .text('ADDITIONAL NOTES', { underline: true });
+           .text('NOTES', { underline: true });
         
-        moveDownWithCheck(0.3); // Reduced from 0.5
+        moveDownWithCheck(0.3);
 
         doc.fillColor('#374151')
-           .fontSize(8) // Reduced from 10
+           .fontSize(9)
            .font('Helvetica')
            .text(billInvoice.notes, { 
              width: 510,
              align: 'left' 
            });
         
-        moveDownWithCheck(0.5); // Reduced from 1
+        moveDownWithCheck(0.5);
       }
 
       // ===========================================
-      // FOOTER - Compact
+      // FOOTER
       // ===========================================
-      
-      // Calculate footer position
-      const footerY = doc.page.height - 70; // Reduced from 80
-      
-      // Only add new page if current position overlaps with footer
-      if (doc.y > footerY - 10) {
-        doc.addPage();
-        doc.y = 40;
-      }
-      
-      // Position at footer
-      doc.y = footerY;
       
       // Footer separator
-      doc.rect(40, doc.y - 8, 510, 0.5).fillAndStroke('#e5e7eb', '#e5e7eb');
+      const footerY = Math.min(doc.y + 10, doc.page.height - 50);
+      doc.y = footerY;
       
-      doc.fillColor('#9ca3af')
-         .fontSize(7.5) // Reduced from 8
-         .font('Helvetica');
+      doc.rect(40, doc.y, 510, 0.5).fillAndStroke('#e5e7eb', '#e5e7eb');
+      
+      moveDownWithCheck(0.3);
 
-      // Status-specific footer message - Compact
-      if (status === 'PAID') {
-        doc.text('Thank you for your timely payment! We appreciate your business.', {
-          align: 'center',
-          width: 510
-        });
-      } else if (status === 'OVERDUE') {
-        doc.fillColor('#dc2626')
-           .text('URGENT: Please settle this overdue invoice immediately to avoid service interruption.', {
-             align: 'center',
-             width: 510
-           })
-           .fillColor('#9ca3af');
-      } else {
-        doc.text('Thank you for your business! We appreciate your timely payment.', {
-          align: 'center',
-          width: 510
-        });
-      }
+      doc.fillColor('#6b7280')
+         .fontSize(8)
+         .font('Helvetica')
+         .text('Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke', {
+           align: 'center',
+           width: 510
+         });
 
-      moveDownWithCheck(0.3); // Reduced from 0.5
+      moveDownWithCheck(0.2);
 
-      // Contact information - Single line
-      doc.text('For inquiries, contact property management during business hours.', {
-        align: 'center',
-        width: 510
-      });
-
-      moveDownWithCheck(0.3); // Reduced from 0.5
-
-      // Page number
-      const totalPages = doc.bufferedPageRange().count;
-      doc.text(`Page ${totalPages} - Generated on ${new Date().toLocaleDateString('en-US')}`, {
+      doc.text(`Generated on ${new Date().toLocaleDateString('en-US')}`, {
         align: 'center',
         width: 510
       });
