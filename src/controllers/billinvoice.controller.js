@@ -4,8 +4,13 @@ import { uploadToStorage } from '../utils/storage.js';
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 const prisma = new PrismaClient();
+
+// Create __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // @desc    Generate invoice for a bill (for current remaining balance)
 // @route   POST /api/bill-invoices/generate

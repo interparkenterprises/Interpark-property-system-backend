@@ -4,6 +4,12 @@ import { uploadToStorage } from '../utils/storage.js'; // You'll need to impleme
 import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 import fs from 'fs'; 
 import path from 'path'; 
+import { fileURLToPath } from 'url';
+
+
+// Create __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // @desc    Generate invoice for tenant
 // @route   POST /api/invoices/generate
@@ -323,6 +329,10 @@ export const downloadInvoice = async (req, res) => {
 async function generateInvoicePDF(invoice, tenant) {
   return new Promise((resolve, reject) => {
     try {
+      // Create __dirname equivalent for ES modules
+      //const __filename = fileURLToPath(import.meta.url);
+      //const __dirname = path.dirname(__filename);
+      
       const doc = new PDFDocument({ margin: 50, size: 'A4' });
       const chunks = [];
 
@@ -808,6 +818,10 @@ export const getPartialPayments = async (req, res) => {
 async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) {
   return new Promise((resolve, reject) => {
     try {
+      // Create __dirname equivalent for ES modules
+     // const __filename = fileURLToPath(import.meta.url);
+     // const __dirname = path.dirname(__filename);
+      
       const doc = new PDFDocument({ margin: 50, size: 'A4' });
       const chunks = [];
 
