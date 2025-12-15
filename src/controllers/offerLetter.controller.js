@@ -119,6 +119,52 @@ export const getOfferLetters = async (req, res) => {
   }
 };
 
+// @desc    Get offer letters by user ID
+// @route   GET /api/offer-letters/user/:userId
+// @access  Private (Admin only or user's own data)
+export const getOfferLetterByUserId = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = req.user; // Assuming you have auth middleware
+    
+    // Authorization check
+    if (!user) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    
+    // Check if user is requesting their own data or is an admin
+    if (user.role !== 'ADMIN' && user.id !== userId) {
+      return res.status(403).json({ message: 'Forbidden: You can only view your own offer letters' });
+    }
+
+    const offerLetters = await prisma.offerLetter.findMany({
+      where: { createdById: userId },
+      include: {
+        lead: true,
+        property: {
+          include: {
+            landlord: true
+          }
+        },
+        unit: true,
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json(offerLetters);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
 // @desc    Get single offer letter
 // @route   GET /api/offer-letters/:id
 // @access  Private

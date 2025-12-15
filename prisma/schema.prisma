@@ -19,6 +19,7 @@ model User {
   commissions ManagerCommission[]
   properties  Property[]
   todos       ToDo[]
+  createdOffers OfferLetter[]
 }
 
 model Landlord {
@@ -329,6 +330,7 @@ model OfferLetter {
   lead            Lead        @relation(fields: [leadId], references: [id])
   property        Property    @relation(fields: [propertyId], references: [id])
   unit            Unit?       @relation(fields: [unitId], references: [id])
+  createdBy       User?       @relation(fields: [createdById], references: [id]) 
 }
 
 model ToDo {

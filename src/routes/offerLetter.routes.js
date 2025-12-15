@@ -2,6 +2,7 @@ import express from 'express';
 import {
   getOfferLetters,
   getOfferLetter,
+  getOfferLetterByUserId,
   createOfferLetter,
   createMixedUseOfferLetter,
   generateOfferLetterPDF,
@@ -22,6 +23,9 @@ router.route('/')
   .get(getOfferLetters)
   .post(authorize('ADMIN', 'MANAGER'), createOfferLetter);
 
+// Get offer letters by user ID
+router.get('/user/:userId', authorize('ADMIN', 'MANAGER'), getOfferLetterByUserId);
+
 // Mixed-use property route
 router.route('/mixed-use')
   .post(authorize('ADMIN', 'MANAGER'), createMixedUseOfferLetter);
@@ -34,6 +38,8 @@ router.route('/:id')
 
 // Status update
 router.patch('/:id/status', authorize('ADMIN', 'MANAGER'), updateOfferLetterStatus);
+
+
 
 // PDF generation and download
 router.post('/:id/generate-pdf', authorize('ADMIN', 'MANAGER'), generateOfferLetterPDF);
