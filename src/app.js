@@ -21,6 +21,8 @@ import invoiceRoutes from './routes/invoice.routes.js';
 import billRoutes from './routes/bill.routes.js';
 import offerLetterRoutes from './routes/offerLetter.routes.js';
 import billInvoiceRoutes from './routes/billInvoice.routes.js';
+import dailyReportRoutes from './routes/dailyReport.routes.js';
+import activationRoutes from './routes/activation.routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,6 +86,8 @@ app.use('/api/invoices', invoiceRoutes);
 app.use('/api/bills', billRoutes);
 app.use('/api/offer-letters', offerLetterRoutes)
 app.use('/api/bill-invoices', billInvoiceRoutes);
+app.use('/api/daily-reports', dailyReportRoutes);
+app.use('/api/activations', activationRoutes);
 
 
 // Basic route for health check

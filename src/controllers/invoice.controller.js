@@ -5,6 +5,7 @@ import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 import fs from 'fs'; 
 import path from 'path'; 
 import { fileURLToPath } from 'url';
+import sizeOf from 'image-size';
 
 
 // Create __dirname equivalent for ES modules
@@ -325,14 +326,10 @@ export const downloadInvoice = async (req, res) => {
   }
 };
 
-// Helper function to generate PDF
+// Helper function to generate Invoice PDF
 async function generateInvoicePDF(invoice, tenant) {
   return new Promise((resolve, reject) => {
     try {
-      // Create __dirname equivalent for ES modules
-      //const __filename = fileURLToPath(import.meta.url);
-      //const __dirname = path.dirname(__filename);
-      
       const doc = new PDFDocument({ margin: 50, size: 'A4' });
       const chunks = [];
 
@@ -340,141 +337,133 @@ async function generateInvoicePDF(invoice, tenant) {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // ===== IMPROVED LETTERHEAD IMAGE HANDLING =====
-      
-      // Get project root directory
+      /* =====================================================
+         LETTERHEAD IMAGE HANDLING (SAFE & SERVER-READY)
+      ====================================================== */
+
       const projectRoot = process.cwd();
-      
-      // Define multiple possible paths for the letterhead based on your exact server structure
       const possiblePaths = [
-        // Exact path based on your server structure
-        path.join(projectRoot, 'src', 'letterHeads', 'letter head-02.jpg'),
-        path.join(projectRoot, 'src', 'letterHeads', 'letter-head.jpg'),
-        path.join(projectRoot, 'src', 'letterHeads', 'letter_head.jpg'),
-        
-        // Alternative paths in case you're running from a different directory
-        path.join(__dirname, 'letterHeads', 'letter head-02.jpg'),
-        path.join(__dirname, '..', 'letterHeads', 'letter head-02.jpg'),
-        path.join(__dirname, '..', 'src', 'letterHeads', 'letter head-02.jpg'),
-        
-        // Common fallback paths
-        '/root/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
-        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
-        '/var/www/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
+        '/root/Interpark-property-system-backend/src/letterHeads/letterhead.png',
+        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letterhead.png',
+        '/var/www/Interpark-property-system-backend/src/letterHeads/letterhead.png',
       ];
 
       let letterheadPath = null;
       let imageLoaded = false;
-      const startY = 120; // Default starting position below letterhead
+      const startY = 120;
 
-      // Debug logging
-      console.log('=== Regular Invoice PDF Generation Debug Info ===');
-      console.log('Project Root (cwd):', projectRoot);
-      console.log('Current File Directory (__dirname):', __dirname);
-      console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
-
-      // Try each possible path
       for (const possiblePath of possiblePaths) {
-        try {
-          if (fs.existsSync(possiblePath)) {
+        if (fs.existsSync(possiblePath)) {
+          const stats = fs.statSync(possiblePath);
+          if (stats.size > 0) {
             letterheadPath = possiblePath;
-            console.log(`✓ Found letterhead at: ${possiblePath}`);
+            console.log(`✓ Letterhead found: ${possiblePath}`);
             break;
-          } else {
-            console.log(`✗ Not found: ${possiblePath}`);
           }
-        } catch (err) {
-          console.log(`✗ Error checking: ${possiblePath} - ${err.message}`);
-          continue;
         }
       }
 
-      // Add letterhead if found
       if (letterheadPath) {
         try {
-          // Add letterhead image at the top
-          doc.image(letterheadPath, 50, 30, { 
-            width: 500, 
-            height: 80
+          const imageBuffer = fs.readFileSync(letterheadPath);
+          const dimensions = sizeOf(imageBuffer);
+
+          // Max usable width (page width minus margins)
+          const maxWidth = doc.page.width - 100;
+
+          // Calculate proportional height
+          const scale = maxWidth / dimensions.width;
+          const scaledHeight = dimensions.height * scale;
+
+          // Optional: cap height if image is extremely tall
+          const finalHeight = Math.min(scaledHeight, 120);
+
+          // Recalculate width if height was capped
+          const finalWidth =
+            finalHeight !== scaledHeight
+              ? (dimensions.width * finalHeight) / dimensions.height
+              : maxWidth;
+
+          const xPosition = 50 + (maxWidth - finalWidth) / 2;
+
+          doc.image(imageBuffer, xPosition, 30, {
+            width: finalWidth,
           });
-          
-          // Adjust the Y position to start below the letterhead
-          doc.y = startY;
+
+          doc.y = 30 + finalHeight + 20;
           imageLoaded = true;
-          console.log('✓ Letterhead image loaded successfully');
-        } catch (imageError) {
-          console.warn('✗ Could not load letterhead image:', imageError.message);
-          console.warn('Image path that failed:', letterheadPath);
-          imageLoaded = false;
+
+          console.log('✓ Letterhead rendered with correct proportions');
+        } catch (err) {
+          console.warn('✗ Letterhead failed to load:', err.message);
         }
-      } else {
-        console.warn('✗ Letterhead image not found in any of the searched paths');
       }
 
-      // Fallback if no image loaded
-      if (!imageLoaded) {
-        console.warn('Using fallback text header');
-        
-        // Fallback: start at adjusted position
-        doc.y = 100;
-        
-        // Add a placeholder header instead
-        doc.fontSize(20)
-          .fillColor('#1e293b')
-          .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
-          .moveDown(0.5);
-      }
 
-      console.log('=== End Debug Info ===\n');
+      /* =====================================================
+         INVOICE HEADER
+      ====================================================== */
 
-      // Move cursor below letterhead
       doc.moveDown(2);
-
-      // Invoice Title
       doc.fontSize(28)
         .fillColor('#1e293b')
         .text('INVOICE', { align: 'center' })
         .moveDown(0.5);
 
-      // Invoice Details Box
       const topY = doc.y;
-      
-      // Left column - Invoice details
+
       doc.fontSize(10)
         .fillColor('#1e293b')
         .text(`Invoice Number: ${invoice.invoiceNumber}`, 50, topY)
-        .text(`Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`, 50, topY + 15)
-        .text(`Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`, 50, topY + 30)
+        .text(
+          `Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`,
+          50,
+          topY + 15
+        )
+        .text(
+          `Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`,
+          50,
+          topY + 30
+        )
         .text(`Payment Period: ${invoice.paymentPeriod}`, 50, topY + 45);
 
-      // VAT Information - right column
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
-        doc.text(`VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`, 300, topY + 15);
+        doc.text(
+          `VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`,
+          300,
+          topY + 15
+        );
       }
 
-      doc.moveDown(3);
+      /* =====================================================
+         BILLING INFORMATION
+      ====================================================== */
 
-      // Tenant Information Section
+      doc.moveDown(3);
       const tenantY = doc.y;
-      
-      // Left side - BILL TO
+
       doc.fontSize(12)
         .fillColor('#1e293b')
-        .text('BILL TO:', 50, tenantY, { underline: true })
-        .moveDown(0.5);
+        .text('BILL TO:', 50, tenantY, { underline: true });
 
       doc.fontSize(10)
         .fillColor('#374151')
         .text(invoice.tenant.fullName, 50, tenantY + 25)
         .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
         .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 55)
-        .text(`Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`, 50, tenantY + 70);
+        .text(
+          `Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`,
+          50,
+          tenantY + 70
+        );
 
-      // Right side - Property/Landlord Information
       doc.fontSize(12)
         .fillColor('#1e293b')
-        .text('FROM:', 300, tenantY, { underline: true })
-        .moveDown(0.5);
+        .text('FROM:', 300, tenantY, { underline: true });
 
       doc.fontSize(10)
         .fillColor('#374151')
@@ -483,129 +472,131 @@ async function generateInvoicePDF(invoice, tenant) {
         .text('Email: info@interparkenterprises.co.ke', 300, tenantY + 55)
         .text('Website: www.interparkenterprises.co.ke', 300, tenantY + 70);
 
-      doc.moveDown(4);
+      /* =====================================================
+         LINE ITEMS
+      ====================================================== */
 
-      // Line Items Table
+      doc.moveDown(4);
       const tableTop = doc.y;
       const itemX = 50;
       const descX = 200;
       const amountX = 450;
       const rowHeight = 25;
 
-      // Table Header
-      doc.rect(itemX, tableTop, 500, rowHeight)
-        .fillAndStroke('#2563eb', '#2563eb');
+      doc.rect(itemX, tableTop, 500, rowHeight).fill('#005478');
 
       doc.fillColor('#fff')
         .fontSize(11)
         .text('Item', itemX + 10, tableTop + 8)
         .text('Description', descX, tableTop + 8)
-        .text('Amount (Ksh)', amountX, tableTop + 8, { width: 80, align: 'right' });
+        .text('Amount', amountX, tableTop + 8, {
+          width: 80,
+          align: 'right',
+        });
 
       let currentY = tableTop + rowHeight;
 
-      // Rent Row
       doc.fillColor('#1e293b')
         .fontSize(10)
         .text('Rent', itemX + 10, currentY + 8)
-        .text(`Monthly rent for ${invoice.paymentPeriod}`, descX, currentY + 8)
-        .text(invoice.rent.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 8, { width: 80, align: 'right' });
+        .text(
+          `Monthly rent for ${invoice.paymentPeriod}`,
+          descX,
+          currentY + 8
+        )
+        .text(
+          invoice.rent.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          }),
+          amountX,
+          currentY + 8,
+          { width: 80, align: 'right' }
+        );
 
       currentY += rowHeight;
 
-      // Service Charge Row (if applicable)
-      if (invoice.serviceCharge && invoice.serviceCharge > 0) {
+      if (invoice.serviceCharge > 0) {
         doc.text('Service Charge', itemX + 10, currentY + 8)
           .text('Property service charge', descX, currentY + 8)
-          .text(invoice.serviceCharge.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 8, { width: 80, align: 'right' });
+          .text(
+            invoice.serviceCharge.toLocaleString('en-US', {
+              minimumFractionDigits: 2,
+            }),
+            amountX,
+            currentY + 8,
+            { width: 80, align: 'right' }
+          );
         currentY += rowHeight;
       }
 
-      // Separator line before calculations
-      doc.rect(itemX, currentY, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
-      currentY += 15;
-
-      // Subtotal - Clear and visible
       const subtotal = invoice.rent + (invoice.serviceCharge || 0);
-      doc.fontSize(11)
-        .fillColor('#374151')
-        .text('Subtotal:', descX, currentY + 5)
-        .text(subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 5, { width: 80, align: 'right' });
 
-      currentY += 25;
+      doc.moveDown(1);
+      doc.text('Subtotal:', descX, currentY + 5)
+        .text(
+          `Ksh ${subtotal.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })}`,
+          amountX,
+          currentY + 5,
+          { width: 80, align: 'right' }
+        );
 
-      // VAT - Clear and visible (only if applicable)
-      if (invoice.vat && invoice.vat > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
-        const vatLabel = tenant.vatType === 'INCLUSIVE' ? 'VAT (Inclusive):' : `VAT (${tenant.vatRate}%):`;
-        doc.text(vatLabel, descX, currentY + 5)
-          .text(invoice.vat.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 5, { width: 80, align: 'right' });
+      if (invoice.vat > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
         currentY += 25;
+        doc.text(`VAT (${tenant.vatRate}%):`, descX, currentY)
+          .text(
+            `Ksh ${invoice.vat.toLocaleString('en-US', {
+              minimumFractionDigits: 2,
+            })}`,
+            amountX,
+            currentY,
+            { width: 80, align: 'right' }
+          );
       }
 
-      // Total Due Section - Prominent display
-      currentY += 10;
-      doc.rect(itemX, currentY, 500, 35)
-        .fillAndStroke('#f8fafc', '#e2e8f0');
+      currentY += 35;
+      doc.rect(itemX, currentY, 500, 35).fill('#f8fafc');
 
       doc.fontSize(14)
         .fillColor('#1e293b')
-        .text('TOTAL DUE:', descX, currentY + 10, { bold: true })
-        .text(`Ksh ${invoice.totalDue.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX - 10, currentY + 10, { width: 90, align: 'right', bold: true });
+        .text('TOTAL DUE:', descX, currentY + 10)
+        .text(
+          `Ksh ${invoice.totalDue.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })}`,
+          amountX - 10,
+          currentY + 10,
+          { width: 90, align: 'right' }
+        );
 
-      currentY += 45;
+      /* =====================================================
+         FOOTER
+      ====================================================== */
 
-      // Payment Status Section
-      if (invoice.amountPaid > 0) {
-        doc.fontSize(11)
-          .fillColor('#10b981')
-          .text('Amount Paid:', descX, currentY)
-          .text(`Ksh ${invoice.amountPaid.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY, { width: 80, align: 'right' });
-        currentY += 20;
-      }
-
-      // Notes Section (if any)
-      if (invoice.notes) {
-        doc.fontSize(10)
-          .fillColor('#374151')
-          .text('Notes:', 50, currentY)
-          .moveDown(0.3)
-          .text(invoice.notes, { width: 500, indent: 10 });
-        currentY = doc.y + 20;
-      }
-
-      // Footer with company information
       const footerY = doc.page.height - 100;
-      
-      // Separator line above footer
-      doc.rect(50, footerY - 10, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
-      
+
+      doc.rect(50, footerY - 10, 500, 1).fill('#e5e7eb');
+
       doc.fontSize(9)
         .fillColor('#6b7280')
-        .text(
-          'Thank you for your business!',
-          50,
-          footerY,
-          { align: 'center', width: 500 }
-        )
-        .moveDown(0.5)
+        .text('Thank you for your business!', 50, footerY, {
+          align: 'center',
+          width: 500,
+        })
+        .moveDown(0.4)
         .fontSize(8)
         .text(
           'Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke',
           { align: 'center', width: 500 }
-        )
-        .moveDown(0.3)
-        .text(
-          `Generated on ${new Date().toLocaleDateString('en-US')}`,
-          { align: 'center', width: 500 }
         );
 
       doc.end();
-    } catch (error) {
-      reject(error);
+    } catch (err) {
+      reject(err);
     }
   });
 }
-
 
 // @desc    Generate invoice for partial payment balance
 // @route   POST /api/invoices/generate-from-partial
@@ -818,10 +809,6 @@ export const getPartialPayments = async (req, res) => {
 async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) {
   return new Promise((resolve, reject) => {
     try {
-      // Create __dirname equivalent for ES modules
-     // const __filename = fileURLToPath(import.meta.url);
-     // const __dirname = path.dirname(__filename);
-      
       const doc = new PDFDocument({ margin: 50, size: 'A4' });
       const chunks = [];
 
@@ -829,85 +816,76 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // ===== IMPROVED LETTERHEAD IMAGE HANDLING =====
-      
-      // Get project root directory
+      /* =====================================================
+         LETTERHEAD IMAGE HANDLING (SAFE & SERVER-READY)
+      ====================================================== */
+
       const projectRoot = process.cwd();
-      
-      // Define multiple possible paths for the letterhead based on your exact server structure
       const possiblePaths = [
-        // Exact path based on your server structure
-        path.join(projectRoot, 'src', 'letterHeads', 'letter head-02.jpg'),
-        path.join(projectRoot, 'src', 'letterHeads', 'letter-head.jpg'),
-        path.join(projectRoot, 'src', 'letterHeads', 'letter_head.jpg'),
-        
-        // Alternative paths in case you're running from a different directory
-        path.join(__dirname, 'letterHeads', 'letter head-02.jpg'),
-        path.join(__dirname, '..', 'letterHeads', 'letter head-02.jpg'),
-        path.join(__dirname, '..', 'src', 'letterHeads', 'letter head-02.jpg'),
-        
-        // Common fallback paths
-        '/root/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
-        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
-        '/var/www/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
+        '/root/Interpark-property-system-backend/src/letterHeads/letterhead.png',
+        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letterhead.png',
+        '/var/www/Interpark-property-system-backend/src/letterHeads/letterhead.png',
       ];
 
       let letterheadPath = null;
       let imageLoaded = false;
-      const startY = 120; // Default starting position below letterhead
+      const startY = 120;
 
-      // Debug logging (remove in production if desired)
-      console.log('=== PDF Generation Debug Info ===');
-      console.log('Project Root (cwd):', projectRoot);
-      console.log('Current File Directory (__dirname):', __dirname);
-      console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
-
-      // Try each possible path
       for (const possiblePath of possiblePaths) {
-        try {
-          if (fs.existsSync(possiblePath)) {
+        if (fs.existsSync(possiblePath)) {
+          const stats = fs.statSync(possiblePath);
+          if (stats.size > 0) {
             letterheadPath = possiblePath;
-            console.log(`✓ Found letterhead at: ${possiblePath}`);
+            console.log(`✓ Letterhead found: ${possiblePath}`);
             break;
-          } else {
-            console.log(`✗ Not found: ${possiblePath}`);
           }
-        } catch (err) {
-          console.log(`✗ Error checking: ${possiblePath} - ${err.message}`);
-          continue;
         }
       }
 
-      // Add letterhead if found
       if (letterheadPath) {
         try {
-          // Add letterhead image at the top
-          doc.image(letterheadPath, 50, 30, { 
-            width: 500, 
-            height: 80
+          const imageBuffer = fs.readFileSync(letterheadPath);
+          const dimensions = sizeOf(imageBuffer);
+
+          // Max usable width (page width minus margins)
+          const maxWidth = doc.page.width - 100;
+
+          // Calculate proportional height
+          const scale = maxWidth / dimensions.width;
+          const scaledHeight = dimensions.height * scale;
+
+          // Optional: cap height if image is extremely tall
+          const finalHeight = Math.min(scaledHeight, 120);
+
+          // Recalculate width if height was capped
+          const finalWidth =
+            finalHeight !== scaledHeight
+              ? (dimensions.width * finalHeight) / dimensions.height
+              : maxWidth;
+
+          const xPosition = 50 + (maxWidth - finalWidth) / 2;
+
+          doc.image(imageBuffer, xPosition, 30, {
+            width: finalWidth,
           });
-          
-          // Adjust the Y position to start below the letterhead
-          doc.y = startY;
+
+          doc.y = 30 + finalHeight + 20;
           imageLoaded = true;
-          console.log('✓ Letterhead image loaded successfully');
-        } catch (imageError) {
-          console.warn('✗ Could not load letterhead image:', imageError.message);
-          console.warn('Image path that failed:', letterheadPath);
-          imageLoaded = false;
+
+          console.log('✓ Letterhead rendered with correct proportions');
+        } catch (err) {
+          console.warn('✗ Letterhead failed to load:', err.message);
         }
-      } else {
-        console.warn('✗ Letterhead image not found in any of the searched paths');
       }
 
       // Fallback if no image loaded
       if (!imageLoaded) {
         console.warn('Using fallback text header');
-        
-        // Fallback: start at adjusted position
         doc.y = 100;
-        
-        // Add a placeholder header instead
         doc.fontSize(20)
           .fillColor('#1e293b')
           .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' })
@@ -997,7 +975,7 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       doc.moveDown(4);
 
-      // Payment Summary Section - Clear and prominent
+      // Payment Summary Section
       const summaryY = doc.y;
       doc.fontSize(12)
         .fillColor('#1e293b')
@@ -1010,18 +988,18 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       const summaryContentY = summaryY + 45;
       
-      // Original Total
+      // Original Total with "Ksh" prefix
       doc.fontSize(11)
         .fillColor('#374151')
         .text('Original Total Due:', 70, summaryContentY)
         .text(`Ksh ${paymentReport.totalDue.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 450, summaryContentY, { width: 80, align: 'right' });
 
-      // Amount Paid
+      // Amount Paid with "Ksh" prefix
       doc.fillColor('#10b981')
         .text('Amount Previously Paid:', 70, summaryContentY + 25)
         .text(`Ksh ${paymentReport.amountPaid.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 450, summaryContentY + 25, { width: 80, align: 'right' });
 
-      // Outstanding Balance - Highlighted
+      // Outstanding Balance with "Ksh" prefix
       doc.fillColor('#dc2626')
         .fontSize(12)
         .text('OUTSTANDING BALANCE:', 70, summaryContentY + 50, { bold: true })
@@ -1036,9 +1014,9 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
       const amountX = 450;
       const rowHeight = 25;
 
-      // Table Header
+      // Table Header with color #005478
       doc.rect(itemX, tableTop, 500, rowHeight)
-        .fillAndStroke('#2563eb', '#2563eb');
+        .fillAndStroke('#005478', '#005478'); // Changed from #2563eb to #005478
 
       doc.fillColor('#fff')
         .fontSize(11)
@@ -1048,16 +1026,16 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       let currentY = tableTop + rowHeight;
 
-      // Outstanding Balance Item
+      // Outstanding Balance Item with "Ksh" prefix
       doc.fillColor('#1e293b')
         .fontSize(10)
         .text('Balance Due', itemX + 10, currentY + 8)
         .text(`Outstanding amount for ${invoice.paymentPeriod}`, descX, currentY + 8)
-        .text(invoice.balance.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 8, { width: 80, align: 'right' });
+        .text(`Ksh ${invoice.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY + 8, { width: 80, align: 'right' });
 
       currentY += rowHeight + 15;
 
-      // Total Balance Due - Very prominent
+      // Total Balance Due with "Ksh" prefix
       doc.rect(itemX, currentY, 500, 40)
         .fillAndStroke('#fee2e2', '#dc2626');
 
@@ -1078,7 +1056,7 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         currentY = doc.y + 20;
       }
 
-      // Important Notice - Very prominent
+      // Important Notice
       doc.rect(50, currentY, 500, 40)
         .fillAndStroke('#fef3c7', '#d97706');
       
@@ -1087,10 +1065,8 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text('⚠️  IMPORTANT NOTICE', 60, currentY + 8, { bold: true })
         .text('Please settle this outstanding balance by the due date to avoid additional charges.', 60, currentY + 25, { width: 480 });
 
-      // Footer with company information (consistent with first function)
+      // Footer with company information
       const footerY = doc.page.height - 100;
-      
-      // Separator line above footer
       doc.rect(50, footerY - 10, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
       
       doc.fontSize(9)

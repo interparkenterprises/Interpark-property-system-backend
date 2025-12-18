@@ -8,18 +8,20 @@ datasource db {
 }
 
 model User {
-  id          String              @id @default(uuid())
-  name        String
-  email       String              @unique
-  password    String
-  role        Role
-  isApproved  Boolean             @default(false)
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
-  commissions ManagerCommission[]
-  properties  Property[]
-  todos       ToDo[]
-  createdOffers OfferLetter[]
+  id                 String              @id @default(uuid())
+  name               String
+  email              String              @unique
+  password           String
+  role               Role
+  isApproved         Boolean             @default(false)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  commissions        ManagerCommission[]
+  properties         Property[]
+  todos              ToDo[]
+  createdOffers      OfferLetter[]
+  dailyReports       DailyReport[]
+  activationRequests ActivationRequest[]
 }
 
 model Landlord {
@@ -36,31 +38,33 @@ model Landlord {
 }
 
 model Property {
-  id               String              @id @default(uuid())
-  name             String
-  address          String
-  lrNumber         String?
-  landlordId       String?
-  createdAt        DateTime            @default(now())
-  updatedAt        DateTime            @updatedAt
-  managerId        String?
-  form             PropertyForm
-  usage            UsageType
-  commissionFee    Float?
-  image            String?
-  accountName      String?
-  accountNo        String?
-  bank             String?
-  branch           String?
-  branchCode       String?
-  incomes          Income[]
-  leads            Lead[]
-  commissions      ManagerCommission[]
-  offerLetters     OfferLetter[]
-  landlord         Landlord?           @relation(fields: [landlordId], references: [id])
-  manager          User?               @relation(fields: [managerId], references: [id])
-  serviceProviders ServiceProvider[]
-  units            Unit[]
+  id                 String              @id @default(uuid())
+  name               String
+  address            String
+  lrNumber           String?
+  landlordId         String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  managerId          String?
+  form               PropertyForm
+  usage              UsageType
+  commissionFee      Float?
+  image              String?
+  accountName        String?
+  accountNo          String?
+  bank               String?
+  branch             String?
+  branchCode         String?
+  incomes            Income[]
+  leads              Lead[]
+  commissions        ManagerCommission[]
+  offerLetters       OfferLetter[]
+  landlord           Landlord?           @relation(fields: [landlordId], references: [id])
+  manager            User?               @relation(fields: [managerId], references: [id])
+  serviceProviders   ServiceProvider[]
+  units              Unit[]
+  dailyReports       DailyReport[]
+  activationRequests ActivationRequest[]
 }
 
 model ManagerCommission {
@@ -330,7 +334,212 @@ model OfferLetter {
   lead            Lead        @relation(fields: [leadId], references: [id])
   property        Property    @relation(fields: [propertyId], references: [id])
   unit            Unit?       @relation(fields: [unitId], references: [id])
-  createdBy       User?       @relation(fields: [createdById], references: [id]) 
+  createdBy       User?       @relation(fields: [createdById], references: [id])
+}
+
+// Add these to your existing schema.prisma file
+
+model DailyReport {
+  id            String   @id @default(uuid())
+  propertyId    String
+  managerId     String
+  reportDate    DateTime
+  day           String
+  timeSubmitted DateTime
+  preparedBy    String
+
+  // Security Report
+  securityProvider          String?
+  shiftCoverage             String?
+  securityIncidents         String?
+  securityActions           String?
+  securityOutstandingIssues String?
+
+  // Cleaning & Sanitation
+  cleaningContractor       String?
+  areasCleaned             Json? // Store as JSON array
+  cleanlinessStandard      String?
+  cleaningIssues           String?
+  cleaningCorrectiveAction String?
+
+  // Maintenance & Repairs
+  preventiveTasks Json? // Store as JSON array of tasks
+  repairs         Json? // Store as JSON array of repairs
+
+  // Tenant Complaints
+  tenantComplaints Json? // Store as JSON array
+
+  // Landlord Instructions
+  landlordInstructions String?
+  landlordActionTaken  String?
+  landlordStatus       String?
+
+  // Leads & Enquiries
+  newEnquiries   Int?    @default(0)
+  enquirySource  String?
+  unitsEnquired  String?
+  followUpAction String?
+  siteVisits     Int?    @default(0)
+
+  // Bookings & Occupancy
+  bookingsReceived  String?
+  bookingsConfirmed Int?    @default(0)
+  bookingsCancelled Int?    @default(0)
+  occupancyLevel    Float?  @default(0)
+  bookingsRemarks   String?
+
+  // Activations/Events
+  activationName   String?
+  activityNature   String?
+  activityDateTime DateTime?
+  activityImpact   String?
+
+  // Utilities Status
+  waterStatus         String? @default("NORMAL")
+  electricityStatus   String? @default("NORMAL")
+  otherServicesStatus String? @default("NORMAL")
+  utilitiesRemarks    String?
+
+  // General Observations
+  operationalChallenges String?
+  healthSafetyIssues    String?
+
+  // Attachments
+  attachments Json? // Store as JSON array of attachments
+
+  // Status
+  status ReportStatus @default(DRAFT)
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  property Property @relation(fields: [propertyId], references: [id])
+  manager  User     @relation(fields: [managerId], references: [id])
+
+  @@index([propertyId])
+  @@index([managerId])
+  @@index([reportDate])
+  @@index([status])
+}
+
+enum ReportStatus {
+  DRAFT
+  SUBMITTED
+  REVIEWED
+  ARCHIVED
+}
+
+model ActivationRequest {
+  id            String @id @default(uuid())
+  requestNumber String @unique
+  propertyId    String
+  managerId     String
+
+  // Part 1 - Client Information
+  companyName   String
+  postalAddress String
+  telephone     String
+  contactPerson String
+  designation   String
+  email         String
+  mobileNo      String
+  alternativeContact String?
+
+  // Part 2 - Description of Activation/Exhibition
+  startDate        DateTime
+  setupTime        String
+  endDate          DateTime
+  tearDownTime     String
+  activationType   String
+  description      String?
+  expectedVisitors Int?
+
+  // Part 3 - Space Requirements
+  spaceRequired    Float // in sq meters
+  location         String? // Preferred location
+  powerRequirement String?
+  waterRequirement Boolean @default(false)
+  internetRequired Boolean @default(false)
+
+  // Part 4 - Equipment & Setup
+  ownEquipment    Boolean @default(true)
+  equipmentList   Json? // Array of equipment details
+  furnitureNeeded Json? // Array of furniture needed
+
+  // Part 5 - Branding & Marketing
+  brandingMaterials Json? // Array of branding materials
+  soundSystem       Boolean @default(false)
+  displayScreens    Boolean @default(false)
+
+  // Part 6 - Health & Safety
+  insuranceCover   Boolean @default(false)
+  insuranceDetails String?
+  safetyMeasures   Json? // Array of safety measures
+  firstAidKit      Boolean @default(false)
+
+  // Part 7 - Financial Information
+  proposedBudget        Float?
+  proposedRent          Float?  // ADD THIS
+  proposedServiceCharge Float?  // ADD THIS
+  proposedDeposit       Float?  // ADD THIS
+  paymentTerms          String?
+
+  // Part 8 - Additional Services
+  securityRequired Boolean @default(false)
+  cleaningRequired Boolean @default(false)
+  cateringRequired Boolean @default(false)
+  parkingSpaces    Int?    @default(0)
+
+  // Part 9 - Terms & Conditions
+  termsAccepted Boolean   @default(false)
+  signature     String? // Base64 or URL
+  signatureDate DateTime?
+
+  // Document Management
+  documentUrl String? // Generated PDF URL
+  status      ActivationStatus @default(DRAFT)
+
+  // Additional Notes
+  specialRequests String?
+  internalNotes   String?
+  
+  // Supporting documents
+  companyRegistration String?
+  kraPinCertificate   String?
+  businessPermit      String?
+  otherDocuments      Json?
+
+  // Approval Workflow
+  submittedAt     DateTime?
+  reviewedAt      DateTime?
+  approvedAt      DateTime?
+  rejectedAt      DateTime?
+  rejectionReason String?
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  property Property @relation(fields: [propertyId], references: [id])
+  manager  User     @relation(fields: [managerId], references: [id])
+
+  @@index([propertyId])
+  @@index([managerId])
+  @@index([status])
+  @@index([startDate])
+}
+
+enum ActivationStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  COMPLETED
+  CANCELLED
 }
 
 model ToDo {

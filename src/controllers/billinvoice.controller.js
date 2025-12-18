@@ -5,6 +5,7 @@ import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import sizeOf from 'image-size';
 
 const prisma = new PrismaClient();
 
@@ -648,67 +649,74 @@ async function generateBillInvoicePDF(billInvoice) {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      // ===== ADD LETTERHEAD IMAGE =====
+      /* =====================================================
+         LETTERHEAD IMAGE HANDLING (SAFE & SERVER-READY)
+      ====================================================== */
 
-      
-      // Get project root directory
       const projectRoot = process.cwd();
-      
-      // Define multiple possible paths for the letterhead
       const possiblePaths = [
-        // Exact path based on your server structure
-        path.join(projectRoot, 'src', 'letterHeads', 'letter head-02.jpg'),
-        path.join(projectRoot, 'src', 'letterHeads', 'letter-head.jpg'),
-        path.join(projectRoot, 'src', 'letterHeads', 'letter_head.jpg'),
-        
-        // Alternative paths in case you're running from a different directory
-        path.join(__dirname, 'letterHeads', 'letter head-02.jpg'),
-        path.join(__dirname, '..', 'letterHeads', 'letter head-02.jpg'),
-        path.join(__dirname, '..', 'src', 'letterHeads', 'letter head-02.jpg'),
-        
-        // Common fallback paths
-        '/root/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
-        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
-        '/var/www/Interpark-property-system-backend/src/letterHeads/letter head-02.jpg',
+        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
+        '/root/Interpark-property-system-backend/src/letterHeads/letterhead.png',
+        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letterhead.png',
+        '/var/www/Interpark-property-system-backend/src/letterHeads/letterhead.png',
       ];
 
       let letterheadPath = null;
       let imageLoaded = false;
-      const startY = 100; // Starting position below letterhead
+      const startY = 120;
 
-      // Try each possible path
       for (const possiblePath of possiblePaths) {
-        try {
-          if (fs.existsSync(possiblePath)) {
+        if (fs.existsSync(possiblePath)) {
+          const stats = fs.statSync(possiblePath);
+          if (stats.size > 0) {
             letterheadPath = possiblePath;
-            console.log(`✓ Found letterhead at: ${possiblePath}`);
+            console.log(`✓ Letterhead found: ${possiblePath}`);
             break;
           }
-        } catch (err) {
-          continue;
         }
       }
 
-      // Add letterhead if found
       if (letterheadPath) {
         try {
-          // Add letterhead image at the top
-          doc.image(letterheadPath, 40, 15, { 
-            width: 510, 
-            height: 70
+          const imageBuffer = fs.readFileSync(letterheadPath);
+          const dimensions = sizeOf(imageBuffer);
+
+          // Max usable width (page width minus margins)
+          const maxWidth = doc.page.width - 100;
+
+          // Calculate proportional height
+          const scale = maxWidth / dimensions.width;
+          const scaledHeight = dimensions.height * scale;
+
+          // Optional: cap height if image is extremely tall
+          const finalHeight = Math.min(scaledHeight, 120);
+
+          // Recalculate width if height was capped
+          const finalWidth =
+            finalHeight !== scaledHeight
+              ? (dimensions.width * finalHeight) / dimensions.height
+              : maxWidth;
+
+          const xPosition = 50 + (maxWidth - finalWidth) / 2;
+
+          doc.image(imageBuffer, xPosition, 30, {
+            width: finalWidth,
           });
-          
-          // Adjust the Y position to start below the letterhead
-          doc.y = startY;
+
+          doc.y = 30 + finalHeight + 20;
           imageLoaded = true;
-        } catch (imageError) {
-          console.warn('Could not load letterhead image:', imageError.message);
-          imageLoaded = false;
+
+          console.log('✓ Letterhead rendered with correct proportions');
+        } catch (err) {
+          console.warn('✗ Letterhead failed to load:', err.message);
         }
       }
-
       // Fallback if no image loaded
       if (!imageLoaded) {
+        console.warn('Using fallback text header');
         doc.y = 40;
         doc.fontSize(18)
           .fillColor('#2563eb')
@@ -719,6 +727,7 @@ async function generateBillInvoicePDF(billInvoice) {
         doc.moveDown(0.5);
       }
 
+      console.log('=== End Debug Info ===\n');
       // Safe number formatting functions
       const safeNum = (val) => {
         const num = Number(val);
