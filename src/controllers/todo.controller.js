@@ -1,4 +1,5 @@
-import { PrismaClient, ToDoStatus } from '@prisma/client';
+import pkg from '@prisma/client';
+const { PrismaClient, ToDoStatus } = pkg;
 const prisma = new PrismaClient();
 
 // @desc    Get all todos for current user
