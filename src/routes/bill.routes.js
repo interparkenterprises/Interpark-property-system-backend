@@ -29,6 +29,6 @@ router.put('/:id', authorize('ADMIN'), updateBill);
 router.post('/:id/pay', authorize( 'ADMIN', 'MANAGER'), payBill);
 
 // DELETE /bills/:id - Only ADMIN can delete bills
-router.delete('/:id', authorize('ADMIN', 'MANAGER' ), deleteBill);
+router.delete('/:id', authorize('ADMIN' ), deleteBill);
 
 export default router;

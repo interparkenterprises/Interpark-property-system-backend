@@ -23,6 +23,6 @@ router.get('/property/:propertyId', getServiceProvidersByProperty);
 router.route('/:id')
   .get(getServiceProvider)
   .put(authorize('ADMIN', 'MANAGER'), updateServiceProvider)
-  .delete(authorize('ADMIN', 'MANAGER'), deleteServiceProvider);
+  .delete(authorize('ADMIN'), deleteServiceProvider);
 
 export default router;

@@ -38,6 +38,6 @@ router.post('/:id/record-payment', protect, authorize('ADMIN', 'MANAGER'), recor
 router.get('/:id/download', authorize('ADMIN', 'MANAGER'), downloadBillInvoice);
 
 // Delete bill invoice - Only ADMIN and MANAGER can delete
-router.delete('/:id', authorize('ADMIN', 'MANAGER'), deleteBillInvoice);
+router.delete('/:id', authorize('ADMIN'), deleteBillInvoice);
 
 export default router;

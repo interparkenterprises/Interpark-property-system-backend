@@ -26,6 +26,6 @@ router.route('/:id')
 
 router.route('/:id/service-charge')
   .patch(authorize('ADMIN', 'MANAGER'), updateServiceCharge)
-  .delete(authorize('ADMIN', 'MANAGER'), removeServiceCharge);
+  .delete(authorize('ADMIN'), removeServiceCharge);
 
 export default router;

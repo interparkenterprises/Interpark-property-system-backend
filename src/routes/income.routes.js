@@ -20,6 +20,7 @@ router.post("/", createIncome);
 router.get("/", getAllIncomes);
 router.get("/:id", getIncomeById);
 router.put("/:id", updateIncome);
-router.delete("/:id", deleteIncome);
+//  Admin ONLY
+router.delete("/:id", authorize("ADMIN"), deleteIncome);
 
 export default router;

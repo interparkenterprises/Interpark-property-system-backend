@@ -32,6 +32,6 @@ router.get('/property/:propertyId', getUnitsByProperty);
 router.route('/:id')
   .get(getUnit)
   .put(authorize('ADMIN', 'MANAGER'), updateUnit)
-  .delete(authorize('ADMIN', 'MANAGER'), deleteUnit);
+  .delete(authorize('ADMIN'), deleteUnit);
 
 export default router;
