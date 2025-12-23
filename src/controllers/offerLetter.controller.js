@@ -1,10 +1,10 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
 import { generateCommercialOfferLetter } from '../template/commercialOfferTemplate.js';
 import { generateResidentialOfferLetter } from '../template/residentialOfferTemplate.js';
 import { generatePDF } from '../utils/pdfGenerator.js';
 import { uploadDocument } from '../utils/uploadHelper.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 // Helper function to parse address into components - FIXED to properly extract P.O. Box
 const parseAddress = (address) => {

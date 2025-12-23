@@ -1,5 +1,5 @@
-import { PrismaClient } from '@prisma/client';
-const prisma = new PrismaClient();
+import prisma from "../lib/prisma.js";
+
 
 // @desc    Get all leads
 // @route   GET /api/leads

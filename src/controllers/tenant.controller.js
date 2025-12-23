@@ -1,20 +1,10 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
+
 import { calculateEscalatedRent, getRentSchedule } from '../services/rentCalculation.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
-// Helper function to update unit rent amount
-const updateUnitRent = async (unitId, newRent) => {
-  try {
-    await prisma.unit.update({
-      where: { id: unitId },
-      data: { rentAmount: parseFloat(newRent) }
-    });
-  } catch (error) {
-    console.error('Error updating unit rent:', error);
-    throw new Error('Failed to update unit rent amount');
-  }
-};
+
 
 // Helper function to check if manager has access to tenant
 const checkManagerTenantAccess = async (userId, tenantId) => {

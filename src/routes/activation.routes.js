@@ -4,7 +4,7 @@ import {
   getActivationRequests,
   getActivationRequest,
   updateActivationRequest,
-  generateActivationPDF,
+  generateActivationPDFController,
   submitActivationRequest,
   deleteActivationRequest,
   downloadActivationPDF
@@ -29,7 +29,7 @@ router.route('/:id')
   .delete(deleteActivationRequest); // Delete activation request
 
 // Special operations
-router.post('/:id/generate-pdf', generateActivationPDF);  // Generate PDF
+router.post('/:id/generate-pdf',  generateActivationPDFController);  // Generate PDF
 router.get('/:id/download', downloadActivationPDF);    //Download PDF
 router.post('/:id/submit', submitActivationRequest);      // Submit for review
 

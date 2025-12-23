@@ -1,5 +1,4 @@
-import { PrismaClient } from '@prisma/client';
-const prisma = new PrismaClient();
+import prisma from "../lib/prisma.js";
 
 // Helper function to determine unit type based on property usage
 const determineUnitType = (propertyUsage, requestedUnitType) => {

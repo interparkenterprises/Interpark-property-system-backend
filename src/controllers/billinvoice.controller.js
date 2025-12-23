@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
 import PDFDocument from 'pdfkit';
 import { uploadToStorage } from '../utils/storage.js';
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
@@ -7,7 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import sizeOf from 'image-size';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 // Create __dirname equivalent for ES modules
 const __filename = fileURLToPath(import.meta.url);

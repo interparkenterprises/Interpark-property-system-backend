@@ -1,7 +1,7 @@
-import { PrismaClient } from "@prisma/client";
+import prisma from "../lib/prisma.js";
 import { processCommissionForIncome } from '../services/commissionService.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 
 // Create income record + auto-generate/update manager commission

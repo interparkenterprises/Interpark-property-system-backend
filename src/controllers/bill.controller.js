@@ -1,9 +1,9 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 import PDFDocument from 'pdfkit';
 import { uploadToStorage } from '../utils/storage.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 // Create a new bill
 export const createBill = async (req, res) => {

@@ -1,8 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
 import { processCommissionForIncome } from '../services/commissionService.js';
 import { generateInvoiceNumber, generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 // Helper: Compute expected rent & service charge for a tenant at a given period
 async function computeExpectedCharges(tenantId, periodStart = null) {

@@ -437,7 +437,7 @@ model ActivationRequest {
   propertyId    String
   managerId     String
 
-  // Part 1 - Client Information
+  // Part 1 - Client Information (Required for template)
   companyName   String
   postalAddress String
   telephone     String
@@ -445,9 +445,8 @@ model ActivationRequest {
   designation   String
   email         String
   mobileNo      String
-  alternativeContact String?
 
-  // Part 2 - Description of Activation/Exhibition
+  // Part 2 - Description of Activation/Exhibition (Required for template)
   startDate        DateTime
   setupTime        String
   endDate          DateTime
@@ -455,72 +454,39 @@ model ActivationRequest {
   activationType   String
   description      String?
   expectedVisitors Int?
+  soundSystem      Boolean @default(false)
 
-  // Part 3 - Space Requirements
-  spaceRequired    Float // in sq meters
-  location         String? // Preferred location
-  powerRequirement String?
-  waterRequirement Boolean @default(false)
-  internetRequired Boolean @default(false)
+  // Part 3 - Cost of Activation/Exhibition (Required for template)
+  licenseFeePerDay Float?
+  numberOfDays     Int?
+  proposedBudget   Float? // Fallback for licenseFeePerDay
 
-  // Part 4 - Equipment & Setup
-  ownEquipment    Boolean @default(true)
-  equipmentList   Json? // Array of equipment details
-  furnitureNeeded Json? // Array of furniture needed
+  // Payment Details (Required for template)
+  bankName      String?
+  bankBranch    String?
+  accountName   String?
+  accountNumber String?
+  swiftCode     String?
+  paybillNumber String?
+  mpesaAccount  String?
 
-  // Part 5 - Branding & Marketing
-  brandingMaterials Json? // Array of branding materials
-  soundSystem       Boolean @default(false)
-  displayScreens    Boolean @default(false)
-
-  // Part 6 - Health & Safety
-  insuranceCover   Boolean @default(false)
-  insuranceDetails String?
-  safetyMeasures   Json? // Array of safety measures
-  firstAidKit      Boolean @default(false)
-
-  // Part 7 - Financial Information
-  proposedBudget        Float?
-  proposedRent          Float?  // ADD THIS
-  proposedServiceCharge Float?  // ADD THIS
-  proposedDeposit       Float?  // ADD THIS
-  paymentTerms          String?
-
-  // Part 8 - Additional Services
-  securityRequired Boolean @default(false)
-  cleaningRequired Boolean @default(false)
-  cateringRequired Boolean @default(false)
-  parkingSpaces    Int?    @default(0)
-
-  // Part 9 - Terms & Conditions
-  termsAccepted Boolean   @default(false)
-  signature     String? // Base64 or URL
-  signatureDate DateTime?
+  // Manager Information (Required for template)
+  managerName        String? // Manager's name for signature
+  managerDesignation String? // Manager's designation
 
   // Document Management
-  documentUrl String? // Generated PDF URL
-  status      ActivationStatus @default(DRAFT)
-
-  // Additional Notes
-  specialRequests String?
-  internalNotes   String?
+  documentUrl   String? // Generated PDF URL
+  status        ActivationStatus @default(DRAFT)
   
-  // Supporting documents
-  companyRegistration String?
-  kraPinCertificate   String?
-  businessPermit      String?
-  otherDocuments      Json?
 
-  // Approval Workflow
-  submittedAt     DateTime?
-  reviewedAt      DateTime?
-  approvedAt      DateTime?
-  rejectedAt      DateTime?
-  rejectionReason String?
+  // Timestamps (Used in template)
+  submittedAt DateTime?
+  approvedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  // Timestamps
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  // Signature Information
+  signatureDate DateTime?
 
   // Relations
   property Property @relation(fields: [propertyId], references: [id])

@@ -1,8 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
 import { hashPassword, comparePassword } from '../utils/hashPassword.js';
 import generateToken from '../utils/generateToken.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 // @desc    Register new user (Manager only)
 // @route   POST /api/auth/register

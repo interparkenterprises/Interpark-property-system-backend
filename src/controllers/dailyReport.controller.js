@@ -1,8 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import prisma from "../lib/prisma.js";
 import { uploadToStorage, generateFileName } from '../utils/storage.js';
 import { DailyReportHelper } from '../utils/dailyReportHelper.js';
 
-const prisma = new PrismaClient();
+//const prisma = new PrismaClient();
 
 export class DailyReportController {
   // Create daily report with PDF generation
