@@ -1,7 +1,7 @@
 /**
  * Commercial Offer Letter Template (LOF)
  * For Commercial, Industrial, and Institutional properties
- * Updated to match exact document structure and wording
+ * Updated to use lead's data while referring to them as tenant
  */
 export const generateCommercialOfferLetter = (data) => {
   const {
@@ -10,10 +10,18 @@ export const generateCommercialOfferLetter = (data) => {
     propertyLRNumber,
     landlordName,
     landlordPOBox,
-    landlordAddress,
-    tenantName,
-    tenantPOBox,
-    tenantAddress,
+    //landlordAddress,
+    
+    // Lead details (used as tenant in the document)
+    leadCompanyName,
+    leadName,
+    leadPOBox,
+    leadAddress,
+    leadIDNumber,
+    leadPINNumber,
+    leadPhone,
+    leadEmail,
+    
     date,
     floor,
     areaSqFt,
@@ -33,10 +41,21 @@ export const generateCommercialOfferLetter = (data) => {
     userPurpose,
     paymentPolicy = 'QUARTERLY',
     additionalTerms,
-    bankDetails,
+    bankDetails = {},
     legalFees,
     promotionExpenses,
-    includeTerrace = false
+    includeTerrace = false,
+    
+    // Landlord bank details
+    landlordIDNumber,
+    landlordBankAccount,
+    landlordAccountName,
+    landlordBankName,
+    landlordBankBranch,
+    landlordBankBranchCode,
+    landlordSwiftCode,
+    landlordMpesaPaybill,
+    landlordMpesaAccount
   } = data;
 
   // Calculate derived values
@@ -46,6 +65,12 @@ export const generateCommercialOfferLetter = (data) => {
   const vatAmount = (totalRentValue + totalServiceChargeValue) * securityDepositMonths * (vatRate / 100);
   const advancePayment = (totalRentValue + totalServiceChargeValue) * securityDepositMonths;
   const totalInitialPayment = securityDepositValue + advancePayment + vatAmount;
+
+  // Format currency
+  const formatCurrency = (amount) => {
+    if (!amount && amount !== 0) return 'N/A';
+    return new Intl.NumberFormat('en-KE').format(Math.round(amount));
+  };
 
   // Convert total payment to words for legal clarity
   const totalInWords = convertNumberToWords(Math.round(totalInitialPayment));
@@ -57,6 +82,66 @@ export const generateCommercialOfferLetter = (data) => {
 
   // Format escalation frequency
   const escalationText = escalationFrequency === 'BI_ANNUALLY' ? 'Six (6)' : 'Twelve (12)';
+
+  // Helper functions for better display
+  const formatAddress = (poBox, address) => {
+    if (!poBox && !address) return 'Address Not Provided';
+    
+    let formatted = '';
+    if (poBox) {
+      formatted += `P. O. Box ${poBox}`;
+    }
+    if (address) {
+      if (formatted) formatted += '<br>';
+      formatted += address;
+    }
+    return formatted;
+  };
+
+  const formatName = (name, fallback = 'Not Provided') => {
+    return name && name.trim() ? name : fallback;
+  };
+
+  const formatField = (value, fallback = 'Not Provided') => {
+    if (value === undefined || value === null || value === '') {
+      return fallback;
+    }
+    return value;
+  };
+
+  // Format lease start date
+  const formatLeaseStartDate = (dateStr) => {
+    if (!dateStr) return 'Date Not Provided';
+    try {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+    } catch (e) {
+      return 'Date Not Provided';
+    }
+  };
+
+  // Extract bank details with fallbacks
+  const bankAccountNo = bankDetails.accountNumber || landlordBankAccount || 'Not Provided';
+  const bankAccountName = bankDetails.accountName || landlordAccountName || 'Not Provided';
+  const bankName = bankDetails.bankName || landlordBankName || 'Not Provided';
+  const bankBranch = bankDetails.branch || landlordBankBranch || 'Not Provided';
+  const bankBranchCode = bankDetails.branchCode || landlordBankBranchCode || 'Not Provided';
+  const bankSwiftCode = bankDetails.swiftCode || landlordSwiftCode;
+
+  // Use lead data but display as "Tenant"
+  const tenantCompanyName = formatName(leadCompanyName || leadName, 'Tenant Company Limited');
+  const tenantContactName = formatName(leadName, 'Tenant');
+  
+  // Format current date for display
+  const currentDate = new Date(date || new Date());
+  const formattedDate = currentDate.toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric'
+  });
+
+  // Format fit-out period
+  const fitOutDisplay = fitOutPeriod ? `${fitOutPeriod} months` : 'Not Specified';
 
   return `
 <!DOCTYPE html>
@@ -207,11 +292,15 @@ export const generateCommercialOfferLetter = (data) => {
       margin: 10px 0;
       text-align: justify;
     }
+    .not-provided {
+      color: #666;
+      font-style: italic;
+    }
   </style>
 </head>
 <body>
   <div class="header">
-    <div class="property-name">${propertyName || 'Property Name PO Box and location'}</div>
+    <div class="property-name">${formatField(propertyName, 'Property Name')}</div>
   </div>
 
   <div class="date-section">
@@ -219,13 +308,13 @@ export const generateCommercialOfferLetter = (data) => {
       <strong>ATTN,</strong>
     </div>
     <div class="date-right">
-      Date: ${date || '……………..'}
+      Date: ${formattedDate}
     </div>
   </div>
 
   <div class="recipient">
-    ${tenantName || 'xxxxxxxxxxxxxxx'}<br>
-    ${tenantPOBox ? `P. O. Box ${tenantPOBox}` : 'P. O. Box …………………..'}${tenantAddress ? '<br>' + tenantAddress : '<br>………………...'}
+    ${tenantCompanyName}<br>
+    ${formatAddress(leadPOBox, leadAddress)}
   </div>
 
   <div class="subject">
@@ -233,15 +322,15 @@ export const generateCommercialOfferLetter = (data) => {
   </div>
 
   <div class="salutation">
-    Dear ${tenantName ? (tenantName.includes(' ') ? tenantName.split(' ')[0] : tenantName) : '………………………….,'},
+    Dear ${tenantContactName},
   </div>
 
   <div class="re-line">
-    RE: OFFER TO LEASE COMMERCIAL SPACE ON THE ${floor ? floor.toUpperCase() : '……………'} FLOOR OF THE DEVELOPMENT ERECTED ON LAND REFERENCE L.R. NO. ${propertyLRNumber || '………………………………..'}
+    RE: OFFER TO LEASE COMMERCIAL SPACE ON THE ${formatField(floor, '________').toUpperCase()} FLOOR OF THE DEVELOPMENT ERECTED ON LAND REFERENCE L.R. NO. ${formatField(propertyLRNumber, '________________')}
   </div>
 
   <p>
-    Further to our discussions in respect to the referenced matter, we are pleased to offer to lease to you the commercial space${includeTerrace ? ' and the terrace abutting the commercial space' : ''} measuring approximately ${areaSqFt || '…………….'}  Square Feet on the ${floor || '……………'} Floor of the development erected on L.R. No. ${propertyLRNumber || '.…………..'} at ${propertyAddress || '…………….'}subject to contract, and subject to the following terms:
+    Further to our discussions in respect to the referenced matter, we are pleased to offer to lease to you the commercial space${includeTerrace ? ' and the terrace abutting the commercial space' : ''} measuring approximately ${formatField(areaSqFt, '______')} Square Feet on the ${formatField(floor, '______')} Floor of the development erected on L.R. No. ${formatField(propertyLRNumber, '______')} at ${formatField(propertyAddress, '________________')} subject to contract, and subject to the following terms:
   </p>
 
   <table>
@@ -249,30 +338,35 @@ export const generateCommercialOfferLetter = (data) => {
       <td>1.</td>
       <td>Premises:</td>
       <td>
-        The Premise leased is the commercial space${includeTerrace ? ' and the terrace abutting the commercial space' : ''} measuring approximately ${areaSqFt || '………………'} Square Feet on the ${floor || '………………...'} Floor of the development erected on L.R. No. ${propertyLRNumber || '……………'} at ${propertyAddress || '……………'}
+        The Premise leased is the commercial space${includeTerrace ? ' and the terrace abutting the commercial space' : ''} measuring approximately ${formatField(areaSqFt, '______')} Square Feet on the ${formatField(floor, '______')} Floor of the development erected on L.R. No. ${formatField(propertyLRNumber, '______')} at ${formatField(propertyAddress, '________________')}
       </td>
     </tr>
     <tr>
       <td>2.</td>
       <td>Landlord:</td>
       <td>
-        ${landlordName || 'XXXXXXXXXXXXXXXXXXXXX'}<br>
-        ${landlordPOBox ? `P. O. Box ${landlordPOBox}` : 'P. O. Box XXXXXXXXXXXXX'}${landlordAddress ? '<br>' + landlordAddress : '<br>XXXXXXXX'}
+        ${formatName(landlordName, 'Landlord Name Not Provided')}<br>
+        ${formatAddress(landlordPOBox, propertyAddress)}
+        ${landlordIDNumber ? `<br>ID No: ${landlordIDNumber}` : ''}
       </td>
     </tr>
     <tr>
       <td>3.</td>
       <td>Tenant:</td>
       <td>
-        ${tenantName || 'xxxxxxxxxxxxxxxxx'} Limited<br>
-        ${tenantPOBox ? `P. O. Box ${tenantPOBox}` : 'P. O. Box xxxxxxx'}${tenantAddress ? '<br>' + tenantAddress : '<br>XXXXXXXXX.'}
+        ${tenantCompanyName}<br>
+        ${formatAddress(leadPOBox, leadAddress)}
+        ${leadIDNumber ? `<br>ID No: ${leadIDNumber}` : ''}
+        ${leadPINNumber ? `<br>PIN No: ${leadPINNumber}` : ''}
+        ${leadPhone ? `<br>Phone: ${leadPhone}` : ''}
+        ${leadEmail ? `<br>Email: ${leadEmail}` : ''}
       </td>
     </tr>
     <tr>
       <td>4.</td>
       <td>Term:</td>
       <td>
-        ${leaseTerm || 'Six (6) Years'} from the 1<sup>st</sup> day of ${leaseStartDate ? new Date(leaseStartDate).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }) : 'XXX(Month) XXX(Year)'} or such other earlier date that the Parties shall agree.
+        ${formatField(leaseTerm, 'Twelve (12) months')} from the 1<sup>st</sup> day of ${formatLeaseStartDate(leaseStartDate)} or such other earlier date that the Parties shall agree.
       </td>
     </tr>
     <tr>
@@ -287,7 +381,7 @@ export const generateCommercialOfferLetter = (data) => {
       <td>6.</td>
       <td>Fit Out Period:</td>
       <td>
-        The Tenant shall be granted ${fitOutPeriod} rent free Fit Out Period. The Tenant shall undertake all the required Fit Out Works before the rent Commencement Date, and the Landlord hereby warrants and undertakes to grant to the Tenant with vacant possession on the 1<sup>st</sup> day of ${leaseStartDate ? new Date(leaseStartDate).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }) : 'xxx (Month) xxx(Year)'} or such other earlier date as the Tenant may require, provided that should the Tenant take possession of the Premises earlier than the 1<sup>st</sup> day of ${leaseStartDate ? new Date(leaseStartDate).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }) : 'May 2026'}, the Term Commencement Date shall be amended to two months after the Tenant takes possession of the Premises.
+        The Tenant shall be granted ${fitOutDisplay} rent free Fit Out Period. The Tenant shall undertake all the required Fit Out Works before the rent Commencement Date, and the Landlord hereby warrants and undertakes to grant to the Tenant with vacant possession on the 1<sup>st</sup> day of ${formatLeaseStartDate(leaseStartDate)} or such other earlier date as the Tenant may require, provided that should the Tenant take possession of the Premises earlier than the 1<sup>st</sup> day of ${formatLeaseStartDate(leaseStartDate)}, the Term Commencement Date shall be amended to two months after the Tenant takes possession of the Premises.
       </td>
     </tr>
     ` : ''}
@@ -295,7 +389,7 @@ export const generateCommercialOfferLetter = (data) => {
       <td>${fitOutPeriod ? '7' : '6'}.</td>
       <td>Rent:</td>
       <td>
-        The Rent which shall be payable from the Term Commencement Date shall be assessed at Kenya Shilling ${rentPerSqFt ? rentPerSqFt.toLocaleString() : 'xxxxxx'} per Square Foot aggregating to Kenya Shillings ${totalRentValue ? totalRentValue.toLocaleString() : 'xxxxxxxxxxxxxxxxxx'} (Kshs. ${totalRentValue ? totalRentValue.toLocaleString() : 'xxxxxxxxx'}/=) which shall escalate at the rate of ${escalationRate || 'xxx'}% after every ${escalationText} months after the Term Commencement Date. The rent is inclusive of service charge.<br><br>
+        The Rent which shall be payable from the Term Commencement Date shall be assessed at Kenya Shilling ${formatField(rentPerSqFt, '______')} per Square Foot aggregating to Kenya Shillings ${formatCurrency(totalRentValue)} (Kshs. ${formatCurrency(totalRentValue)}/=) which shall escalate at the rate of ${formatField(escalationRate, '______')}% after every ${escalationText} months after the Term Commencement Date. The rent is inclusive of service charge.<br><br>
         Rent shall be paid ${paymentPolicyText} in advance not later than the 5<sup>th</sup> day of every month upon presentation of an invoice, and if the rent is not paid by then, the Tenant shall pay the Landlord interest on the rent arrears at the rate of Fifteen Percent (15%) per month from the date the Rent fell due until the date it is paid in full. Interest shall be calculated on daily balances and debited monthly by way of compound interest.
       </td>
     </tr>
@@ -303,7 +397,7 @@ export const generateCommercialOfferLetter = (data) => {
       <td>${fitOutPeriod ? '8' : '7'}.</td>
       <td>Service charge:</td>
       <td>
-        The Service Charge levied at Ksh. ${serviceChargePerSqFt ? serviceChargePerSqFt.toLocaleString() : 'Xxxxx'} per sq.ft or ${totalServiceChargeValue ? totalServiceChargeValue.toLocaleString() : 'XX'} amount, which shall be payable either monthly or quarterly in advance together with the rent, shall cover all outgoings, operational costs and overheads relating to the building that shall include but not be limited to the following: -
+        The Service Charge levied at Ksh. ${formatField(serviceChargePerSqFt, '______')} per sq.ft or ${formatCurrency(totalServiceChargeValue)} amount, which shall be payable either monthly or quarterly in advance together with the rent, shall cover all outgoings, operational costs and overheads relating to the building that shall include but not be limited to the following: -
         <div class="list-item">a) Electricity for common areas</div>
         <div class="list-item">b) Cleanliness for common areas</div>
         <div class="list-item">c) Insurance</div>
@@ -341,7 +435,7 @@ export const generateCommercialOfferLetter = (data) => {
       <td>${fitOutPeriod ? '11' : '10'}.</td>
       <td>Security Deposit:</td>
       <td>
-        Together with the acceptance of this offer, the tenant will pay a Security Deposit of Rent and Service Charge in form of cash or bank guarantee and maintain with the landlord such Security during the Term of the Lease of a sum of Kenya Shillings ${securityDepositValue ? securityDepositValue.toLocaleString() : 'xxxxxxxxxxxx'} (Ksh. ${securityDepositValue ? securityDepositValue.toLocaleString() : 'xxxxxx'} /=) (equivalent to ${securityDepositMonths} month's rent and Service Charge.)<br><br>
+        Together with the acceptance of this offer, the tenant will pay a Security Deposit of Rent and Service Charge in form of cash or bank guarantee and maintain with the landlord such Security during the Term of the Lease of a sum of Kenya Shillings ${formatCurrency(securityDepositValue)} (Ksh. ${formatCurrency(securityDepositValue)} /=) (equivalent to ${securityDepositMonths} month${securityDepositMonths !== 1 ? 's' : ''} rent and Service Charge.)<br><br>
         The deposit shall be retained by the landlord as security for the due performance by the tenant of its obligations under the lease.<br><br>
         The deposit will not be utilized by the tenant on account of the payment of rent, service charge or car park license fees for the last month (or longer period) of the term of lease.<br><br>
         During the period of the lease the deposit will be adjusted from time to time so that at no time during the term shall the rents payable be higher than the deposit held.<br><br>
@@ -352,7 +446,7 @@ export const generateCommercialOfferLetter = (data) => {
       <td>${fitOutPeriod ? '12' : '11'}.</td>
       <td>User:</td>
       <td>
-        The premises shall be used for the sole purpose as ${userPurpose || 'xxxxxxxxxxx'} and any change of user will not be permitted without the landlord's or its Agents prior approval.<br><br>
+        The premises shall be used for the sole purpose as ${formatField(userPurpose, 'General Business Purpose')} and any change of user will not be permitted without the landlord's or its Agents prior approval.<br><br>
         The usage of the space will have to be in accordance with the design of the building.<br><br>
         The Tenant shall at all times during the Term comply with all Laws, Acts, Rules, Regulations or By-Laws now in force, or as shall be enacted, passed, made or issued by the Government of Kenya or any Municipal, Township, Local or other competent authority in relation to the occupation, conduct and user of the Premise AND obtain all such licenses consents certificates or approvals thereon.
       </td>
@@ -418,7 +512,7 @@ export const generateCommercialOfferLetter = (data) => {
       <td>${fitOutPeriod ? '20' : '19'}.</td>
       <td>Re-entry:</td>
       <td>
-        If the rent agreed or any part thereof shall remain unpaid for fourteen (14) days after becoming payable (whether formally demanded or not) or if at any time thereafter the tenant in breach of any of the covenants or conditions referred to in the standard form lease, it will be lawful for the landlord to re-enter the premises or any part thereof in the name of the whole and thereupon the lease shall be terminated absolutely.
+        If the rent agreed or any part thereof shall remain unpaid for fourteen (14) days after becoming payable (whether formally demanded or not) or if at any time thereafter the tenant in breach of any of the covenants or conditions referred to in the standard form lease, it will be lawful for the landlord to re- enter the premises or any part thereof in the name of the whole and thereupon the lease shall be terminated absolutely.
       </td>
     </tr>
     <tr>
@@ -492,36 +586,35 @@ export const generateCommercialOfferLetter = (data) => {
         <table class="payment-table">
           <tr>
             <td>${securityDepositMonths} months' Security Deposit of Rent and Service Charge:</td>
-            <td>Ksh. ${securityDepositValue ? securityDepositValue.toLocaleString() : '……………'} /=</td>
+            <td>Ksh. ${formatCurrency(securityDepositValue)} /=</td>
           </tr>
           <tr>
             <td>${securityDepositMonths} months' Advance Rent & service charge:</td>
-            <td>Ksh. ${advancePayment ? advancePayment.toLocaleString() : '……..'}  /=</td>
+            <td>Ksh. ${formatCurrency(advancePayment)} /=</td>
           </tr>
           <tr>
             <td>VAT</td>
-            <td>Ksh. ${vatAmount ? vatAmount.toLocaleString() : '…………'} /=</td>
+            <td>Ksh. ${formatCurrency(vatAmount)} /=</td>
           </tr>
           <tr>
             <td><strong>Total:</strong></td>
-            <td><strong>Ksh. ${totalInitialPayment ? totalInitialPayment.toLocaleString() : '…………'} /=</strong></td>
+            <td><strong>Ksh. ${formatCurrency(totalInitialPayment)} /=</strong></td>
           </tr>
         </table>
         <br>
         All payments shall be made to the Landlord's Bank Account specified below, and shall be evidenced by an official bank deposit slip duly endorsed by the receiving bank. The Landlord shall not be liable for any payment which is made to any other person or into any other account or in any other mode:<br><br>
-        ${bankDetails ? `
-        <strong>Account no:</strong> ${bankDetails.accountNumber || '….………...'}<br>
-        <strong>Account Name:</strong> ${bankDetails.accountName || '………………...'}<br>
-        <strong>Bank:</strong> ${bankDetails.bankName || '……………………….'}<br>
-        <strong>Branch:</strong> ${bankDetails.branch || '………………...'}<br>
-        <strong>Branch Code:</strong> ${bankDetails.branchCode || '…………'}<br><br>
-        ` : `
-        <strong>Account no:</strong> ….………...<br>
-        <strong>Account Name:</strong> ………………...<br>
-        <strong>Bank:</strong> ……………………….<br>
-        <strong>Branch:</strong> ………………...<br>
-        <strong>Branch Code:</strong> …………<br><br>
-        `}
+        <strong>Account no:</strong> ${bankAccountNo}<br>
+        <strong>Account Name:</strong> ${bankAccountName}<br>
+        <strong>Bank:</strong> ${bankName}<br>
+        <strong>Branch:</strong> ${bankBranch}<br>
+        <strong>Branch Code:</strong> ${bankBranchCode}<br>
+        ${bankSwiftCode ? `<strong>Swift Code:</strong> ${bankSwiftCode}<br>` : ''}
+        ${landlordMpesaPaybill ? `
+        <br><strong>Alternative Mpesa Payment:</strong><br>
+        Paybill Number: ${landlordMpesaPaybill}<br>
+        Account Number: ${landlordMpesaAccount || 'Tenant Name'}<br>
+        ` : ''}
+        <br>
         The Legal Fees for the Landlord's Advocates for attending to the instant transaction shall be payable to the Landlord's Advocates contemporaneous with the payment of the above sums and before the return of the accepted Letter of Offer.<br><br>
         By accepting this Offer, the Tenant is deemed to have accepted the Terms and Conditions contained herein and shall be bound by the same pending execution of the Lease and further agrees and undertakes to execute the Lease within Seven (7) days of receipt of the same.<br><br>
         The Tenant shall furnish the Landlord's Advocates with the following:<br><br>
@@ -540,7 +633,7 @@ export const generateCommercialOfferLetter = (data) => {
 
   <div class="signature-section">
     <div class="signature-block">
-      <strong>${landlordName || 'Landlords name here'}</strong><br><br>
+      <strong>${formatName(landlordName, 'Landlord Name')}</strong><br><br>
       Director
     </div>
   </div>
@@ -551,25 +644,25 @@ export const generateCommercialOfferLetter = (data) => {
     </div>
 
     <p>
-      We or I <strong>${tenantName || 'xxxxxxxxxxxxxxxxxxxx'}</strong> do hereby unconditionally accept the offer to lease the Premises, and the above Terms and Conditions, and undertake to execute the standard Lease which shall be prepared by the Landlord's Advocates within Seven (7) days of receipt of the engrossed Lease and enclose herewith payments of Kenya Shillings in respect of: -
+      We or I <strong>${tenantCompanyName}</strong> do hereby unconditionally accept the offer to lease the Premises, and the above Terms and Conditions, and undertake to execute the standard Lease which shall be prepared by the Landlord's Advocates within Seven (7) days of receipt of the engrossed Lease and enclose herewith payments of Kenya Shillings in respect of: -
     </p>
 
     <table class="payment-table">
       <tr>
         <td>${securityDepositMonths} months' Security Deposit of Rent and Service Charge:</td>
-        <td>Ksh. ${securityDepositValue ? securityDepositValue.toLocaleString() : 'xxxxxx'} /=</td>
+        <td>Ksh. ${formatCurrency(securityDepositValue)} /=</td>
       </tr>
       <tr>
         <td>${securityDepositMonths} months' Advance Rent & service charge:</td>
-        <td>Ksh. ${advancePayment ? advancePayment.toLocaleString() : 'xxxxxx'} /=</td>
+        <td>Ksh. ${formatCurrency(advancePayment)} /=</td>
       </tr>
       <tr>
         <td>VAT</td>
-        <td>Ksh. ${vatAmount ? vatAmount.toLocaleString() : 'xxxxxx'} /=</td>
+        <td>Ksh. ${formatCurrency(vatAmount)} /=</td>
       </tr>
       <tr>
         <td><strong>Total:</strong></td>
-        <td><strong>Ksh. ${totalInitialPayment ? totalInitialPayment.toLocaleString() : 'xxxxxxxx'} /=</strong></td>
+        <td><strong>Ksh. ${formatCurrency(totalInitialPayment)} /=</strong></td>
       </tr>
       <tr>
         <td><strong>Legal Fees:</strong></td>
@@ -579,7 +672,7 @@ export const generateCommercialOfferLetter = (data) => {
 
     <div class="seal-section">
       SEALED with the COMMON SEAL of the Tenant the said<br>
-      ${tenantName || 'Xxxxxxxxxxxxxxx'} ltd
+      ${tenantCompanyName}
     </div>
 
     <div class="witness-section">
@@ -631,6 +724,8 @@ function getClauseNumber(fitOutPeriod, promotionExpenses, baseNumber) {
 
 // Helper function to convert number to words (enhanced)
 function convertNumberToWords(num) {
+  if (!num && num !== 0) return 'Zero Only';
+  
   const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine'];
   const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
   const teens = ['Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];

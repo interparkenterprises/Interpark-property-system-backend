@@ -442,6 +442,7 @@ model ActivationRequest {
   postalAddress String
   telephone     String
   contactPerson String
+  alternativeContact String?
   designation   String
   email         String
   mobileNo      String
