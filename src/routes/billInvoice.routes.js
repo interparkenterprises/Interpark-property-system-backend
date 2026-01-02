@@ -11,7 +11,7 @@ import {
   deleteBillInvoice,
   recordBillInvoicePayment,
   getBillInvoiceStatsByPaymentPolicy  // NEW - Added from updated controller
-} from '../controllers/billInvoice.controller.js';
+} from '../controllers/billinvoice.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
 
