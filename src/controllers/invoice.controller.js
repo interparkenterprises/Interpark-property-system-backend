@@ -94,11 +94,11 @@ export const generateInvoice = async (req, res) => {
     // Generate unique invoice number
     const invoiceNumber = await generateInvoiceNumber();
 
-    // Determine payment period
+    // Determine payment period based on tenant's payment policy
     const paymentPeriod = paymentReport?.paymentPeriod || 
-      new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      getPaymentPeriod(new Date(), tenant.paymentPolicy);
 
-    // Create invoice record
+    // Create invoice record with paymentPolicy
     const invoice = await prisma.invoice.create({
       data: {
         invoiceNumber,
@@ -114,7 +114,8 @@ export const generateInvoice = async (req, res) => {
         amountPaid,
         balance,
         status: amountPaid >= totalDue ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UNPAID',
-        notes
+        notes,
+        paymentPolicy: tenant.paymentPolicy // Add payment policy from tenant
       },
       include: {
         tenant: {
@@ -158,12 +159,15 @@ export const generateInvoice = async (req, res) => {
 export const getInvoicesByTenant = async (req, res) => {
   try {
     const { tenantId } = req.params;
-    const { page = 1, limit = 10, status } = req.query;
+    const { page = 1, limit = 10, status, paymentPolicy } = req.query;
     const skip = (page - 1) * limit;
 
     const where = { tenantId };
     if (status) {
       where.status = status;
+    }
+    if (paymentPolicy) {
+      where.paymentPolicy = paymentPolicy;
     }
 
     const total = await prisma.invoice.count({ where });
@@ -181,6 +185,91 @@ export const getInvoicesByTenant = async (req, res) => {
               include: {
                 property: {
                   select: { id: true, name: true }
+                }
+              }
+            }
+          }
+        }
+      },
+      orderBy: { issueDate: 'desc' },
+      skip,
+      take: parseInt(limit)
+    });
+
+    res.json({
+      success: true,
+      data: invoices,
+      meta: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching invoices:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Get all invoices with filters
+// @route   GET /api/invoices
+// @access  Private
+export const getAllInvoices = async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 10, 
+      status, 
+      paymentPolicy, 
+      propertyId,
+      startDate,
+      endDate 
+    } = req.query;
+    
+    const skip = (page - 1) * limit;
+
+    const where = {};
+    
+    if (status) {
+      where.status = status;
+    }
+    if (paymentPolicy) {
+      where.paymentPolicy = paymentPolicy;
+    }
+    if (propertyId) {
+      where.tenant = {
+        unit: {
+          propertyId
+        }
+      };
+    }
+    if (startDate || endDate) {
+      where.issueDate = {};
+      if (startDate) {
+        where.issueDate.gte = new Date(startDate);
+      }
+      if (endDate) {
+        where.issueDate.lte = new Date(endDate);
+      }
+    }
+
+    const total = await prisma.invoice.count({ where });
+
+    const invoices = await prisma.invoice.findMany({
+      where,
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            vatRate: true,
+            vatType: true,
+            paymentPolicy: true,
+            unit: {
+              include: {
+                property: {
+                  select: { id: true, name: true, address: true }
                 }
               }
             }
@@ -429,7 +518,8 @@ async function generateInvoicePDF(invoice, tenant) {
           50,
           topY + 30
         )
-        .text(`Payment Period: ${invoice.paymentPeriod}`, 50, topY + 45);
+        .text(`Payment Period: ${invoice.paymentPeriod}`, 50, topY + 45)
+        .text(`Payment Policy: ${invoice.paymentPolicy}`, 50, topY + 60);
 
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
         doc.text(
@@ -459,7 +549,8 @@ async function generateInvoicePDF(invoice, tenant) {
           `Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`,
           50,
           tenantY + 70
-        );
+        )
+        .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, tenantY + 85);
 
       doc.fontSize(12)
         .fillColor('#1e293b')
@@ -496,11 +587,31 @@ async function generateInvoicePDF(invoice, tenant) {
 
       let currentY = tableTop + rowHeight;
 
+      // Payment Policy badge
+      const policyWidth = 100;
+      const policyX = 500 - policyWidth;
+      let policyColor = '#059669'; // Default green for MONTHLY
+      
+      if (invoice.paymentPolicy === 'QUARTERLY') {
+        policyColor = '#2563eb'; // Blue for QUARTERLY
+      } else if (invoice.paymentPolicy === 'ANNUAL') {
+        policyColor = '#7c3aed'; // Purple for ANNUAL
+      }
+      
+      doc.rect(policyX, currentY - 35, policyWidth, 20).fill(policyColor);
+      doc.fillColor('#fff')
+        .fontSize(9)
+        .text(invoice.paymentPolicy, policyX, currentY - 30, { 
+          width: policyWidth, 
+          align: 'center',
+          bold: true 
+        });
+
       doc.fillColor('#1e293b')
         .fontSize(10)
         .text('Rent', itemX + 10, currentY + 8)
         .text(
-          `Monthly rent for ${invoice.paymentPeriod}`,
+          `${invoice.paymentPolicy} rent for ${invoice.paymentPeriod}`,
           descX,
           currentY + 8
         )
@@ -578,9 +689,24 @@ async function generateInvoicePDF(invoice, tenant) {
 
       doc.rect(50, footerY - 10, 500, 1).fill('#e5e7eb');
 
+      // Add payment policy note to footer
+      let paymentNote = '';
+      if (invoice.paymentPolicy === 'MONTHLY') {
+        paymentNote = 'This is a monthly invoice. Please pay by the due date.';
+      } else if (invoice.paymentPolicy === 'QUARTERLY') {
+        paymentNote = 'This is a quarterly invoice covering 3 months of rent.';
+      } else if (invoice.paymentPolicy === 'ANNUAL') {
+        paymentNote = 'This is an annual invoice covering 12 months of rent.';
+      }
+
       doc.fontSize(9)
         .fillColor('#6b7280')
-        .text('Thank you for your business!', 50, footerY, {
+        .text(paymentNote, 50, footerY, {
+          align: 'center',
+          width: 500,
+        })
+        .moveDown(0.4)
+        .text('Thank you for your business!', {
           align: 'center',
           width: 500,
         })
@@ -672,7 +798,7 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
       year: 'numeric' 
     });
 
-    // Create invoice record for the balance
+    // Create invoice record for the balance with paymentPolicy
     const invoice = await prisma.invoice.create({
       data: {
         invoiceNumber,
@@ -688,7 +814,8 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
         amountPaid: 0, // New invoice, no payment yet
         balance: balance,
         status: 'UNPAID',
-        notes: notes || `Balance invoice for partial payment of ${paymentPeriod}`
+        notes: notes || `Balance invoice for partial payment of ${paymentPeriod}`,
+        paymentPolicy: tenant.paymentPolicy // Add payment policy from tenant
       },
       include: {
         tenant: {
@@ -763,6 +890,7 @@ export const getPartialPayments = async (req, res) => {
             contact: true,
             vatRate: true,
             vatType: true,
+            paymentPolicy: true,
             unit: {
               include: {
                 property: {
@@ -780,7 +908,8 @@ export const getPartialPayments = async (req, res) => {
             amountPaid: true,
             balance: true,
             status: true,
-            issueDate: true
+            issueDate: true,
+            paymentPolicy: true
           }
         }
       },
@@ -925,7 +1054,8 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text(`Invoice Number: ${invoice.invoiceNumber}`, 50, detailsY)
         .text(`Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`, 50, detailsY + 15)
         .text(`Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`, 50, detailsY + 30)
-        .text(`Original Payment Period: ${invoice.paymentPeriod}`, 50, detailsY + 45);
+        .text(`Original Payment Period: ${invoice.paymentPeriod}`, 50, detailsY + 45)
+        .text(`Payment Policy: ${invoice.paymentPolicy}`, 50, detailsY + 60);
 
       // VAT Information
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
@@ -958,7 +1088,8 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text(invoice.tenant.fullName, 50, tenantY + 25)
         .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
         .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 55)
-        .text(`Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`, 50, tenantY + 70);
+        .text(`Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`, 50, tenantY + 70)
+        .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, tenantY + 85);
 
       // Right side - Property/Landlord Information
       doc.fontSize(12)
@@ -1026,11 +1157,31 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       let currentY = tableTop + rowHeight;
 
+      // Payment Policy badge for balance invoice
+      const policyWidth = 100;
+      const policyX = 500 - policyWidth;
+      let policyColor = '#059669'; // Default green for MONTHLY
+      
+      if (invoice.paymentPolicy === 'QUARTERLY') {
+        policyColor = '#2563eb'; // Blue for QUARTERLY
+      } else if (invoice.paymentPolicy === 'ANNUAL') {
+        policyColor = '#7c3aed'; // Purple for ANNUAL
+      }
+      
+      doc.rect(policyX, currentY - 35, policyWidth, 20).fill(policyColor);
+      doc.fillColor('#fff')
+        .fontSize(9)
+        .text(invoice.paymentPolicy, policyX, currentY - 30, { 
+          width: policyWidth, 
+          align: 'center',
+          bold: true 
+        });
+
       // Outstanding Balance Item with "Ksh" prefix
       doc.fillColor('#1e293b')
         .fontSize(10)
         .text('Balance Due', itemX + 10, currentY + 8)
-        .text(`Outstanding amount for ${invoice.paymentPeriod}`, descX, currentY + 8)
+        .text(`Outstanding amount for ${invoice.paymentPeriod} (${invoice.paymentPolicy})`, descX, currentY + 8)
         .text(`Ksh ${invoice.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY + 8, { width: 80, align: 'right' });
 
       currentY += rowHeight + 15;
@@ -1056,14 +1207,14 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         currentY = doc.y + 20;
       }
 
-      // Important Notice
+      // Important Notice with payment policy
       doc.rect(50, currentY, 500, 40)
         .fillAndStroke('#fef3c7', '#d97706');
       
       doc.fontSize(11)
         .fillColor('#92400e')
         .text('⚠️  IMPORTANT NOTICE', 60, currentY + 8, { bold: true })
-        .text('Please settle this outstanding balance by the due date to avoid additional charges.', 60, currentY + 25, { width: 480 });
+        .text(`Please settle this ${invoice.paymentPolicy.toLowerCase()} outstanding balance by the due date to avoid additional charges.`, 60, currentY + 25, { width: 480 });
 
       // Footer with company information
       const footerY = doc.page.height - 100;
@@ -1095,3 +1246,69 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
     }
   });
 }
+
+// Helper function to get payment period based on payment policy
+function getPaymentPeriod(date, paymentPolicy) {
+  const currentDate = new Date(date);
+  
+  switch (paymentPolicy) {
+    case 'QUARTERLY':
+      const quarter = Math.floor(currentDate.getMonth() / 3) + 1;
+      const quarterNames = ['Q1', 'Q2', 'Q3', 'Q4'];
+      return `${quarterNames[quarter - 1]} ${currentDate.getFullYear()}`;
+    
+    case 'ANNUAL':
+      return `Annual ${currentDate.getFullYear()}`;
+    
+    case 'MONTHLY':
+    default:
+      return currentDate.toLocaleDateString('en-US', { 
+        month: 'long', 
+        year: 'numeric' 
+      });
+  }
+}
+
+// @desc    Update invoice with payment policy (for existing invoices)
+// @route   PATCH /api/invoices/:id/payment-policy
+// @access  Private
+export const updateInvoicePaymentPolicy = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { paymentPolicy } = req.body;
+
+    // Validate payment policy
+    const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
+    if (!validPolicies.includes(paymentPolicy)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid payment policy. Must be MONTHLY, QUARTERLY, or ANNUAL' 
+      });
+    }
+
+    const invoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: {
+        tenant: true
+      }
+    });
+
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: 'Invoice not found' });
+    }
+
+    const updatedInvoice = await prisma.invoice.update({
+      where: { id },
+      data: { paymentPolicy }
+    });
+
+    res.json({
+      success: true,
+      data: updatedInvoice,
+      message: 'Invoice payment policy updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating invoice payment policy:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};

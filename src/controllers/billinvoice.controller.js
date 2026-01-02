@@ -98,6 +98,7 @@ export const generateBillInvoice = async (req, res) => {
         amountPaid: 0, // Start with 0 paid for this invoice
         balance: remainingBalance,
         status,
+        paymentPolicy: bill.tenant.paymentPolicy, // Add payment policy from tenant
         notes: notes || `Invoice generated for remaining balance of Ksh ${remainingBalance.toLocaleString()}`
       },
       include: {
@@ -142,12 +143,141 @@ export const generateBillInvoice = async (req, res) => {
 // @access  Private
 export const getAllBillInvoices = async (req, res) => {
   try {
-    const { page = 1, limit = 10, status, tenantId, billType } = req.query;
+    const { page = 1, limit = 10, status, tenantId, billType, paymentPolicy } = req.query;
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     const whereClause = {};
     if (status) whereClause.status = status;
     if (tenantId) whereClause.tenantId = tenantId;
+    if (billType) whereClause.billType = billType;
+    if (paymentPolicy) whereClause.paymentPolicy = paymentPolicy;
+
+    const billInvoices = await prisma.billInvoice.findMany({
+      where: whereClause,
+      skip,
+      take: parseInt(limit, 10),
+      orderBy: { issueDate: 'desc' },
+      include: {
+        tenant: {
+          select: {
+            fullName: true,
+            contact: true,
+            paymentPolicy: true,
+            unit: {
+              select: {
+                unitNo: true,
+                property: {
+                  select: { name: true }
+                }
+              }
+            }
+          }
+        },
+        bill: {
+          select: {
+            id: true,
+            type: true,
+            issuedAt: true
+          }
+        }
+      }
+    });
+
+    const total = await prisma.billInvoice.count({ where: whereClause });
+
+    res.status(200).json({
+      success: true,
+      data: billInvoices,
+      pagination: {
+        page: parseInt(page, 10),
+        limit: parseInt(limit, 10),
+        total,
+        totalPages: Math.ceil(total / parseInt(limit, 10)),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching bill invoices:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+};
+
+// @desc    Get bill invoices by tenant
+// @route   GET /api/bill-invoices/tenant/:tenantId
+// @access  Private
+export const getBillInvoicesByTenant = async (req, res) => {
+  try {
+    const { tenantId } = req.params;
+    const { page = 1, limit = 10, status, billType, paymentPolicy } = req.query;
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+
+    const whereClause = { tenantId };
+    if (status) whereClause.status = status;
+    if (billType) whereClause.billType = billType;
+    if (paymentPolicy) whereClause.paymentPolicy = paymentPolicy;
+
+    const billInvoices = await prisma.billInvoice.findMany({
+      where: whereClause,
+      skip,
+      take: parseInt(limit, 10),
+      orderBy: { issueDate: 'desc' },
+      include: {
+        tenant: {
+          select: {
+            fullName: true,
+            contact: true,
+            paymentPolicy: true,
+            unit: {
+              select: {
+                unitNo: true,
+                property: {
+                  select: { name: true, address: true }
+                }
+              }
+            }
+          }
+        },
+        bill: true
+      }
+    });
+
+    const total = await prisma.billInvoice.count({ where: whereClause });
+
+    res.status(200).json({
+      success: true,
+      data: billInvoices,
+      pagination: {
+        page: parseInt(page, 10),
+        limit: parseInt(limit, 10),
+        total,
+        totalPages: Math.ceil(total / parseInt(limit, 10)),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching bill invoices:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+};
+
+// @desc    Get bill invoices by payment policy
+// @route   GET /api/bill-invoices/payment-policy/:policy
+// @access  Private
+export const getBillInvoicesByPaymentPolicy = async (req, res) => {
+  try {
+    const { policy } = req.params;
+    const { page = 1, limit = 10, status, billType } = req.query;
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+
+    // Validate payment policy
+    const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
+    if (!validPolicies.includes(policy.toUpperCase())) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment policy. Must be MONTHLY, QUARTERLY, or ANNUAL'
+      });
+    }
+
+    const whereClause = { paymentPolicy: policy.toUpperCase() };
+    if (status) whereClause.status = status;
     if (billType) whereClause.billType = billType;
 
     const billInvoices = await prisma.billInvoice.findMany({
@@ -193,62 +323,7 @@ export const getAllBillInvoices = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error fetching bill invoices:', error);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
-  }
-};
-
-// @desc    Get bill invoices by tenant
-// @route   GET /api/bill-invoices/tenant/:tenantId
-// @access  Private
-export const getBillInvoicesByTenant = async (req, res) => {
-  try {
-    const { tenantId } = req.params;
-    const { page = 1, limit = 10, status, billType } = req.query;
-    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
-
-    const whereClause = { tenantId };
-    if (status) whereClause.status = status;
-    if (billType) whereClause.billType = billType;
-
-    const billInvoices = await prisma.billInvoice.findMany({
-      where: whereClause,
-      skip,
-      take: parseInt(limit, 10),
-      orderBy: { issueDate: 'desc' },
-      include: {
-        tenant: {
-          select: {
-            fullName: true,
-            contact: true,
-            unit: {
-              select: {
-                unitNo: true,
-                property: {
-                  select: { name: true, address: true }
-                }
-              }
-            }
-          }
-        },
-        bill: true
-      }
-    });
-
-    const total = await prisma.billInvoice.count({ where: whereClause });
-
-    res.status(200).json({
-      success: true,
-      data: billInvoices,
-      pagination: {
-        page: parseInt(page, 10),
-        limit: parseInt(limit, 10),
-        total,
-        totalPages: Math.ceil(total / parseInt(limit, 10)),
-      },
-    });
-  } catch (error) {
-    console.error('Error fetching bill invoices:', error);
+    console.error('Error fetching bill invoices by payment policy:', error);
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 };
@@ -530,6 +605,7 @@ export const recordBillInvoicePayment = async (req, res) => {
               amountPaid: 0,
               balance: newBalance,
               status: 'UNPAID',
+              paymentPolicy: billInvoice.paymentPolicy, // Copy payment policy from original invoice
               notes: `New invoice generated for remaining balance after partial payment`
             }
           });
@@ -598,6 +674,53 @@ export const downloadBillInvoice = async (req, res) => {
     res.send(pdfBuffer);
   } catch (error) {
     console.error('Error downloading bill invoice:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+};
+
+// @desc    Update bill invoice payment policy
+// @route   PATCH /api/bill-invoices/:id/payment-policy
+// @access  Private
+export const updateBillInvoicePaymentPolicy = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { paymentPolicy } = req.body;
+
+    // Validate payment policy
+    const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
+    if (!validPolicies.includes(paymentPolicy)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment policy. Must be MONTHLY, QUARTERLY, or ANNUAL'
+      });
+    }
+
+    const billInvoice = await prisma.billInvoice.findUnique({
+      where: { id },
+      include: {
+        tenant: true
+      }
+    });
+
+    if (!billInvoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'Bill invoice not found'
+      });
+    }
+
+    const updatedInvoice = await prisma.billInvoice.update({
+      where: { id },
+      data: { paymentPolicy }
+    });
+
+    res.status(200).json({
+      success: true,
+      data: updatedInvoice,
+      message: 'Bill invoice payment policy updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating bill invoice payment policy:', error);
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 };
@@ -764,6 +887,7 @@ async function generateBillInvoicePDF(billInvoice) {
       const amountPaid = safeNum(billInvoice.amountPaid);
       const balance = safeNum(billInvoice.balance);
       const status = billInvoice.status || 'UNPAID';
+      const paymentPolicy = billInvoice.paymentPolicy || 'MONTHLY';
 
       // ===========================================
       // INVOICE TITLE
@@ -795,8 +919,9 @@ async function generateBillInvoicePDF(billInvoice) {
          .text(`Invoice No: ${billInvoice.invoiceNumber || 'N/A'}`, 40, infoTop + 12)
          .text(`Issue Date: ${billInvoice.issueDate ? new Date(billInvoice.issueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 24)
          .text(`Due Date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 36)
-         .text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, infoTop + 48)
-         .text(`Bill Date: ${billInvoice.billReferenceDate ? new Date(billInvoice.billReferenceDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 60);
+         .text(`Payment Policy: ${paymentPolicy}`, 40, infoTop + 48)
+         .text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, infoTop + 60)
+         .text(`Bill Date: ${billInvoice.billReferenceDate ? new Date(billInvoice.billReferenceDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 72);
 
       // Right Column - Billed To
       const billedToTop = infoTop;
@@ -810,7 +935,8 @@ async function generateBillInvoicePDF(billInvoice) {
          .text(billInvoice.tenant?.fullName || 'N/A', 280, billedToTop + 12)
          .text(`Contact: ${billInvoice.tenant?.contact || 'N/A'}`, 280, billedToTop + 24)
          .text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 280, billedToTop + 36)
-         .text(`Property: ${billInvoice.tenant?.unit?.property?.name || 'N/A'}`, 280, billedToTop + 48);
+         .text(`Property: ${billInvoice.tenant?.unit?.property?.name || 'N/A'}`, 280, billedToTop + 48)
+         .text(`Payment Frequency: ${paymentPolicy}`, 280, billedToTop + 60);
 
       // Status Badge - placed at the right side above both columns
       const statusColor = 
@@ -835,29 +961,59 @@ async function generateBillInvoicePDF(billInvoice) {
            align: 'center' 
          });
 
+      // Payment Policy Badge - placed next to status badge
+      const policyBoxTop = infoTop + 30;
+      let policyColor = '#059669'; // Default green for MONTHLY
+      
+      if (paymentPolicy === 'QUARTERLY') {
+        policyColor = '#2563eb'; // Blue for QUARTERLY
+      } else if (paymentPolicy === 'ANNUAL') {
+        policyColor = '#7c3aed'; // Purple for ANNUAL
+      }
+      
+      doc.rect(statusBoxX, policyBoxTop, statusBoxWidth, 20)
+         .fillAndStroke(policyColor, policyColor);
+      
+      doc.fillColor('#ffffff')
+         .fontSize(9)
+         .font('Helvetica-Bold')
+         .text(paymentPolicy, statusBoxX, policyBoxTop + 5, { 
+           width: statusBoxWidth, 
+           align: 'center' 
+         });
+
       // Move Y position to after the invoice details section
-      doc.y = Math.max(infoTop + 72, billedToTop + 60);
+      doc.y = Math.max(infoTop + 84, billedToTop + 72);
       
       moveDownWithCheck(0.3);
 
       // ===========================================
       // BILL TYPE & METER READINGS
       // ===========================================
+      // Reset position to ensure clean centering
+      doc.x = 40; // Set x to left margin
       
+      // BILL TYPE - Centered (Change 1)
       doc.fillColor('#2563eb')
          .fontSize(12)
          .font('Helvetica-Bold')
-         .text(`BILL TYPE: ${billInvoice.billType || 'N/A'}`, { underline: true });
+         .text(`BILL TYPE: ${billInvoice.billType || 'N/A'}`, { 
+           align: 'center',
+           width: 510, // Explicit width (page width - margins: 595 - 40 - 45 = 510)
+           underline: true 
+         });
       
       moveDownWithCheck(0.5);
 
-      // Meter Readings Table
+      // Meter Readings Table - Aligned left (Change 2)
       const readingsTop = doc.y;
       
       doc.fillColor('#1e293b')
          .fontSize(11)
          .font('Helvetica-Bold')
-         .text('METER READING DETAILS', { underline: true });
+         .text('METER READING DETAILS', 40, readingsTop, { 
+           underline: true 
+         });
       
       moveDownWithCheck(0.3);
 
@@ -913,10 +1069,13 @@ async function generateBillInvoicePDF(billInvoice) {
       // BILL CALCULATION & CHARGES
       // ===========================================
       
+      // BILL CALCULATION - Aligned left (Change 3)
       doc.fillColor('#1e293b')
          .fontSize(11)
          .font('Helvetica-Bold')
-         .text('BILL CALCULATION', { underline: true });
+         .text('BILL CALCULATION', 40, doc.y, { 
+           underline: true 
+         });
       
       moveDownWithCheck(0.3);
 
@@ -994,24 +1153,54 @@ async function generateBillInvoicePDF(billInvoice) {
       moveDownWithCheck(0.5);
 
       // ===========================================
+      // PAYMENT POLICY NOTE
+      // ===========================================
+      
+      let paymentPolicyNote = '';
+      if (paymentPolicy === 'MONTHLY') {
+        paymentPolicyNote = 'Note: This is a monthly utility invoice. Bills are generated monthly based on consumption.';
+      } else if (paymentPolicy === 'QUARTERLY') {
+        paymentPolicyNote = 'Note: This is a quarterly utility invoice. Bills are generated every 3 months based on consumption.';
+      } else if (paymentPolicy === 'ANNUAL') {
+        paymentPolicyNote = 'Note: This is an annual utility invoice. Bill is for the full year\'s consumption.';
+      }
+
+      if (paymentPolicyNote) {
+        doc.fillColor('#374151')
+           .fontSize(9)
+           .font('Helvetica')
+           .text(paymentPolicyNote, 40, doc.y, { 
+             width: 510,
+             align: 'left'
+           });
+        
+        moveDownWithCheck(0.5);
+      }
+
+      // ===========================================
       // PAYMENT INSTRUCTIONS (only for unpaid invoices)
       // ===========================================
       
       if (['UNPAID', 'PARTIAL', 'OVERDUE'].includes(status)) {
+        // PAYMENT INSTRUCTIONS - Aligned left (Change 4)
         doc.fillColor('#1e293b')
            .fontSize(10)
            .font('Helvetica-Bold')
-           .text('PAYMENT INSTRUCTIONS', { underline: true });
+           .text('PAYMENT INSTRUCTIONS', 40, doc.y, { 
+             underline: true 
+           });
         
         moveDownWithCheck(0.3);
 
         doc.fillColor('#374151')
            .fontSize(9)
            .font('Helvetica')
-           .text(`• Please pay by: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`)
-           .text(`• Reference Number: ${billInvoice.invoiceNumber}`)
-           .text('• Payment Methods: Bank Transfer, Mobile Money, or Cash')
-           .text('• For assistance, contact property management');
+           // Remove the reference number line (Change 5)
+           .text(`• Please pay by: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, doc.y)
+           .moveDown(0.5)
+           .text('• Payment Methods: Bank Transfer, Mobile Money, or Cash', 40, doc.y)
+           .moveDown(0.5)
+           .text('• For assistance, contact property management', 40, doc.y);
         
         moveDownWithCheck(0.5);
       }
@@ -1021,17 +1210,20 @@ async function generateBillInvoicePDF(billInvoice) {
       // ===========================================
       
       if (billInvoice.notes) {
+        // NOTES - Aligned left (Change 6)
         doc.fillColor('#1e293b')
            .fontSize(10)
            .font('Helvetica-Bold')
-           .text('NOTES', { underline: true });
+           .text('NOTES', 40, doc.y, { 
+             underline: true 
+           });
         
         moveDownWithCheck(0.3);
 
         doc.fillColor('#374151')
            .fontSize(9)
            .font('Helvetica')
-           .text(billInvoice.notes, { 
+           .text(billInvoice.notes, 40, doc.y, { 
              width: 510,
              align: 'left' 
            });
@@ -1042,29 +1234,34 @@ async function generateBillInvoicePDF(billInvoice) {
       // ===========================================
       // FOOTER
       // ===========================================
-      
-      // Footer separator
-      const footerY = Math.min(doc.y + 10, doc.page.height - 50);
-      doc.y = footerY;
-      
-      doc.rect(40, doc.y, 510, 0.5).fillAndStroke('#e5e7eb', '#e5e7eb');
-      
-      moveDownWithCheck(0.3);
 
+      // Add significant space before footer to make it look like a proper footer
+      // First, check if we're near the bottom of the page
+      if (doc.y < doc.page.height - 100) {
+        // Add more space to push footer to bottom
+        doc.y = doc.page.height - 60; // Position footer 60px from bottom
+      } else {
+        // If we're already near bottom, just add some space
+        moveDownWithCheck(3); // Add 3 lines of space
+      }
+
+      // Footer separator
+      doc.rect(40, doc.y, 510, 0.5).fillAndStroke('#e5e7eb', '#e5e7eb');
+            
+      moveDownWithCheck(0.5);
+
+      // FOOTER - Left aligned
       doc.fillColor('#6b7280')
          .fontSize(8)
          .font('Helvetica')
-         .text('Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke', {
-           align: 'center',
+         .text('Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke', 40, doc.y, {
+           align: 'left',
            width: 510
          });
 
-      moveDownWithCheck(0.2);
+      moveDownWithCheck(0.3);
 
-      doc.text(`Generated on ${new Date().toLocaleDateString('en-US')}`, {
-        align: 'center',
-        width: 510
-      });
+      
 
       doc.end();
     } catch (error) {
@@ -1073,3 +1270,107 @@ async function generateBillInvoicePDF(billInvoice) {
     }
   });
 }
+
+// @desc    Get bill invoice statistics by payment policy
+// @route   GET /api/bill-invoices/stats/payment-policy
+// @access  Private
+export const getBillInvoiceStatsByPaymentPolicy = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    const whereClause = {};
+    
+    if (startDate || endDate) {
+      whereClause.issueDate = {};
+      if (startDate) {
+        whereClause.issueDate.gte = new Date(startDate);
+      }
+      if (endDate) {
+        whereClause.issueDate.lte = new Date(endDate);
+      }
+    }
+
+    // Get all invoices grouped by payment policy
+    const invoices = await prisma.billInvoice.findMany({
+      where: whereClause,
+      select: {
+        paymentPolicy: true,
+        grandTotal: true,
+        amountPaid: true,
+        balance: true,
+        status: true,
+        issueDate: true
+      }
+    });
+
+    // Calculate statistics
+    const stats = {
+      MONTHLY: { 
+        count: 0, 
+        totalAmount: 0, 
+        totalPaid: 0, 
+        totalBalance: 0,
+        paid: { count: 0, amount: 0 },
+        unpaid: { count: 0, amount: 0 },
+        partial: { count: 0, amount: 0 },
+        overdue: { count: 0, amount: 0 }
+      },
+      QUARTERLY: { 
+        count: 0, 
+        totalAmount: 0, 
+        totalPaid: 0, 
+        totalBalance: 0,
+        paid: { count: 0, amount: 0 },
+        unpaid: { count: 0, amount: 0 },
+        partial: { count: 0, amount: 0 },
+        overdue: { count: 0, amount: 0 }
+      },
+      ANNUAL: { 
+        count: 0, 
+        totalAmount: 0, 
+        totalPaid: 0, 
+        totalBalance: 0,
+        paid: { count: 0, amount: 0 },
+        unpaid: { count: 0, amount: 0 },
+        partial: { count: 0, amount: 0 },
+        overdue: { count: 0, amount: 0 }
+      }
+    };
+
+    invoices.forEach(invoice => {
+      const policy = invoice.paymentPolicy || 'MONTHLY';
+      const stat = stats[policy];
+      
+      if (stat) {
+        stat.count++;
+        stat.totalAmount += Number(invoice.grandTotal) || 0;
+        stat.totalPaid += Number(invoice.amountPaid) || 0;
+        stat.totalBalance += Number(invoice.balance) || 0;
+        
+        // Categorize by status
+        const status = invoice.status || 'UNPAID';
+        if (status === 'PAID') {
+          stat.paid.count++;
+          stat.paid.amount += Number(invoice.grandTotal) || 0;
+        } else if (status === 'UNPAID') {
+          stat.unpaid.count++;
+          stat.unpaid.amount += Number(invoice.grandTotal) || 0;
+        } else if (status === 'PARTIAL') {
+          stat.partial.count++;
+          stat.partial.amount += Number(invoice.grandTotal) || 0;
+        } else if (status === 'OVERDUE') {
+          stat.overdue.count++;
+          stat.overdue.amount += Number(invoice.grandTotal) || 0;
+        }
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      data: stats
+    });
+  } catch (error) {
+    console.error('Error fetching bill invoice statistics:', error);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+};
