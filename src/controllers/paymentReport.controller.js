@@ -309,12 +309,13 @@ export const createPaymentReport = async (req, res) => {
       amountPaid, 
       paymentPeriod, 
       notes, 
-      billIds, // Changed from billInvoiceIds to billIds (Bill IDs, not BillInvoice IDs)
+      billIds,
       createRentInvoice = true,
       rentInvoiceDueDate,
-      autoGenerateBalanceInvoice = false // NEW: Flag for balance invoice generation
+      autoGenerateBalanceInvoice = false
     } = req.body;
 
+    // Input validation
     if (!tenantId) {
       return res.status(400).json({ success: false, message: 'tenantId is required' });
     }
@@ -327,7 +328,16 @@ export const createPaymentReport = async (req, res) => {
       return res.status(400).json({ success: false, message: 'amountPaid cannot be negative' });
     }
 
-    // Fetch tenant + property
+    // Validate paymentPeriod date format
+    let paymentPeriodDate = null;
+    if (paymentPeriod) {
+      paymentPeriodDate = new Date(paymentPeriod);
+      if (isNaN(paymentPeriodDate.getTime())) {
+        return res.status(400).json({ success: false, message: 'Invalid paymentPeriod date format' });
+      }
+    }
+
+    // 1. Fetch tenant + property (outside transaction)
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
@@ -348,10 +358,10 @@ export const createPaymentReport = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Tenant must be assigned to a unit with a property' });
     }
 
-    // Compute expected charges with VAT
+    // 2. Compute expected charges (outside transaction)
     const expected = await computeExpectedCharges(
       tenantId,
-      paymentPeriod ? new Date(paymentPeriod) : null
+      paymentPeriodDate
     );
 
     const arrears = parseFloat((expected.totalDue - parsedAmountPaid).toFixed(2));
@@ -361,9 +371,48 @@ export const createPaymentReport = async (req, res) => {
         ? 'PARTIAL'
         : 'UNPAID';
 
-    // Transaction: PaymentReport + Income + Commission + Invoices + BillInvoices
+    // 3. Generate invoice numbers BEFORE transaction to reduce transaction time
+    let invoiceNumber = null;
+    let balanceInvoiceNumber = null;
+    
+    if (createRentInvoice) {
+      invoiceNumber = await generateInvoiceNumber();
+    }
+    
+    if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice) {
+      balanceInvoiceNumber = await generateInvoiceNumber();
+    }
+    
+    // 4. Generate bill invoice numbers if needed (outside transaction)
+    let billInvoiceNumbers = [];
+    if (billIds && Array.isArray(billIds) && billIds.length > 0) {
+      for (let i = 0; i < billIds.length; i++) {
+        const number = await generateBillInvoiceNumber();
+        billInvoiceNumbers.push(number);
+      }
+    }
+
+    // 5. Format payment period string for display (outside transaction)
+    const paymentPeriodStr = expected.periodStart.toLocaleDateString('en-US', { 
+      month: 'long', 
+      year: 'numeric' 
+    });
+
+    // Calculate invoice due dates (outside transaction)
+    const issueDate = new Date();
+    const dueDate = rentInvoiceDueDate ? new Date(rentInvoiceDueDate) : new Date(issueDate.setDate(issueDate.getDate() + 30));
+    
+    let balanceDueDate = null;
+    if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice) {
+      const balanceIssueDate = new Date();
+      balanceDueDate = rentInvoiceDueDate 
+        ? new Date(rentInvoiceDueDate) 
+        : new Date(balanceIssueDate.setDate(balanceIssueDate.getDate() + 30));
+    }
+
+    // 6. Now run the transaction with pre-generated numbers and increased timeout
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Create PaymentReport
+      // 6.1 Create PaymentReport
       const report = await tx.paymentReport.create({
         data: {
           tenantId,
@@ -400,18 +449,9 @@ export const createPaymentReport = async (req, res) => {
         }
       });
 
-      // 2. Create Rent Invoice if requested
+      // 6.2 Create Rent Invoice if requested
       let rentInvoice = null;
-      if (createRentInvoice) {
-        const invoiceNumber = await generateInvoiceNumber();
-        const issueDate = new Date();
-        const dueDate = rentInvoiceDueDate ? new Date(rentInvoiceDueDate) : new Date(issueDate.setDate(issueDate.getDate() + 30));
-
-        const paymentPeriodStr = expected.periodStart.toLocaleDateString('en-US', { 
-          month: 'long', 
-          year: 'numeric' 
-        });
-
+      if (createRentInvoice && invoiceNumber) {
         const rentBalance = arrears > 0 ? arrears : 0;
 
         rentInvoice = await tx.invoice.create({
@@ -419,7 +459,7 @@ export const createPaymentReport = async (req, res) => {
             invoiceNumber,
             tenantId,
             paymentReportId: report.id,
-            issueDate: new Date(), // Current date
+            issueDate: new Date(),
             dueDate,
             paymentPeriod: paymentPeriodStr,
             rent: expected.rent,
@@ -434,20 +474,9 @@ export const createPaymentReport = async (req, res) => {
         });
       }
 
-      // 2.5 Auto-generate balance invoice if payment is partial (OPTIONAL)
+      // 6.3 Auto-generate balance invoice if payment is partial
       let balanceInvoice = null;
-      if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice) {
-        const balanceInvoiceNumber = await generateInvoiceNumber();
-        const balanceIssueDate = new Date();
-        const balanceDueDate = rentInvoiceDueDate 
-          ? new Date(rentInvoiceDueDate) 
-          : new Date(balanceIssueDate.setDate(balanceIssueDate.getDate() + 30));
-
-        const paymentPeriodStr = expected.periodStart.toLocaleDateString('en-US', { 
-          month: 'long', 
-          year: 'numeric' 
-        });
-
+      if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice && balanceInvoiceNumber && balanceDueDate) {
         balanceInvoice = await tx.invoice.create({
           data: {
             invoiceNumber: balanceInvoiceNumber,
@@ -459,7 +488,7 @@ export const createPaymentReport = async (req, res) => {
             rent: expected.rent,
             serviceCharge: expected.serviceCharge || 0,
             vat: expected.vat || 0,
-            totalDue: arrears, // Only the balance
+            totalDue: arrears,
             amountPaid: 0,
             balance: arrears,
             status: 'UNPAID',
@@ -468,7 +497,7 @@ export const createPaymentReport = async (req, res) => {
         });
       }
 
-      // 3. Create Income
+      // 6.4 Create Income
       const income = await tx.income.create({
         data: {
           propertyId: tenant.unit.propertyId,
@@ -478,10 +507,10 @@ export const createPaymentReport = async (req, res) => {
         }
       });
 
-      // 4. Create Bill Invoices if bill IDs provided
+      // 6.5 Create Bill Invoices if bill IDs provided
       let createdBillInvoices = [];
-      if (billIds && Array.isArray(billIds) && billIds.length > 0) {
-        // Fetch the bills to create invoices from
+      if (billIds && Array.isArray(billIds) && billIds.length > 0 && billInvoiceNumbers.length === billIds.length) {
+        // Fetch bills in batch
         const bills = await tx.bill.findMany({
           where: {
             id: { in: billIds },
@@ -489,55 +518,53 @@ export const createPaymentReport = async (req, res) => {
           }
         });
 
-        if (bills.length > 0) {
-          // You can distribute payment or handle as needed
-          // For now, we'll create invoices without payment distribution
-          for (const bill of bills) {
-            const billInvoiceNumber = await generateBillInvoiceNumber();
-            const issueDate = new Date();
-            const dueDate = bill.dueDate || new Date(issueDate.setDate(issueDate.getDate() + 30));
+        // Create bill invoices in parallel using Promise.all for better performance
+        const billInvoicePromises = bills.map(async (bill, index) => {
+          const billInvoiceNumber = billInvoiceNumbers[index];
+          
+          const billIssueDate = new Date();
+          const billDueDate = bill.dueDate || new Date(billIssueDate.setDate(billIssueDate.getDate() + 30));
 
-            const billBalance = parseFloat((bill.grandTotal - bill.amountPaid).toFixed(2));
-            const billStatus = bill.amountPaid >= bill.grandTotal
-              ? 'PAID'
-              : bill.amountPaid > 0
-                ? 'PARTIAL'
-                : 'UNPAID';
+          const billBalance = parseFloat((bill.grandTotal - bill.amountPaid).toFixed(2));
+          const billStatus = bill.amountPaid >= bill.grandTotal
+            ? 'PAID'
+            : bill.amountPaid > 0
+              ? 'PARTIAL'
+              : 'UNPAID';
 
-            const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
+          const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
 
-            const billInvoice = await tx.billInvoice.create({
-              data: {
-                invoiceNumber: billInvoiceNumber,
-                billId: bill.id,
-                billReferenceNumber,
-                billReferenceDate: bill.issuedAt,
-                tenantId,
-                paymentReportId: report.id,
-                issueDate: new Date(), // Current date
-                dueDate,
-                billType: bill.type,
-                previousReading: bill.previousReading,
-                currentReading: bill.currentReading,
-                units: bill.units,
-                chargePerUnit: bill.chargePerUnit,
-                totalAmount: bill.totalAmount,
-                vatRate: bill.vatRate,
-                vatAmount: bill.vatAmount,
-                grandTotal: bill.grandTotal,
-                amountPaid: bill.amountPaid,
-                balance: billBalance,
-                status: billStatus,
-                notes: notes || null
-              }
-            });
+          return await tx.billInvoice.create({
+            data: {
+              invoiceNumber: billInvoiceNumber,
+              billId: bill.id,
+              billReferenceNumber,
+              billReferenceDate: bill.issuedAt,
+              tenantId,
+              paymentReportId: report.id,
+              issueDate: new Date(),
+              dueDate: billDueDate,
+              billType: bill.type,
+              previousReading: bill.previousReading,
+              currentReading: bill.currentReading,
+              units: bill.units,
+              chargePerUnit: bill.chargePerUnit,
+              totalAmount: bill.totalAmount,
+              vatRate: bill.vatRate,
+              vatAmount: bill.vatAmount,
+              grandTotal: bill.grandTotal,
+              amountPaid: bill.amountPaid,
+              balance: billBalance,
+              status: billStatus,
+              notes: notes || null
+            }
+          });
+        });
 
-            createdBillInvoices.push(billInvoice);
-          }
-        }
+        createdBillInvoices = await Promise.all(billInvoicePromises);
       }
 
-      // 5. Process commission
+      // 6.6 Process commission (consider using a simpler/optimized version)
       const commission = await processCommissionForIncome(tx, income.id);
 
       return { 
@@ -546,14 +573,18 @@ export const createPaymentReport = async (req, res) => {
         commission, 
         rentInvoice, 
         billInvoices: createdBillInvoices,
-        balanceInvoice // NEW: Include balance invoice in transaction result
+        balanceInvoice
       };
+    }, {
+      // Increased transaction timeout
+      maxWait: 15000, // Maximum time to wait for a transaction
+      timeout: 60000, // Increase timeout to 60 seconds
     });
 
     // Format response
     const formattedReport = {
       id: result.report.id,
-      tenantId: result.report.tenant,
+      tenantId: result.report.tenantId,
       rent: result.report.rent,
       serviceCharge: result.report.serviceCharge,
       vat: result.report.vat,
@@ -605,7 +636,7 @@ export const createPaymentReport = async (req, res) => {
         balance: result.rentInvoice.balance,
         status: result.rentInvoice.status
       } : null,
-      balanceInvoice: result.balanceInvoice ? {  // NEW: Include balance invoice in response
+      balanceInvoice: result.balanceInvoice ? {
         id: result.balanceInvoice.id,
         invoiceNumber: result.balanceInvoice.invoiceNumber,
         issueDate: result.balanceInvoice.issueDate,
@@ -648,15 +679,35 @@ export const createPaymentReport = async (req, res) => {
 
   } catch (error) {
     console.error('Error creating payment report:', error);
+    
+    // More specific error handling
+    if (error.code === 'P2028') {
+      return res.status(408).json({ 
+        success: false, 
+        message: 'Transaction timeout. The operation took too long to complete. Please try again or contact support.' 
+      });
+    }
+    
+    if (error.code === 'P2025') {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Related record not found. Please check the provided IDs.' 
+      });
+    }
+    
+    if (error.code === 'P2002') {
+      return res.status(409).json({ 
+        success: false, 
+        message: 'Duplicate entry. This payment may already exist.' 
+      });
+    }
+    
     res.status(400).json({ 
       success: false, 
       message: error.message || 'Failed to create payment report' 
     });
   }
 };
-
-
-
 
 // @desc    Get income reports (with basic filtering)
 // @route   GET /api/payments/income
