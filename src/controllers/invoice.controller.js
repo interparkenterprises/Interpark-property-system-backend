@@ -498,10 +498,21 @@ async function generateInvoicePDF(invoice, tenant) {
       ====================================================== */
 
       doc.moveDown(2);
+      
+      // Invoice title
       doc.fontSize(28)
         .fillColor('#1e293b')
         .text('INVOICE', { align: 'center' })
-        .moveDown(0.5);
+        .moveDown(0.3);
+      
+      // Property name below the title (bold but smaller)
+      const propertyName = invoice.tenant.unit?.property?.name || 'N/A';
+      doc.fontSize(14)
+        .fillColor('#005478') // Using the blue color from your design
+        .font('Helvetica-Bold')
+        .text(propertyName, { align: 'center' })
+        .font('Helvetica') // Reset to regular font
+        .moveDown(1);
 
       const topY = doc.y;
 
@@ -544,12 +555,8 @@ async function generateInvoicePDF(invoice, tenant) {
         .fillColor('#374151')
         .text(invoice.tenant.fullName, 50, tenantY + 25)
         .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
-        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 55)
-        .text(
-          `Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`,
-          50,
-          tenantY + 70
-        )
+        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, tenantY + 55)
+        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 70)
         .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, tenantY + 85);
 
       doc.fontSize(12)
@@ -586,26 +593,6 @@ async function generateInvoicePDF(invoice, tenant) {
         });
 
       let currentY = tableTop + rowHeight;
-
-      // Payment Policy badge
-      const policyWidth = 100;
-      const policyX = 500 - policyWidth;
-      let policyColor = '#059669'; // Default green for MONTHLY
-      
-      if (invoice.paymentPolicy === 'QUARTERLY') {
-        policyColor = '#2563eb'; // Blue for QUARTERLY
-      } else if (invoice.paymentPolicy === 'ANNUAL') {
-        policyColor = '#7c3aed'; // Purple for ANNUAL
-      }
-      
-      doc.rect(policyX, currentY - 35, policyWidth, 20).fill(policyColor);
-      doc.fillColor('#fff')
-        .fontSize(9)
-        .text(invoice.paymentPolicy, policyX, currentY - 30, { 
-          width: policyWidth, 
-          align: 'center',
-          bold: true 
-        });
 
       doc.fillColor('#1e293b')
         .fontSize(10)
@@ -1030,6 +1017,15 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
       doc.fontSize(28)
         .fillColor('#dc2626')
         .text('BALANCE INVOICE', { align: 'center' })
+        .moveDown(0.3);
+      
+      // Property name below the title (bold but smaller)
+      const propertyName = invoice.tenant.unit?.property?.name || 'N/A';
+      doc.fontSize(14)
+        .fillColor('#dc2626') // Using red color to match balance invoice theme
+        .font('Helvetica-Bold')
+        .text(propertyName, { align: 'center' })
+        .font('Helvetica') // Reset to regular font
         .moveDown(0.5);
 
       // Alert box for partial payment
@@ -1087,8 +1083,8 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .fillColor('#374151')
         .text(invoice.tenant.fullName, 50, tenantY + 25)
         .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
-        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 55)
-        .text(`Property: ${invoice.tenant.unit?.property?.name || 'N/A'}`, 50, tenantY + 70)
+        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, tenantY + 55)
+        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 70)
         .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, tenantY + 85);
 
       // Right side - Property/Landlord Information
@@ -1147,7 +1143,7 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       // Table Header with color #005478
       doc.rect(itemX, tableTop, 500, rowHeight)
-        .fillAndStroke('#005478', '#005478'); // Changed from #2563eb to #005478
+        .fillAndStroke('#005478', '#005478');
 
       doc.fillColor('#fff')
         .fontSize(11)
@@ -1156,26 +1152,6 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text('Amount (Ksh)', amountX, tableTop + 8, { width: 80, align: 'right' });
 
       let currentY = tableTop + rowHeight;
-
-      // Payment Policy badge for balance invoice
-      const policyWidth = 100;
-      const policyX = 500 - policyWidth;
-      let policyColor = '#059669'; // Default green for MONTHLY
-      
-      if (invoice.paymentPolicy === 'QUARTERLY') {
-        policyColor = '#2563eb'; // Blue for QUARTERLY
-      } else if (invoice.paymentPolicy === 'ANNUAL') {
-        policyColor = '#7c3aed'; // Purple for ANNUAL
-      }
-      
-      doc.rect(policyX, currentY - 35, policyWidth, 20).fill(policyColor);
-      doc.fillColor('#fff')
-        .fontSize(9)
-        .text(invoice.paymentPolicy, policyX, currentY - 30, { 
-          width: policyWidth, 
-          align: 'center',
-          bold: true 
-        });
 
       // Outstanding Balance Item with "Ksh" prefix
       doc.fillColor('#1e293b')

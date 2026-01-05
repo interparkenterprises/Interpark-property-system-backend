@@ -86,7 +86,7 @@ export const generateBillInvoice = async (req, res) => {
         tenantId: bill.tenantId,
         issueDate: new Date(),
         dueDate: due,
-        billType: bill.type,
+        billType: bill.type, 
         previousReading: Number(bill.previousReading) || 0,
         currentReading: Number(bill.currentReading) || 0,
         units: Number(bill.units) || 0,
@@ -116,7 +116,7 @@ export const generateBillInvoice = async (req, res) => {
     });
 
     // Generate PDF
-    const pdfBuffer = await generateBillInvoicePDF(billInvoice);
+    const pdfBuffer = await generateBillInvoicePDF(billInvoice,  bill.description);
     
     // Upload PDF to storage
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
@@ -759,7 +759,7 @@ export const deleteBillInvoice = async (req, res) => {
 
 
 // Helper function to generate Bill Invoice PDF
-async function generateBillInvoicePDF(billInvoice) {
+async function generateBillInvoicePDF(billInvoice, billDescription) {
   return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ 
@@ -888,6 +888,7 @@ async function generateBillInvoicePDF(billInvoice) {
       const balance = safeNum(billInvoice.balance);
       const status = billInvoice.status || 'UNPAID';
       const paymentPolicy = billInvoice.paymentPolicy || 'MONTHLY';
+      const description = billDescription || null;
 
       // ===========================================
       // INVOICE TITLE
@@ -898,9 +899,41 @@ async function generateBillInvoicePDF(billInvoice) {
          .font('Helvetica-Bold')
          .text('UTILITY BILL INVOICE', { 
            align: 'center'
-         });
+         })
+         .moveDown(0.3);
       
-      moveDownWithCheck(0.5);
+      // Property name below the title (bold but smaller)
+      const propertyName = billInvoice.tenant?.unit?.property?.name || 'N/A';
+      doc.fontSize(14)
+         .fillColor('#005478') // Using the blue color from your design
+         .font('Helvetica-Bold')
+         .text(propertyName, { align: 'center' })
+         .font('Helvetica') // Reset to regular font
+         .moveDown(1);
+
+      // ===========================================
+      // DESCRIPTION (if available)
+      // ===========================================
+      
+      if (description) {
+        doc.fillColor('#374151')
+           .fontSize(11)
+           .font('Helvetica-Bold')
+           .text('Description:', { 
+             align: 'center',
+             width: 510
+           })
+           .moveDown(0.2);
+        
+        doc.fillColor('#4b5563')
+           .fontSize(10)
+           .font('Helvetica')
+           .text(description, { 
+             align: 'center',
+             width: 510
+           })
+           .moveDown(0.5);
+      }
 
       // ===========================================
       // INVOICE DETAILS & BILLED TO - SIDE BY SIDE
@@ -914,76 +947,55 @@ async function generateBillInvoicePDF(billInvoice) {
          .font('Helvetica-Bold')
          .text('INVOICE DETAILS:', 40, infoTop, { underline: true });
       
+      // Adjust Y positions based on whether description was added
+      let invoiceDetailsY = infoTop + 12;
+      const lineHeight = 12;
+      
       doc.font('Helvetica')
          .fontSize(8.5)
-         .text(`Invoice No: ${billInvoice.invoiceNumber || 'N/A'}`, 40, infoTop + 12)
-         .text(`Issue Date: ${billInvoice.issueDate ? new Date(billInvoice.issueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 24)
-         .text(`Due Date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 36)
-         .text(`Payment Policy: ${paymentPolicy}`, 40, infoTop + 48)
-         .text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, infoTop + 60)
-         .text(`Bill Date: ${billInvoice.billReferenceDate ? new Date(billInvoice.billReferenceDate).toLocaleDateString('en-US') : 'N/A'}`, 40, infoTop + 72);
+         .text(`Invoice No: ${billInvoice.invoiceNumber || 'N/A'}`, 40, invoiceDetailsY);
+      
+      invoiceDetailsY += lineHeight;
+      doc.text(`Issue Date: ${billInvoice.issueDate ? new Date(billInvoice.issueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
+      
+      invoiceDetailsY += lineHeight;
+      doc.text(`Due Date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
+      
+      invoiceDetailsY += lineHeight;
+      doc.text(`Payment Policy: ${paymentPolicy}`, 40, invoiceDetailsY);
+      
+      invoiceDetailsY += lineHeight;
+      doc.text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, invoiceDetailsY);
+      
+      invoiceDetailsY += lineHeight;
+      doc.text(`Bill Date: ${billInvoice.billReferenceDate ? new Date(billInvoice.billReferenceDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
 
-      // Right Column - Billed To
+      // Right Column - Billed To (with KRA Pin)
       const billedToTop = infoTop;
       doc.fontSize(9)
          .fillColor('#374151')
          .font('Helvetica-Bold')
          .text('BILLED TO:', 280, billedToTop, { underline: true });
       
+      let billedToY = billedToTop + 12;
       doc.font('Helvetica')
          .fontSize(8.5)
-         .text(billInvoice.tenant?.fullName || 'N/A', 280, billedToTop + 12)
-         .text(`Contact: ${billInvoice.tenant?.contact || 'N/A'}`, 280, billedToTop + 24)
-         .text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 280, billedToTop + 36)
-         .text(`Property: ${billInvoice.tenant?.unit?.property?.name || 'N/A'}`, 280, billedToTop + 48)
-         .text(`Payment Frequency: ${paymentPolicy}`, 280, billedToTop + 60);
-
-      // Status Badge - placed at the right side above both columns
-      const statusColor = 
-        status === 'PAID' ? '#10b981' : 
-        status === 'PARTIAL' ? '#f59e0b' : 
-        status === 'OVERDUE' ? '#dc2626' : 
-        status === 'CANCELLED' ? '#6b7280' : '#ef4444';
-
-      const statusBoxTop = infoTop;
-      const statusBoxWidth = 100;
-      const statusBoxHeight = 25;
-      const statusBoxX = 510 - statusBoxWidth;
+         .text(billInvoice.tenant?.fullName || 'N/A', 280, billedToY);
       
-      doc.rect(statusBoxX, statusBoxTop, statusBoxWidth, statusBoxHeight)
-         .fillAndStroke(statusColor, statusColor);
+      billedToY += lineHeight;
+      doc.text(`Contact: ${billInvoice.tenant?.contact || 'N/A'}`, 280, billedToY);
       
-      doc.fillColor('#ffffff')
-         .fontSize(10)
-         .font('Helvetica-Bold')
-         .text(status.toUpperCase(), statusBoxX, statusBoxTop + 7, { 
-           width: statusBoxWidth, 
-           align: 'center' 
-         });
-
-      // Payment Policy Badge - placed next to status badge
-      const policyBoxTop = infoTop + 30;
-      let policyColor = '#059669'; // Default green for MONTHLY
+      billedToY += lineHeight;
+      doc.text(`KRA Pin: ${billInvoice.tenant?.KRAPin || 'N/A'}`, 280, billedToY);
       
-      if (paymentPolicy === 'QUARTERLY') {
-        policyColor = '#2563eb'; // Blue for QUARTERLY
-      } else if (paymentPolicy === 'ANNUAL') {
-        policyColor = '#7c3aed'; // Purple for ANNUAL
-      }
+      billedToY += lineHeight;
+      doc.text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 280, billedToY);
       
-      doc.rect(statusBoxX, policyBoxTop, statusBoxWidth, 20)
-         .fillAndStroke(policyColor, policyColor);
-      
-      doc.fillColor('#ffffff')
-         .fontSize(9)
-         .font('Helvetica-Bold')
-         .text(paymentPolicy, statusBoxX, policyBoxTop + 5, { 
-           width: statusBoxWidth, 
-           align: 'center' 
-         });
+      billedToY += lineHeight;
+      doc.text(`Payment Frequency: ${paymentPolicy}`, 280, billedToY);
 
       // Move Y position to after the invoice details section
-      doc.y = Math.max(infoTop + 84, billedToTop + 72);
+      doc.y = Math.max(invoiceDetailsY + lineHeight, billedToY + lineHeight);
       
       moveDownWithCheck(0.3);
 
@@ -993,19 +1005,19 @@ async function generateBillInvoicePDF(billInvoice) {
       // Reset position to ensure clean centering
       doc.x = 40; // Set x to left margin
       
-      // BILL TYPE - Centered (Change 1)
+      // BILL TYPE - Centered
       doc.fillColor('#2563eb')
          .fontSize(12)
          .font('Helvetica-Bold')
          .text(`BILL TYPE: ${billInvoice.billType || 'N/A'}`, { 
            align: 'center',
-           width: 510, // Explicit width (page width - margins: 595 - 40 - 45 = 510)
+           width: 510,
            underline: true 
          });
       
       moveDownWithCheck(0.5);
 
-      // Meter Readings Table - Aligned left (Change 2)
+      // Meter Readings Table - Aligned left
       const readingsTop = doc.y;
       
       doc.fillColor('#1e293b')
@@ -1069,7 +1081,7 @@ async function generateBillInvoicePDF(billInvoice) {
       // BILL CALCULATION & CHARGES
       // ===========================================
       
-      // BILL CALCULATION - Aligned left (Change 3)
+      // BILL CALCULATION - Aligned left
       doc.fillColor('#1e293b')
          .fontSize(11)
          .font('Helvetica-Bold')
@@ -1180,37 +1192,106 @@ async function generateBillInvoicePDF(billInvoice) {
       // ===========================================
       // PAYMENT INSTRUCTIONS (only for unpaid invoices)
       // ===========================================
-      
+
       if (['UNPAID', 'PARTIAL', 'OVERDUE'].includes(status)) {
-        // PAYMENT INSTRUCTIONS - Aligned left (Change 4)
+        // PAYMENT INSTRUCTIONS - Aligned left
         doc.fillColor('#1e293b')
-           .fontSize(10)
-           .font('Helvetica-Bold')
-           .text('PAYMENT INSTRUCTIONS', 40, doc.y, { 
-             underline: true 
-           });
+          .fontSize(10)
+          .font('Helvetica-Bold')
+          .text('PAYMENT INSTRUCTIONS', 40, doc.y, { 
+            underline: true 
+          });
         
         moveDownWithCheck(0.3);
 
+        // Get property payment details
+        const property = billInvoice.tenant?.unit?.property;
+        
+        // Due date
         doc.fillColor('#374151')
-           .fontSize(9)
-           .font('Helvetica')
-           // Remove the reference number line (Change 5)
-           .text(`• Please pay by: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, doc.y)
-           .moveDown(0.5)
-           .text('• Payment Methods: Bank Transfer, Mobile Money, or Cash', 40, doc.y)
-           .moveDown(0.5)
-           .text('• For assistance, contact property management', 40, doc.y);
+          .fontSize(9)
+          .font('Helvetica')
+          .text(`Please pay by: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, doc.y);
+        
+        moveDownWithCheck(0.5);
+
+        // Bank Transfer Details (if available)
+        if (property && (property.accountName || property.accountNo || property.bank)) {
+          doc.fillColor('#1e293b')
+            .fontSize(9)
+            .font('Helvetica-Bold')
+            .text('Bank Transfer Details:', 40, doc.y);
+          
+          moveDownWithCheck(0.3);
+          
+          let bankDetailsY = doc.y;
+          
+          if (property.accountName) {
+            doc.fillColor('#374151')
+              .fontSize(8.5)
+              .font('Helvetica')
+              .text(`Account Name: ${property.accountName}`, 40, bankDetailsY);
+            bankDetailsY += 15;
+          }
+          
+          if (property.accountNo) {
+            doc.fillColor('#374151')
+              .fontSize(8.5)
+              .font('Helvetica')
+              .text(`Account Number: ${property.accountNo}`, 40, bankDetailsY);
+            bankDetailsY += 15;
+          }
+          
+          if (property.bank) {
+            doc.fillColor('#374151')
+              .fontSize(8.5)
+              .font('Helvetica')
+              .text(`Bank: ${property.bank}`, 40, bankDetailsY);
+            bankDetailsY += 15;
+          }
+          
+          if (property.branch) {
+            doc.fillColor('#374151')
+              .fontSize(8.5)
+              .font('Helvetica')
+              .text(`Branch: ${property.branch}`, 40, bankDetailsY);
+            bankDetailsY += 15;
+          }
+          
+          if (property.branchCode) {
+            doc.fillColor('#374151')
+              .fontSize(8.5)
+              .font('Helvetica')
+              .text(`Branch Code: ${property.branchCode}`, 40, bankDetailsY);
+            bankDetailsY += 15;
+          }
+          
+          doc.y = bankDetailsY;
+          moveDownWithCheck(0.5);
+        } else {
+          // Default payment methods if no bank details
+          doc.fillColor('#374151')
+            .fontSize(9)
+            .font('Helvetica')
+            .text('Payment Methods: Bank Transfer, Mobile Money, or Cash', 40, doc.y);
+          
+          moveDownWithCheck(0.5);
+        }
+
+        // Contact information
+        doc.fillColor('#374151')
+          .fontSize(9)
+          .font('Helvetica')
+          .text('For assistance, contact property management', 40, doc.y);
         
         moveDownWithCheck(0.5);
       }
-
       // ===========================================
       // NOTES SECTION
       // ===========================================
       
       if (billInvoice.notes) {
-        // NOTES - Aligned left (Change 6)
+        // NOTES - Aligned left
         doc.fillColor('#1e293b')
            .fontSize(10)
            .font('Helvetica-Bold')
@@ -1261,8 +1342,6 @@ async function generateBillInvoicePDF(billInvoice) {
 
       moveDownWithCheck(0.3);
 
-      
-
       doc.end();
     } catch (error) {
       console.error('PDF Generation Error:', error);
@@ -1270,7 +1349,6 @@ async function generateBillInvoicePDF(billInvoice) {
     }
   });
 }
-
 // @desc    Get bill invoice statistics by payment policy
 // @route   GET /api/bill-invoices/stats/payment-policy
 // @access  Private
