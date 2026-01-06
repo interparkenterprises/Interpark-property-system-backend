@@ -235,7 +235,6 @@ model BillInvoice {
   createdAt           DateTime       @default(now())
   updatedAt           DateTime       @updatedAt
   paymentReportId     String?
-  paymentPolicy       PaymentPolicy?  // Added this field
   bill                Bill           @relation(fields: [billId], references: [id], onDelete: Cascade)
   paymentReport       PaymentReport? @relation(fields: [paymentReportId], references: [id])
   tenant              Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -245,7 +244,7 @@ model BillInvoice {
   @@index([invoiceNumber])
   @@index([status])
   @@index([billReferenceNumber])
-  @@index([paymentPolicy])  // Added index for paymentPolicy
+ // Removed: @@index([paymentPolicy])  // Added index for paymentPolicy
 }
 
 model ServiceProvider {

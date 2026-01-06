@@ -98,7 +98,6 @@ export const generateBillInvoice = async (req, res) => {
         amountPaid: 0, // Start with 0 paid for this invoice
         balance: remainingBalance,
         status,
-        paymentPolicy: bill.tenant.paymentPolicy, // Add payment policy from tenant
         notes: notes || `Invoice generated for remaining balance of Ksh ${remainingBalance.toLocaleString()}`
       },
       include: {
@@ -143,14 +142,13 @@ export const generateBillInvoice = async (req, res) => {
 // @access  Private
 export const getAllBillInvoices = async (req, res) => {
   try {
-    const { page = 1, limit = 10, status, tenantId, billType, paymentPolicy } = req.query;
+    const { page = 1, limit = 10, status, tenantId, billType } = req.query;
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     const whereClause = {};
     if (status) whereClause.status = status;
     if (tenantId) whereClause.tenantId = tenantId;
     if (billType) whereClause.billType = billType;
-    if (paymentPolicy) whereClause.paymentPolicy = paymentPolicy;
 
     const billInvoices = await prisma.billInvoice.findMany({
       where: whereClause,
@@ -162,7 +160,6 @@ export const getAllBillInvoices = async (req, res) => {
           select: {
             fullName: true,
             contact: true,
-            paymentPolicy: true,
             unit: {
               select: {
                 unitNo: true,
@@ -207,13 +204,12 @@ export const getAllBillInvoices = async (req, res) => {
 export const getBillInvoicesByTenant = async (req, res) => {
   try {
     const { tenantId } = req.params;
-    const { page = 1, limit = 10, status, billType, paymentPolicy } = req.query;
+    const { page = 1, limit = 10, status, billType } = req.query;
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     const whereClause = { tenantId };
     if (status) whereClause.status = status;
     if (billType) whereClause.billType = billType;
-    if (paymentPolicy) whereClause.paymentPolicy = paymentPolicy;
 
     const billInvoices = await prisma.billInvoice.findMany({
       where: whereClause,
@@ -225,7 +221,6 @@ export const getBillInvoicesByTenant = async (req, res) => {
           select: {
             fullName: true,
             contact: true,
-            paymentPolicy: true,
             unit: {
               select: {
                 unitNo: true,
@@ -254,76 +249,6 @@ export const getBillInvoicesByTenant = async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching bill invoices:', error);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
-  }
-};
-
-// @desc    Get bill invoices by payment policy
-// @route   GET /api/bill-invoices/payment-policy/:policy
-// @access  Private
-export const getBillInvoicesByPaymentPolicy = async (req, res) => {
-  try {
-    const { policy } = req.params;
-    const { page = 1, limit = 10, status, billType } = req.query;
-    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
-
-    // Validate payment policy
-    const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
-    if (!validPolicies.includes(policy.toUpperCase())) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid payment policy. Must be MONTHLY, QUARTERLY, or ANNUAL'
-      });
-    }
-
-    const whereClause = { paymentPolicy: policy.toUpperCase() };
-    if (status) whereClause.status = status;
-    if (billType) whereClause.billType = billType;
-
-    const billInvoices = await prisma.billInvoice.findMany({
-      where: whereClause,
-      skip,
-      take: parseInt(limit, 10),
-      orderBy: { issueDate: 'desc' },
-      include: {
-        tenant: {
-          select: {
-            fullName: true,
-            contact: true,
-            unit: {
-              select: {
-                unitNo: true,
-                property: {
-                  select: { name: true }
-                }
-              }
-            }
-          }
-        },
-        bill: {
-          select: {
-            id: true,
-            type: true,
-            issuedAt: true
-          }
-        }
-      }
-    });
-
-    const total = await prisma.billInvoice.count({ where: whereClause });
-
-    res.status(200).json({
-      success: true,
-      data: billInvoices,
-      pagination: {
-        page: parseInt(page, 10),
-        limit: parseInt(limit, 10),
-        total,
-        totalPages: Math.ceil(total / parseInt(limit, 10)),
-      },
-    });
-  } catch (error) {
-    console.error('Error fetching bill invoices by payment policy:', error);
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 };
@@ -605,7 +530,6 @@ export const recordBillInvoicePayment = async (req, res) => {
               amountPaid: 0,
               balance: newBalance,
               status: 'UNPAID',
-              paymentPolicy: billInvoice.paymentPolicy, // Copy payment policy from original invoice
               notes: `New invoice generated for remaining balance after partial payment`
             }
           });
@@ -674,53 +598,6 @@ export const downloadBillInvoice = async (req, res) => {
     res.send(pdfBuffer);
   } catch (error) {
     console.error('Error downloading bill invoice:', error);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
-  }
-};
-
-// @desc    Update bill invoice payment policy
-// @route   PATCH /api/bill-invoices/:id/payment-policy
-// @access  Private
-export const updateBillInvoicePaymentPolicy = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { paymentPolicy } = req.body;
-
-    // Validate payment policy
-    const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
-    if (!validPolicies.includes(paymentPolicy)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid payment policy. Must be MONTHLY, QUARTERLY, or ANNUAL'
-      });
-    }
-
-    const billInvoice = await prisma.billInvoice.findUnique({
-      where: { id },
-      include: {
-        tenant: true
-      }
-    });
-
-    if (!billInvoice) {
-      return res.status(404).json({
-        success: false,
-        error: 'Bill invoice not found'
-      });
-    }
-
-    const updatedInvoice = await prisma.billInvoice.update({
-      where: { id },
-      data: { paymentPolicy }
-    });
-
-    res.status(200).json({
-      success: true,
-      data: updatedInvoice,
-      message: 'Bill invoice payment policy updated successfully'
-    });
-  } catch (error) {
-    console.error('Error updating bill invoice payment policy:', error);
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 };
@@ -887,7 +764,6 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
       const amountPaid = safeNum(billInvoice.amountPaid);
       const balance = safeNum(billInvoice.balance);
       const status = billInvoice.status || 'UNPAID';
-      const paymentPolicy = billInvoice.paymentPolicy || 'MONTHLY';
       const description = billDescription || null;
 
       // ===========================================
@@ -961,9 +837,7 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
       invoiceDetailsY += lineHeight;
       doc.text(`Due Date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
       
-      invoiceDetailsY += lineHeight;
-      doc.text(`Payment Policy: ${paymentPolicy}`, 40, invoiceDetailsY);
-      
+      // MOVED UP: Bill Ref now immediately follows Due Date (no blank space)
       invoiceDetailsY += lineHeight;
       doc.text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, invoiceDetailsY);
       
@@ -991,10 +865,7 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
       billedToY += lineHeight;
       doc.text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 280, billedToY);
       
-      billedToY += lineHeight;
-      doc.text(`Payment Frequency: ${paymentPolicy}`, 280, billedToY);
-
-      // Move Y position to after the invoice details section
+      // Update Y position to after the invoice details section
       doc.y = Math.max(invoiceDetailsY + lineHeight, billedToY + lineHeight);
       
       moveDownWithCheck(0.3);
@@ -1165,31 +1036,6 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
       moveDownWithCheck(0.5);
 
       // ===========================================
-      // PAYMENT POLICY NOTE
-      // ===========================================
-      
-      let paymentPolicyNote = '';
-      if (paymentPolicy === 'MONTHLY') {
-        paymentPolicyNote = 'Note: This is a monthly utility invoice. Bills are generated monthly based on consumption.';
-      } else if (paymentPolicy === 'QUARTERLY') {
-        paymentPolicyNote = 'Note: This is a quarterly utility invoice. Bills are generated every 3 months based on consumption.';
-      } else if (paymentPolicy === 'ANNUAL') {
-        paymentPolicyNote = 'Note: This is an annual utility invoice. Bill is for the full year\'s consumption.';
-      }
-
-      if (paymentPolicyNote) {
-        doc.fillColor('#374151')
-           .fontSize(9)
-           .font('Helvetica')
-           .text(paymentPolicyNote, 40, doc.y, { 
-             width: 510,
-             align: 'left'
-           });
-        
-        moveDownWithCheck(0.5);
-      }
-
-      // ===========================================
       // PAYMENT INSTRUCTIONS (only for unpaid invoices)
       // ===========================================
 
@@ -1286,11 +1132,25 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
         
         moveDownWithCheck(0.5);
       }
+
       // ===========================================
-      // NOTES SECTION
+      // NOTES SECTION (combined notes and payment policy)
       // ===========================================
       
+      // Create combined notes array
+      const notesArray = [];
+      
+      // Add custom notes if available
       if (billInvoice.notes) {
+        notesArray.push(billInvoice.notes);
+      }
+      
+      // Always add payment policy note for utility bills
+      const paymentPolicyNote = 'This is a monthly utility invoice. Bills are generated monthly based on consumption.';
+      notesArray.push(paymentPolicyNote);
+      
+      // Display combined notes if we have any
+      if (notesArray.length > 0) {
         // NOTES - Aligned left
         doc.fillColor('#1e293b')
            .fontSize(10)
@@ -1301,12 +1161,16 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
         
         moveDownWithCheck(0.3);
 
+        // Join notes with line breaks
+        const combinedNotes = notesArray.join('\n\n');
+        
         doc.fillColor('#374151')
            .fontSize(9)
            .font('Helvetica')
-           .text(billInvoice.notes, 40, doc.y, { 
+           .text(combinedNotes, 40, doc.y, { 
              width: 510,
-             align: 'left' 
+             align: 'left',
+             lineGap: 4
            });
         
         moveDownWithCheck(0.5);
@@ -1349,106 +1213,3 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
     }
   });
 }
-// @desc    Get bill invoice statistics by payment policy
-// @route   GET /api/bill-invoices/stats/payment-policy
-// @access  Private
-export const getBillInvoiceStatsByPaymentPolicy = async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    
-    const whereClause = {};
-    
-    if (startDate || endDate) {
-      whereClause.issueDate = {};
-      if (startDate) {
-        whereClause.issueDate.gte = new Date(startDate);
-      }
-      if (endDate) {
-        whereClause.issueDate.lte = new Date(endDate);
-      }
-    }
-
-    // Get all invoices grouped by payment policy
-    const invoices = await prisma.billInvoice.findMany({
-      where: whereClause,
-      select: {
-        paymentPolicy: true,
-        grandTotal: true,
-        amountPaid: true,
-        balance: true,
-        status: true,
-        issueDate: true
-      }
-    });
-
-    // Calculate statistics
-    const stats = {
-      MONTHLY: { 
-        count: 0, 
-        totalAmount: 0, 
-        totalPaid: 0, 
-        totalBalance: 0,
-        paid: { count: 0, amount: 0 },
-        unpaid: { count: 0, amount: 0 },
-        partial: { count: 0, amount: 0 },
-        overdue: { count: 0, amount: 0 }
-      },
-      QUARTERLY: { 
-        count: 0, 
-        totalAmount: 0, 
-        totalPaid: 0, 
-        totalBalance: 0,
-        paid: { count: 0, amount: 0 },
-        unpaid: { count: 0, amount: 0 },
-        partial: { count: 0, amount: 0 },
-        overdue: { count: 0, amount: 0 }
-      },
-      ANNUAL: { 
-        count: 0, 
-        totalAmount: 0, 
-        totalPaid: 0, 
-        totalBalance: 0,
-        paid: { count: 0, amount: 0 },
-        unpaid: { count: 0, amount: 0 },
-        partial: { count: 0, amount: 0 },
-        overdue: { count: 0, amount: 0 }
-      }
-    };
-
-    invoices.forEach(invoice => {
-      const policy = invoice.paymentPolicy || 'MONTHLY';
-      const stat = stats[policy];
-      
-      if (stat) {
-        stat.count++;
-        stat.totalAmount += Number(invoice.grandTotal) || 0;
-        stat.totalPaid += Number(invoice.amountPaid) || 0;
-        stat.totalBalance += Number(invoice.balance) || 0;
-        
-        // Categorize by status
-        const status = invoice.status || 'UNPAID';
-        if (status === 'PAID') {
-          stat.paid.count++;
-          stat.paid.amount += Number(invoice.grandTotal) || 0;
-        } else if (status === 'UNPAID') {
-          stat.unpaid.count++;
-          stat.unpaid.amount += Number(invoice.grandTotal) || 0;
-        } else if (status === 'PARTIAL') {
-          stat.partial.count++;
-          stat.partial.amount += Number(invoice.grandTotal) || 0;
-        } else if (status === 'OVERDUE') {
-          stat.overdue.count++;
-          stat.overdue.amount += Number(invoice.grandTotal) || 0;
-        }
-      }
-    });
-
-    res.status(200).json({
-      success: true,
-      data: stats
-    });
-  } catch (error) {
-    console.error('Error fetching bill invoice statistics:', error);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
-  }
-};

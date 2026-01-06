@@ -659,49 +659,33 @@ async function generateInvoicePDF(invoice, tenant) {
       doc.fontSize(14)
         .fillColor('#1e293b')
         .text('TOTAL DUE:', descX, currentY + 10)
+        .fontSize(12)
         .text(
           `Ksh ${invoice.totalDue.toLocaleString('en-US', {
             minimumFractionDigits: 2,
           })}`,
-          amountX - 10,
+          amountX - 20,  // Move left a bit more
           currentY + 10,
-          { width: 90, align: 'right' }
+          { width: 100, align: 'right' }  // Increase width
         );
 
       /* =====================================================
-         FOOTER
-      ====================================================== */
+          FOOTER
+        ====================================================== */
 
       const footerY = doc.page.height - 100;
 
       doc.rect(50, footerY - 10, 500, 1).fill('#e5e7eb');
 
-      // Add payment policy note to footer
-      let paymentNote = '';
-      if (invoice.paymentPolicy === 'MONTHLY') {
-        paymentNote = 'This is a monthly invoice. Please pay by the due date.';
-      } else if (invoice.paymentPolicy === 'QUARTERLY') {
-        paymentNote = 'This is a quarterly invoice covering 3 months of rent.';
-      } else if (invoice.paymentPolicy === 'ANNUAL') {
-        paymentNote = 'This is an annual invoice covering 12 months of rent.';
-      }
-
-      doc.fontSize(9)
+      // Start directly with the contact information
+      doc.fontSize(8)
         .fillColor('#6b7280')
-        .text(paymentNote, 50, footerY, {
-          align: 'center',
-          width: 500,
-        })
-        .moveDown(0.4)
-        .text('Thank you for your business!', {
-          align: 'center',
-          width: 500,
-        })
-        .moveDown(0.4)
-        .fontSize(8)
         .text(
           'Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke',
-          { align: 'center', width: 500 }
+          50, footerY, {
+            align: 'center',
+            width: 500
+          }
         );
 
       doc.end();

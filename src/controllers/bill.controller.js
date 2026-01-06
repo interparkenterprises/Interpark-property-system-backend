@@ -415,82 +415,6 @@ async function generateBillInvoicePDF(billInvoice) {
   });
 }
 
-// Helper function to generate bill invoice for a payment
-async function generateBillInvoiceForPayment(bill, amountPaid, paymentDate) {
-  try {
-    // Generate unique invoice number using your existing helper
-    const invoiceNumber = await generateBillInvoiceNumber();
-
-    // Generate bill reference number
-    const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
-
-    // Calculate current balance after this payment
-    const currentAmountPaid = bill.amountPaid + amountPaid;
-    const balance = Math.max(0, bill.grandTotal - currentAmountPaid);
-    
-    // Determine status
-    let status = 'UNPAID';
-    if (currentAmountPaid >= bill.grandTotal) {
-      status = 'PAID';
-    } else if (currentAmountPaid > 0) {
-      status = 'PARTIAL';
-    }
-
-    // Create bill invoice record
-    const billInvoice = await prisma.billInvoice.create({
-      data: {
-        invoiceNumber,
-        billId: bill.id,
-        billReferenceNumber,
-        billReferenceDate: bill.issuedAt,
-        tenantId: bill.tenantId,
-        issueDate: new Date(),
-        dueDate: bill.dueDate || new Date(),
-        billType: bill.type,
-        previousReading: Number(bill.previousReading) || 0,
-        currentReading: Number(bill.currentReading) || 0,
-        units: Number(bill.units) || 0,
-        chargePerUnit: Number(bill.chargePerUnit) || 0,
-        totalAmount: Number(bill.totalAmount) || 0,
-        vatRate: bill.vatRate ? Number(bill.vatRate) : null,
-        vatAmount: bill.vatAmount ? Number(bill.vatAmount) : null,
-        grandTotal: Number(bill.grandTotal) || 0,
-        amountPaid: amountPaid,
-        balance: balance,
-        status,
-        notes: `Payment of Ksh ${amountPaid.toLocaleString()} recorded on ${paymentDate}`
-      },
-      include: {
-        tenant: {
-          include: {
-            unit: {
-              include: {
-                property: true
-              }
-            }
-          }
-        },
-        bill: true
-      }
-    });
-
-    // Generate PDF using your storage utility
-    const pdfBuffer = await generateBillInvoicePDF(billInvoice);
-    const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
-
-    // Update invoice with PDF URL
-    const updatedInvoice = await prisma.billInvoice.update({
-      where: { id: billInvoice.id },
-      data: { pdfUrl }
-    });
-
-    return updatedInvoice;
-  } catch (error) {
-    console.error('Error generating bill invoice for payment:', error);
-    throw error;
-  }
-}
-
 // Pay bill with automatic invoice generation
 export const payBill = async (req, res) => {
   try {
@@ -551,8 +475,9 @@ export const payBill = async (req, res) => {
       newStatus = "OVERDUE";
     }
 
-    const result = await prisma.$transaction(async (tx) => {
-      // 1️⃣ Update Bill
+    // Execute database operations in transaction
+    const { updatedBill, invoice } = await prisma.$transaction(async (tx) => {
+      // 1 Update Bill
       const updatedBill = await tx.bill.update({
         where: { id },
         data: {
@@ -574,68 +499,75 @@ export const payBill = async (req, res) => {
         }
       });
 
-      // 2️⃣ Create Invoice Entry
-      let invoice = null;
-      try {
-        const invoiceNumber = await generateBillInvoiceNumber();
-        const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
-        
-        const balance = roundTo2(grandTotal - newAmountPaid);
+      // 2 Create Invoice Entry
+      const invoiceNumber = await generateBillInvoiceNumber();
+      const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
+      
+      const balance = roundTo2(grandTotal - newAmountPaid);
 
-        let invoiceStatus = "UNPAID";
-        if (newAmountPaid >= grandTotal) invoiceStatus = "PAID";
-        else if (newAmountPaid > 0) invoiceStatus = "PARTIAL";
+      let invoiceStatus = "UNPAID";
+      if (newAmountPaid >= grandTotal) invoiceStatus = "PAID";
+      else if (newAmountPaid > 0) invoiceStatus = "PARTIAL";
 
-        invoice = await tx.billInvoice.create({
-          data: {
-            invoiceNumber,
-            billId: bill.id,
-            billReferenceNumber,
-            billReferenceDate: bill.issuedAt,
-            tenantId: bill.tenantId,
-            issueDate: now,
-            dueDate: bill.dueDate || now,
-            billType: bill.type,
-            previousReading: Number(bill.previousReading) || 0,
-            currentReading: Number(bill.currentReading) || 0,
-            units: Number(bill.units) || 0,
-            chargePerUnit: Number(bill.chargePerUnit) || 0,
-            totalAmount: Number(bill.totalAmount) || 0,
-            vatRate: bill.vatRate ? Number(bill.vatRate) : null,
-            vatAmount: bill.vatAmount ? Number(bill.vatAmount) : null,
-            grandTotal: grandTotal,
-            amountPaid: roundTo2(amount),
-            balance: balance,
-            status: invoiceStatus,
-            notes: `Payment of Ksh ${amount.toLocaleString()} recorded on ${now.toLocaleDateString()}`
-          }
-        });
-      } catch (invoiceError) {
-        console.error("Error generating invoice:", invoiceError);
-      }
+      const invoice = await tx.billInvoice.create({
+        data: {
+          invoiceNumber,
+          billId: bill.id,
+          billReferenceNumber,
+          billReferenceDate: bill.issuedAt,
+          tenantId: bill.tenantId,
+          issueDate: now,
+          dueDate: bill.dueDate || now,
+          billType: bill.type,
+          previousReading: Number(bill.previousReading) || 0,
+          currentReading: Number(bill.currentReading) || 0,
+          units: Number(bill.units) || 0,
+          chargePerUnit: Number(bill.chargePerUnit) || 0,
+          totalAmount: Number(bill.totalAmount) || 0,
+          vatRate: bill.vatRate ? Number(bill.vatRate) : null,
+          vatAmount: bill.vatAmount ? Number(bill.vatAmount) : null,
+          grandTotal: grandTotal,
+          amountPaid: roundTo2(amount),
+          balance: balance,
+          status: invoiceStatus,
+          notes: `Payment of Ksh ${amount.toLocaleString()} recorded on ${now.toLocaleDateString()}`
+        }
+      });
 
       return { updatedBill, invoice };
+    }, {
+      // Optional: Increase transaction timeout if needed (default is 5 seconds)
+      maxWait: 15000, // Maximum wait time for a transaction (10 seconds)
+      timeout: 30000, // Maximum time the transaction can run (30 seconds)
     });
 
-    // 3 Optionally generate PDF after transaction commit
-    if (result.invoice) {
+    // 3 Generate PDF and upload to storage (OUTSIDE transaction)
+    let pdfUrl = null;
+    if (invoice) {
       try {
-        const pdfBuffer = await generateBillInvoicePDF(result.invoice);
-        const pdfUrl = await uploadToStorage(pdfBuffer, `${result.invoice.invoiceNumber}.pdf`);
+        const pdfBuffer = await generateBillInvoicePDF(invoice);
+        pdfUrl = await uploadToStorage(pdfBuffer, `${invoice.invoiceNumber}.pdf`);
+        
+        // Update invoice with PDF URL (separate, non-transactional operation)
         await prisma.billInvoice.update({
-          where: { id: result.invoice.id },
+          where: { id: invoice.id },
           data: { pdfUrl }
         });
       } catch (pdfError) {
         console.error("Invoice PDF generation failed:", pdfError);
+        // Don't fail the whole payment if PDF generation fails
+        // The invoice was already created successfully
       }
     }
 
     res.status(200).json({
       success: true,
       data: {
-        bill: result.updatedBill,
-        invoice: result.invoice,
+        bill: updatedBill,
+        invoice: {
+          ...invoice,
+          pdfUrl // Include the PDF URL in response
+        },
       },
       message: "Payment recorded successfully and invoice generated"
     });
@@ -645,6 +577,12 @@ export const payBill = async (req, res) => {
 
     if (error.code === "P2002") {
       return res.status(400).json({ error: "Duplicate payment detected" });
+    }
+    
+    if (error.code === "P2028") {
+      return res.status(500).json({ 
+        error: "Transaction timeout. The operation took too long. Please try again." 
+      });
     }
 
     res.status(500).json({ error: "Internal Server Error" });
