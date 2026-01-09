@@ -514,67 +514,57 @@ async function generateInvoicePDF(invoice, tenant) {
         .font('Helvetica') // Reset to regular font
         .moveDown(1);
 
+      /* =====================================================
+         BILLING INFORMATION - MOVED TO TOP SECTION
+      ====================================================== */
+
       const topY = doc.y;
+      
+      // Left side: BILL TO information
+      doc.fontSize(12)
+        .fillColor('#1e293b')
+        .text('BILL TO:', 50, topY, { underline: true });
 
       doc.fontSize(10)
+        .fillColor('#374151')
+        .text(invoice.tenant.fullName, 50, topY + 25)
+        .text(`Contact: ${invoice.tenant.contact}`, 50, topY + 40)
+        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, topY + 55)
+        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, topY + 70)
+        //.text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, topY + 85);
+
+      // Right side: Invoice details
+      const invoiceDetailsX = 300; // Right side of the page
+      
+      doc.fontSize(10)
         .fillColor('#1e293b')
-        .text(`Invoice Number: ${invoice.invoiceNumber}`, 50, topY)
+        .text(`Invoice Number: ${invoice.invoiceNumber}`, invoiceDetailsX, topY)
         .text(
           `Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`,
-          50,
+          invoiceDetailsX,
           topY + 15
         )
         .text(
           `Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`,
-          50,
+          invoiceDetailsX,
           topY + 30
         )
-        .text(`Payment Period: ${invoice.paymentPeriod}`, 50, topY + 45)
-        .text(`Payment Policy: ${invoice.paymentPolicy}`, 50, topY + 60);
+        .text(`Payment Period: ${invoice.paymentPeriod}`, invoiceDetailsX, topY + 45)
+        .text(`Payment Policy: ${invoice.paymentPolicy}`, invoiceDetailsX, topY + 60);
 
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
         doc.text(
           `VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`,
-          300,
-          topY + 15
+          invoiceDetailsX,
+          topY + 75
         );
       }
-
-      /* =====================================================
-         BILLING INFORMATION
-      ====================================================== */
-
-      doc.moveDown(3);
-      const tenantY = doc.y;
-
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('BILL TO:', 50, tenantY, { underline: true });
-
-      doc.fontSize(10)
-        .fillColor('#374151')
-        .text(invoice.tenant.fullName, 50, tenantY + 25)
-        .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
-        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, tenantY + 55)
-        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 70)
-        .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, tenantY + 85);
-
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('FROM:', 300, tenantY, { underline: true });
-
-      doc.fontSize(10)
-        .fillColor('#374151')
-        .text('Interpark Enterprises Limited', 300, tenantY + 25)
-        .text('Tel: 0110 060 088', 300, tenantY + 40)
-        .text('Email: info@interparkenterprises.co.ke', 300, tenantY + 55)
-        .text('Website: www.interparkenterprises.co.ke', 300, tenantY + 70);
 
       /* =====================================================
          LINE ITEMS
       ====================================================== */
 
-      doc.moveDown(4);
+      doc.moveDown(6); // Adjusted spacing since BILL TO section is at the top
       const tableTop = doc.y;
       const itemX = 50;
       const descX = 200;
@@ -1012,6 +1002,68 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .font('Helvetica') // Reset to regular font
         .moveDown(0.5);
 
+      /* =====================================================
+         BILLING INFORMATION & INVOICE DETAILS - COMBINED TOP SECTION
+      ====================================================== */
+
+      const topY = doc.y;
+      
+      // Left side: BILL TO information
+      doc.fontSize(12)
+        .fillColor('#1e293b')
+        .text('BILL TO:', 50, topY, { underline: true });
+
+      doc.fontSize(10)
+        .fillColor('#374151')
+        .text(invoice.tenant.fullName, 50, topY + 25)
+        .text(`Contact: ${invoice.tenant.contact}`, 50, topY + 40)
+        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, topY + 55)
+        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, topY + 70)
+        .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, topY + 85);
+
+      // Right side: Invoice details
+      const invoiceDetailsX = 300; // Right side of the page
+      
+      doc.fontSize(10)
+        .fillColor('#1e293b')
+        .text(`Invoice Number: ${invoice.invoiceNumber}`, invoiceDetailsX, topY)
+        .text(
+          `Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`,
+          invoiceDetailsX,
+          topY + 15
+        )
+        .text(
+          `Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`,
+          invoiceDetailsX,
+          topY + 30
+        )
+        .text(`Original Payment Period: ${invoice.paymentPeriod}`, invoiceDetailsX, topY + 45)
+        .text(`Payment Policy: ${invoice.paymentPolicy}`, invoiceDetailsX, topY + 60);
+
+      if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
+        doc.text(
+          `VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`,
+          invoiceDetailsX,
+          topY + 75
+        );
+      }
+
+      // Status Badge - Adjusted position
+      const statusWidth = 100;
+      const statusX = invoiceDetailsX + 150; // Moved further right
+      doc.rect(statusX, topY, statusWidth, 25)
+        .fillAndStroke('#dc2626', '#dc2626');
+      
+      doc.fillColor('#fff')
+        .fontSize(12)
+        .text('UNPAID', statusX, topY + 7, { width: statusWidth, align: 'center' });
+
+      /* =====================================================
+         ALERT BOX AND PAYMENT SUMMARY
+      ====================================================== */
+
+      doc.moveDown(6); // Adjusted spacing since sections are combined at top
+      
       // Alert box for partial payment
       const alertY = doc.y;
       doc.rect(50, alertY, 500, 50)
@@ -1024,67 +1076,6 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text(`Original Payment Period: ${invoice.paymentPeriod}`, 60, alertY + 38);
 
       doc.moveDown(3);
-
-      // Invoice Details Box
-      const detailsY = doc.y;
-      
-      // Left column - Invoice details
-      doc.fontSize(10)
-        .fillColor('#1e293b')
-        .text(`Invoice Number: ${invoice.invoiceNumber}`, 50, detailsY)
-        .text(`Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`, 50, detailsY + 15)
-        .text(`Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`, 50, detailsY + 30)
-        .text(`Original Payment Period: ${invoice.paymentPeriod}`, 50, detailsY + 45)
-        .text(`Payment Policy: ${invoice.paymentPolicy}`, 50, detailsY + 60);
-
-      // VAT Information
-      if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
-        doc.text(`VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`, 300, detailsY + 15);
-      }
-
-      // Status Badge
-      const statusWidth = 100;
-      const statusX = 500 - statusWidth;
-      doc.rect(statusX, detailsY, statusWidth, 25)
-        .fillAndStroke('#dc2626', '#dc2626');
-      
-      doc.fillColor('#fff')
-        .fontSize(12)
-        .text('UNPAID', statusX, detailsY + 7, { width: statusWidth, align: 'center' });
-
-      doc.moveDown(3);
-
-      // Tenant Information
-      const tenantY = doc.y;
-      
-      // Left side - BILL TO
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('BILL TO:', 50, tenantY, { underline: true })
-        .moveDown(0.5);
-
-      doc.fontSize(10)
-        .fillColor('#374151')
-        .text(invoice.tenant.fullName, 50, tenantY + 25)
-        .text(`Contact: ${invoice.tenant.contact}`, 50, tenantY + 40)
-        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, tenantY + 55)
-        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, tenantY + 70)
-        .text(`Payment Frequency: ${invoice.paymentPolicy}`, 50, tenantY + 85);
-
-      // Right side - Property/Landlord Information
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('FROM:', 300, tenantY, { underline: true })
-        .moveDown(0.5);
-
-      doc.fontSize(10)
-        .fillColor('#374151')
-        .text('Interpark Enterprises Limited', 300, tenantY + 25)
-        .text('Tel: 0110 060 088', 300, tenantY + 40)
-        .text('Email: info@interparkenterprises.co.ke', 300, tenantY + 55)
-        .text('Website: www.interparkenterprises.co.ke', 300, tenantY + 70);
-
-      doc.moveDown(4);
 
       // Payment Summary Section
       const summaryY = doc.y;
@@ -1118,7 +1109,10 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
       doc.moveDown(5);
 
-      // Line Items Table
+      /* =====================================================
+         LINE ITEMS
+      ====================================================== */
+
       const tableTop = doc.y;
       const itemX = 50;
       const descX = 200;
@@ -1176,7 +1170,10 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
         .text('⚠️  IMPORTANT NOTICE', 60, currentY + 8, { bold: true })
         .text(`Please settle this ${invoice.paymentPolicy.toLowerCase()} outstanding balance by the due date to avoid additional charges.`, 60, currentY + 25, { width: 480 });
 
-      // Footer with company information
+      /* =====================================================
+         FOOTER
+      ====================================================== */
+
       const footerY = doc.page.height - 100;
       doc.rect(50, footerY - 10, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
       
