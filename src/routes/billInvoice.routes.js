@@ -8,6 +8,7 @@ import {
   downloadBillInvoice,
   deleteBillInvoice,
   recordBillInvoicePayment,
+  deleteBillInvoicePDF
 } from '../controllers/billinvoice.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
@@ -40,6 +41,9 @@ router.post('/:id/record-payment', authorize('ADMIN', 'MANAGER'), recordBillInvo
 router.get('/:id/download', authorize('ADMIN', 'MANAGER'), downloadBillInvoice);
 
 // Delete bill invoice - Only ADMIN and MANAGER can delete
-router.delete('/:id', authorize('ADMIN'), deleteBillInvoice);
+router.delete('/:id', authorize('ADMIN', 'MANAGER'), deleteBillInvoice);
+
+// delete bill invoice pdf
+router.delete('/:id/pdf', authorize('ADMIN'), deleteBillInvoicePDF);
 
 export default router;

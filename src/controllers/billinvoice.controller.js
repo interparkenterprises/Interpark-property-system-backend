@@ -602,35 +602,334 @@ export const downloadBillInvoice = async (req, res) => {
   }
 };
 
-// @desc    Delete bill invoice
+// @desc    Delete bill invoice and associated PDF with optional payment report cleanup
 // @route   DELETE /api/bill-invoices/:id
-// @access  Private
+// @access  Private (Admin only)
 export const deleteBillInvoice = async (req, res) => {
   try {
     const { id } = req.params;
-
+    const { 
+      deletePaymentReport = false, 
+      deleteLinkedInvoices = false,  // Option to delete all linked bill invoices
+      force = false 
+    } = req.body;
+    
+    // Find bill invoice with payment report and all linked invoices info
     const billInvoice = await prisma.billInvoice.findUnique({
-      where: { id }
+      where: { id },
+      include: {
+        paymentReport: {
+          include: {
+            billInvoices: {
+              select: {
+                id: true,
+                invoiceNumber: true,
+                pdfUrl: true,
+                createdAt: true,
+                tenant: {
+                  select: {
+                    fullName: true
+                  }
+                }
+              }
+            },
+            _count: {
+              select: { billInvoices: true }
+            }
+          }
+        },
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            unit: {
+              select: {
+                unitNo: true,
+                property: {
+                  select: { 
+                    name: true,
+                    address: true 
+                  }
+                }
+              }
+            }
+          }
+        },
+        bill: {
+          select: {
+            id: true,
+            type: true,
+            status: true,
+            grandTotal: true,
+            amountPaid: true
+          }
+        }
+      }
     });
-
+    
     if (!billInvoice) {
       return res.status(404).json({ 
         success: false, 
         error: 'Bill invoice not found.' 
       });
     }
-
-    await prisma.billInvoice.delete({
-      where: { id }
+    
+    // Check if invoice is within allowed deletion period
+    const invoiceAge = Date.now() - new Date(billInvoice.createdAt).getTime();
+    const maxAgeForDeletion = 60 * 24 * 60 * 60 * 1000; // 60 days
+    
+    if (!force && invoiceAge > maxAgeForDeletion) {
+      return res.status(400).json({
+        success: false,
+        message: `Bill invoice is older than 60 days. Use force=true to delete older invoices.`,
+        invoiceDate: billInvoice.createdAt,
+        ageInDays: Math.floor(invoiceAge / (24 * 60 * 60 * 1000)),
+        allowed: false
+      });
+    }
+    
+    const result = {
+      billInvoiceDeleted: false,
+      paymentReportDeleted: false,
+      linkedBillInvoicesDeleted: 0,
+      totalPdfsDeleted: 0,
+      invoiceInfo: {
+        id: billInvoice.id,
+        invoiceNumber: billInvoice.invoiceNumber,
+        tenantName: billInvoice.tenant.fullName,
+        propertyName: billInvoice.tenant.unit?.property?.name || 'N/A',
+        billType: billInvoice.billType,
+        grandTotal: billInvoice.grandTotal,
+        balance: billInvoice.balance,
+        createdAt: billInvoice.createdAt
+      }
+    };
+    
+    // Track linked bill invoices info
+    let linkedBillInvoices = [];
+    if (billInvoice.paymentReport) {
+      result.paymentReportInfo = {
+        id: billInvoice.paymentReportId,
+        status: billInvoice.paymentReport.status,
+        totalLinkedBillInvoices: billInvoice.paymentReport._count.billInvoices,
+        linkedBillInvoices: billInvoice.paymentReport.billInvoices.map(inv => ({
+          id: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          tenantName: inv.tenant.fullName,
+          createdAt: inv.createdAt
+        }))
+      };
+      linkedBillInvoices = billInvoice.paymentReport.billInvoices;
+    }
+    
+    // Array to store all delete operations
+    const deleteOperations = [];
+    const deletedBillInvoiceIds = new Set();
+    
+    // Function to delete bill invoice and its PDF
+    const deleteBillInvoiceAndPDF = async (invoiceToDelete, isMainInvoice = false) => {
+      // Delete PDF file if exists
+      let pdfDeleted = false;
+      if (invoiceToDelete.pdfUrl) {
+        try {
+          const filePath = path.join(
+            process.cwd(), 
+            'uploads', 
+            'bill-invoices',  // Note: Changed folder name for bill invoices
+            path.basename(invoiceToDelete.pdfUrl)
+          );
+          
+          if (fs.existsSync(filePath)) {
+            await fs.promises.unlink(filePath);
+            pdfDeleted = true;
+            result.totalPdfsDeleted++;
+            console.log(`Deleted PDF: ${invoiceToDelete.invoiceNumber}`);
+          }
+        } catch (fileError) {
+          console.warn(`Could not delete PDF for ${invoiceToDelete.invoiceNumber}:`, fileError.message);
+        }
+      }
+      
+      // Add to delete operations
+      deleteOperations.push(
+        prisma.billInvoice.delete({
+          where: { id: invoiceToDelete.id }
+        }).then(() => {
+          deletedBillInvoiceIds.add(invoiceToDelete.id);
+          
+          if (isMainInvoice) {
+            result.billInvoiceDeleted = true;
+          } else {
+            result.linkedBillInvoicesDeleted++;
+          }
+          
+          console.log(`Deleted bill invoice: ${invoiceToDelete.invoiceNumber}`);
+        })
+      );
+      
+      return pdfDeleted;
+    };
+    
+    // Case 1: Delete linked invoices + payment report
+    if (deleteLinkedInvoices && deletePaymentReport && billInvoice.paymentReportId) {
+      // Delete ALL bill invoices linked to this payment report
+      for (const linkedInvoice of linkedBillInvoices) {
+        await deleteBillInvoiceAndPDF(linkedInvoice, linkedInvoice.id === id);
+      }
+      
+      // Delete the payment report
+      deleteOperations.push(
+        prisma.paymentReport.delete({
+          where: { id: billInvoice.paymentReportId }
+        }).then(() => {
+          result.paymentReportDeleted = true;
+          console.log(`Deleted PaymentReport: ${billInvoice.paymentReportId}`);
+        })
+      );
+      
+    } 
+    // Case 2: Delete linked invoices only (keep payment report)
+    else if (deleteLinkedInvoices && billInvoice.paymentReportId) {
+      // Delete ALL bill invoices linked to this payment report
+      for (const linkedInvoice of linkedBillInvoices) {
+        await deleteBillInvoiceAndPDF(linkedInvoice, linkedInvoice.id === id);
+      }
+      
+      // Payment report remains but will have 0 bill invoices
+      result.paymentReportRemains = true;
+      
+    }
+    // Case 3: Delete payment report only if it has 1 invoice
+    else if (deletePaymentReport && billInvoice.paymentReportId) {
+      const paymentReport = billInvoice.paymentReport;
+      
+      if (paymentReport && paymentReport._count.billInvoices === 1) {
+        // Delete main bill invoice
+        await deleteBillInvoiceAndPDF(billInvoice, true);
+        
+        // Delete payment report
+        deleteOperations.push(
+          prisma.paymentReport.delete({
+            where: { id: billInvoice.paymentReportId }
+          }).then(() => {
+            result.paymentReportDeleted = true;
+            console.log(`Deleted PaymentReport: ${billInvoice.paymentReportId}`);
+          })
+        );
+      } else if (paymentReport) {
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot delete payment report as it has other bill invoices linked to it.',
+          linkedBillInvoiceCount: paymentReport._count.billInvoices,
+          linkedBillInvoices: paymentReport.billInvoices
+            .filter(inv => inv.id !== id)
+            .map(inv => ({
+              id: inv.id,
+              invoiceNumber: inv.invoiceNumber,
+              tenantName: inv.tenant.fullName
+            })),
+          suggestion: 'Use deleteLinkedInvoices=true to delete all linked bill invoices'
+        });
+      }
+    }
+    // Case 4: Delete only this bill invoice (default behavior)
+    else {
+      await deleteBillInvoiceAndPDF(billInvoice, true);
+    }
+    
+    // Execute all delete operations
+    if (deleteOperations.length > 0) {
+      await Promise.all(deleteOperations);
+    }
+    
+    // Update the original bill's amountPaid if this invoice had payments
+    if (billInvoice.amountPaid > 0) {
+      try {
+        const currentBill = await prisma.bill.findUnique({
+          where: { id: billInvoice.billId }
+        });
+        
+        if (currentBill) {
+          const newBillAmountPaid = Math.max(0, currentBill.amountPaid - billInvoice.amountPaid);
+          const newBillBalance = currentBill.grandTotal - newBillAmountPaid;
+          
+          let newBillStatus = currentBill.status;
+          if (newBillAmountPaid >= currentBill.grandTotal) {
+            newBillStatus = 'PAID';
+          } else if (newBillAmountPaid > 0) {
+            newBillStatus = 'PARTIAL';
+          } else {
+            newBillStatus = 'UNPAID';
+          }
+          
+          await prisma.bill.update({
+            where: { id: billInvoice.billId },
+            data: {
+              amountPaid: newBillAmountPaid,
+              status: newBillStatus,
+              paidAt: newBillStatus === 'PAID' ? currentBill.paidAt : null
+            }
+          });
+          
+          result.billUpdated = {
+            id: billInvoice.billId,
+            previousAmountPaid: currentBill.amountPaid,
+            newAmountPaid: newBillAmountPaid,
+            newStatus: newBillStatus
+          };
+        }
+      } catch (billError) {
+        console.warn('Could not update bill amounts:', billError.message);
+      }
+    }
+    
+    // Prepare response message
+    let message = 'Bill invoice deleted successfully';
+    if (result.linkedBillInvoicesDeleted > 0) {
+      message += ` along with ${result.linkedBillInvoicesDeleted} linked bill invoice(s)`;
+    }
+    if (result.paymentReportDeleted) {
+      message += ' and its payment report';
+    }
+    if (result.billUpdated) {
+      message += `. Original bill payment amounts have been adjusted.`;
+    }
+    message += '.';
+    
+    res.status(200).json({
+      success: true,
+      data: result,
+      message: message
     });
-
-    res.status(200).json({ 
-      success: true, 
-      message: 'Bill invoice deleted successfully.' 
-    });
+    
   } catch (error) {
     console.error('Error deleting bill invoice:', error);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
+    
+    // Handle foreign key constraint errors
+    if (error.code === 'P2003') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete bill invoice due to database constraints.',
+        suggestion: 'Try deleting linked records first or use deletePaymentReport=true',
+        errorCode: error.code
+      });
+    }
+    
+    // Handle not found error
+    if (error.code === 'P2025') {
+      return res.status(404).json({
+        success: false,
+        message: 'Record not found. It may have been already deleted.',
+        errorCode: error.code
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      errorCode: error.code
+    });
   }
 };
 
@@ -1213,3 +1512,70 @@ async function generateBillInvoicePDF(billInvoice, billDescription) {
     }
   });
 }
+
+// @desc    Delete bill invoice PDF only (keep database record)
+// @route   DELETE /api/bill-invoices/:id/pdf
+// @access  Private (Admin only)
+export const deleteBillInvoicePDF = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const billInvoice = await prisma.billInvoice.findUnique({
+      where: { id }
+    });
+    
+    if (!billInvoice) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Bill invoice not found.' 
+      });
+    }
+    
+    if (!billInvoice.pdfUrl) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'No PDF associated with this bill invoice' 
+      });
+    }
+    
+    // Delete PDF file from storage
+    const filePath = path.join(
+      process.cwd(), 
+      'uploads', 
+      'bill-invoices',  // Changed folder name
+      path.basename(billInvoice.pdfUrl)
+    );
+    
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'PDF file not found on server' 
+      });
+    }
+    
+    await fs.promises.unlink(filePath);
+    
+    // Update bill invoice to remove PDF URL
+    await prisma.billInvoice.update({
+      where: { id },
+      data: { pdfUrl: null }
+    });
+    
+    res.status(200).json({
+      success: true,
+      message: 'Bill invoice PDF deleted successfully',
+      data: {
+        invoiceId: billInvoice.id,
+        invoiceNumber: billInvoice.invoiceNumber,
+        pdfUrl: null
+      }
+    });
+  } catch (error) {
+    console.error('Error deleting bill invoice PDF:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+};
+

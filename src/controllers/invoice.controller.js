@@ -1269,3 +1269,226 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
+// @desc    Delete invoice with smart linked invoice handling
+// @route   DELETE /api/invoices/:id
+// @access  Private (Admin only)
+export const deleteInvoice = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { deletePaymentReport = false, force = false } = req.body;
+    
+    // Find invoice with payment report info
+    const invoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: {
+        paymentReport: {
+          include: {
+            invoices: {
+              select: {
+                id: true,
+                invoiceNumber: true,
+                createdAt: true,
+                tenant: {
+                  select: { fullName: true }
+                }
+              }
+            },
+            _count: {
+              select: { invoices: true }
+            }
+          }
+        },
+        tenant: {
+          select: {
+            fullName: true,
+            unit: {
+              select: {
+                property: {
+                  select: { name: true }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    if (!invoice) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Invoice not found' 
+      });
+    }
+    
+    // Check age
+    const invoiceAge = Date.now() - new Date(invoice.createdAt).getTime();
+    const maxAge = 60 * 24 * 60 * 60 * 1000;
+    
+    if (!force && invoiceAge > maxAge) {
+      return res.status(400).json({
+        success: false,
+        message: `Invoice is older than 60 days. Use force=true to delete.`,
+        ageInDays: Math.floor(invoiceAge / (24 * 60 * 60 * 1000))
+      });
+    }
+    
+    const result = {
+      deletedInvoices: [],
+      deletedPaymentReport: false,
+      deletedPdfs: 0
+    };
+    
+    // Determine which invoices to delete
+    let invoicesToDelete = [];
+    
+    if (deletePaymentReport && invoice.paymentReport) {
+      // Delete all invoices linked to this payment report
+      invoicesToDelete = invoice.paymentReport.invoices;
+    } else {
+      // Delete only this invoice
+      invoicesToDelete = [invoice];
+    }
+    
+    // Show warning if deleting multiple invoices
+    if (invoicesToDelete.length > 1) {
+      // You might want to add a confirmation step here
+      console.log(`Will delete ${invoicesToDelete.length} invoices linked to payment report ${invoice.paymentReportId}`);
+    }
+    
+    // Delete each invoice and its PDF
+    for (const inv of invoicesToDelete) {
+      try {
+        // Delete PDF
+        if (inv.pdfUrl) {
+          try {
+            const filePath = path.join(
+              process.cwd(), 
+              'uploads', 
+              'invoices', 
+              path.basename(inv.pdfUrl)
+            );
+            
+            if (fs.existsSync(filePath)) {
+              await fs.promises.unlink(filePath);
+              result.deletedPdfs++;
+            }
+          } catch (fileError) {
+            console.warn(`PDF delete failed for ${inv.invoiceNumber}:`, fileError.message);
+          }
+        }
+        
+        // Delete invoice from database
+        await prisma.invoice.delete({
+          where: { id: inv.id }
+        });
+        
+        result.deletedInvoices.push({
+          id: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          tenantName: inv.tenant?.fullName || 'Unknown'
+        });
+        
+      } catch (error) {
+        console.error(`Failed to delete invoice ${inv.id}:`, error);
+      }
+    }
+    
+    // Delete payment report if requested and all invoices are gone
+    if (deletePaymentReport && invoice.paymentReportId && result.deletedInvoices.length > 0) {
+      try {
+        await prisma.paymentReport.delete({
+          where: { id: invoice.paymentReportId }
+        });
+        result.deletedPaymentReport = true;
+      } catch (error) {
+        console.error(`Failed to delete payment report ${invoice.paymentReportId}:`, error);
+      }
+    }
+    
+    // Response
+    const message = result.deletedInvoices.length === 1 
+      ? 'Invoice deleted successfully'
+      : `${result.deletedInvoices.length} invoices deleted successfully`;
+    
+    res.json({
+      success: true,
+      data: result,
+      message: result.deletedPaymentReport 
+        ? `${message} along with the payment report`
+        : message
+    });
+    
+  } catch (error) {
+    console.error('Error in smart delete:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message 
+    });
+  }
+};
+
+// @desc    Delete invoice PDF only (keep database record)
+// @route   DELETE /api/invoices/:id/pdf
+// @access  Private (Admin only)
+export const deleteInvoicePDF = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const invoice = await prisma.invoice.findUnique({
+      where: { id }
+    });
+    
+    if (!invoice) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Invoice not found' 
+      });
+    }
+    
+    if (!invoice.pdfUrl) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No PDF associated with this invoice' 
+      });
+    }
+    
+    // Delete PDF file from storage
+    const filePath = path.join(
+      process.cwd(), 
+      'uploads', 
+      'invoices', 
+      path.basename(invoice.pdfUrl)
+    );
+    
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'PDF file not found on server' 
+      });
+    }
+    
+    await fs.promises.unlink(filePath);
+    
+    // Update invoice to remove PDF URL
+    await prisma.invoice.update({
+      where: { id },
+      data: { pdfUrl: null }
+    });
+    
+    res.json({
+      success: true,
+      message: 'Invoice PDF deleted successfully',
+      data: {
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        pdfUrl: null
+      }
+    });
+  } catch (error) {
+    console.error('Error deleting invoice PDF:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message 
+    });
+  }
+};
