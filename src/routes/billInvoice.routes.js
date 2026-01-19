@@ -44,6 +44,6 @@ router.get('/:id/download', authorize('ADMIN', 'MANAGER'), downloadBillInvoice);
 router.delete('/:id', authorize('ADMIN', 'MANAGER'), deleteBillInvoice);
 
 // delete bill invoice pdf
-router.delete('/:id/pdf', authorize('ADMIN'), deleteBillInvoicePDF);
+router.delete('/:id/pdf', authorize('ADMIN', 'MANAGER'), deleteBillInvoicePDF);
 
 export default router;

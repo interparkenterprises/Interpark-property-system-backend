@@ -157,8 +157,8 @@ export const generateCommercialOfferLetter = (data) => {
       color: #000;
     }
     .header {
-      text-align: left;
-      margin-bottom: 40px;
+      text-align: center;
+      margin-bottom: 20px;
     }
     .property-name {
       font-weight: bold;
@@ -168,7 +168,7 @@ export const generateCommercialOfferLetter = (data) => {
     .date-section {
       display: flex;
       justify-content: space-between;
-      margin-bottom: 30px;
+      margin-bottom: 20px;
     }
     .attn-section {
       flex: 1;
@@ -180,67 +180,73 @@ export const generateCommercialOfferLetter = (data) => {
     .subject {
       font-weight: bold;
       text-align: right;
-      margin: 20px 0;
+      margin: 15px 0;
     }
     .recipient {
-      margin-bottom: 25px;
+      margin-bottom: 15px;
     }
     .salutation {
-      margin-bottom: 25px;
+      margin-bottom: 15px;
     }
     .re-line {
       font-weight: bold;
-      margin: 25px 0;
+      margin: 15px 0;
       line-height: 1.8;
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin: 25px 0;
+    .clause-container {
+      margin: 15px 0;
+      page-break-inside: avoid;
     }
-    table td {
-      padding: 10px 8px;
-      border: 1px solid #000;
-      vertical-align: top;
-      text-align: left;
-      line-height: 1.6;
+    .clause-row {
+      display: flex;
+      margin-bottom: 8px;
+      align-items: flex-start;
     }
-    table td:first-child {
+    .clause-number {
       width: 35px;
       text-align: center;
       font-weight: bold;
+      padding-top: 10px;
+      flex-shrink: 0;
     }
-    table td:nth-child(2) {
+    .clause-title {
       width: 180px;
       font-weight: bold;
+      padding-top: 10px;
+      flex-shrink: 0;
+    }
+    .clause-content {
+      flex: 1;
+      padding-top: 10px;
+      text-align: left;
     }
     .list-item {
-      margin-left: 30px;
+      margin-left: 20px;
       text-indent: -20px;
       margin-bottom: 5px;
     }
     .signature-section {
-      margin-top: 50px;
-      margin-bottom: 80px;
+      margin-top: 40px;
+      margin-bottom: 60px;
     }
     .signature-block {
-      margin-top: 60px;
+      margin-top: 40px;
     }
     .acceptance-section {
-      margin-top: 80px;
+      margin-top: 60px;
       page-break-before: always;
     }
     .acceptance-title {
       font-weight: bold;
       text-align: center;
       text-decoration: underline;
-      margin: 30px 0;
+      margin: 20px 0;
       font-size: 12pt;
     }
     .payment-table {
       width: 100%;
       border: none;
-      margin: 20px 0;
+      margin: 15px 0;
     }
     .payment-table td {
       border: none;
@@ -257,11 +263,11 @@ export const generateCommercialOfferLetter = (data) => {
     .seal-section {
       text-align: center;
       font-weight: bold;
-      margin: 40px 0 60px 0;
+      margin: 30px 0 40px 0;
       line-height: 2;
     }
     .witness-section {
-      margin: 60px 0;
+      margin: 40px 0;
       display: flex;
       justify-content: space-between;
     }
@@ -270,14 +276,14 @@ export const generateCommercialOfferLetter = (data) => {
     }
     .certification-box {
       border: 1px solid #000;
-      padding: 20px;
-      margin-top: 60px;
+      padding: 15px;
+      margin-top: 40px;
     }
     .certification-title {
       font-weight: bold;
       text-align: center;
       text-decoration: underline;
-      margin-bottom: 15px;
+      margin-bottom: 10px;
     }
     .underline-space {
       display: inline-block;
@@ -289,12 +295,17 @@ export const generateCommercialOfferLetter = (data) => {
       font-weight: bold;
     }
     p {
-      margin: 10px 0;
+      margin: 8px 0;
       text-align: justify;
     }
     .not-provided {
       color: #666;
       font-style: italic;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #000;
+      margin: 10px 0;
     }
   </style>
 </head>
@@ -333,70 +344,91 @@ export const generateCommercialOfferLetter = (data) => {
     Further to our discussions in respect to the referenced matter, we are pleased to offer to lease to you the commercial space${includeTerrace ? ' and the terrace abutting the commercial space' : ''} measuring approximately ${formatField(areaSqFt, '______')} Square Feet on the ${formatField(floor, '______')} Floor of the development erected on L.R. No. ${formatField(propertyLRNumber, '______')} at ${formatField(propertyAddress, '________________')} subject to contract, and subject to the following terms:
   </p>
 
-  <table>
-    <tr>
-      <td>1.</td>
-      <td>Premises:</td>
-      <td>
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">1.</div>
+      <div class="clause-title">Premises:</div>
+      <div class="clause-content">
         The Premise leased is the commercial space${includeTerrace ? ' and the terrace abutting the commercial space' : ''} measuring approximately ${formatField(areaSqFt, '______')} Square Feet on the ${formatField(floor, '______')} Floor of the development erected on L.R. No. ${formatField(propertyLRNumber, '______')} at ${formatField(propertyAddress, '________________')}
-      </td>
-    </tr>
-    <tr>
-      <td>2.</td>
-      <td>Landlord:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">2.</div>
+      <div class="clause-title">Landlord:</div>
+      <div class="clause-content">
         ${formatName(landlordName, 'Landlord Name Not Provided')}<br>
         ${formatAddress(landlordPOBox, propertyAddress)}
         ${landlordIDNumber ? `<br>ID No: ${landlordIDNumber}` : ''}
-      </td>
-    </tr>
-    <tr>
-      <td>3.</td>
-      <td>Tenant:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">3.</div>
+      <div class="clause-title">Tenant:</div>
+      <div class="clause-content">
         ${tenantCompanyName}<br>
         ${formatAddress(leadPOBox, leadAddress)}
         ${leadIDNumber ? `<br>ID No: ${leadIDNumber}` : ''}
         ${leadPINNumber ? `<br>PIN No: ${leadPINNumber}` : ''}
         ${leadPhone ? `<br>Phone: ${leadPhone}` : ''}
         ${leadEmail ? `<br>Email: ${leadEmail}` : ''}
-      </td>
-    </tr>
-    <tr>
-      <td>4.</td>
-      <td>Term:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">4.</div>
+      <div class="clause-title">Term:</div>
+      <div class="clause-content">
         ${formatField(leaseTerm, 'Twelve (12) months')} from the 1<sup>st</sup> day of ${formatLeaseStartDate(leaseStartDate)} or such other earlier date that the Parties shall agree.
-      </td>
-    </tr>
-    <tr>
-      <td>5.</td>
-      <td>Guarantors:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">5.</div>
+      <div class="clause-title">Guarantors:</div>
+      <div class="clause-content">
         The Tenant's Directors shall issue and execute a personal Deed of Guarantee and Indemnity to the Landlord to guarantee the Tenant's fulfillment of its obligation under the Lease.
-      </td>
-    </tr>
-    ${fitOutPeriod ? `
-    <tr>
-      <td>6.</td>
-      <td>Fit Out Period:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  ${fitOutPeriod ? `
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">6.</div>
+      <div class="clause-title">Fit Out Period:</div>
+      <div class="clause-content">
         The Tenant shall be granted ${fitOutDisplay} rent free Fit Out Period. The Tenant shall undertake all the required Fit Out Works before the rent Commencement Date, and the Landlord hereby warrants and undertakes to grant to the Tenant with vacant possession on the 1<sup>st</sup> day of ${formatLeaseStartDate(leaseStartDate)} or such other earlier date as the Tenant may require, provided that should the Tenant take possession of the Premises earlier than the 1<sup>st</sup> day of ${formatLeaseStartDate(leaseStartDate)}, the Term Commencement Date shall be amended to two months after the Tenant takes possession of the Premises.
-      </td>
-    </tr>
-    ` : ''}
-    <tr>
-      <td>${fitOutPeriod ? '7' : '6'}.</td>
-      <td>Rent:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '7' : '6'}.</div>
+      <div class="clause-title">Rent:</div>
+      <div class="clause-content">
         The Rent which shall be payable from the Term Commencement Date shall be assessed at Kenya Shilling ${formatField(rentPerSqFt, '______')} per Square Foot aggregating to Kenya Shillings ${formatCurrency(totalRentValue)} (Kshs. ${formatCurrency(totalRentValue)}/=) which shall escalate at the rate of ${formatField(escalationRate, '______')}% after every ${escalationText} months after the Term Commencement Date. The rent is inclusive of service charge.<br><br>
         Rent shall be paid ${paymentPolicyText} in advance not later than the 5<sup>th</sup> day of every month upon presentation of an invoice, and if the rent is not paid by then, the Tenant shall pay the Landlord interest on the rent arrears at the rate of Fifteen Percent (15%) per month from the date the Rent fell due until the date it is paid in full. Interest shall be calculated on daily balances and debited monthly by way of compound interest.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '8' : '7'}.</td>
-      <td>Service charge:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '8' : '7'}.</div>
+      <div class="clause-title">Service charge:</div>
+      <div class="clause-content">
         The Service Charge levied at Ksh. ${formatField(serviceChargePerSqFt, '______')} per sq.ft or ${formatCurrency(totalServiceChargeValue)} amount, which shall be payable either monthly or quarterly in advance together with the rent, shall cover all outgoings, operational costs and overheads relating to the building that shall include but not be limited to the following: -
         <div class="list-item">a) Electricity for common areas</div>
         <div class="list-item">b) Cleanliness for common areas</div>
@@ -411,57 +443,75 @@ export const generateCommercialOfferLetter = (data) => {
         Service charge will be payable from the Term Commencement Date.<br><br>
         The Service Charge shall escalate at the rate of ${serviceChargeEscalation}% per annum after every 12 months from the Term Commencement Date.<br><br>
         The Service Charge does not cover electricity and water exclusively consumed by the Tenant, which will be metered separately and payable by the Tenant.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '9' : '8'}.</td>
-      <td>VAT</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '9' : '8'}.</div>
+      <div class="clause-title">VAT</div>
+      <div class="clause-content">
         The Rent and Service Charge shall attract VAT at the prevailing rate, currently at the rate of ${vatRate}%. In addition to the above rental costs, the Tenant will be liable to pay on demand by the Landlord or to provide exemption certificate including exceptions from The Kenya Revenue Authority in accordance with the legal requirements of all Value Added Taxes or other taxes livable from time to time in law in respect of any amounts payable by the Tenant. Should the rate of VAT be varied during the Term, the Tenant shall pay VAT on the Rent at such higher or lower revised rate.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '10' : '9'}.</td>
-      <td>Utilities:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '10' : '9'}.</div>
+      <div class="clause-title">Utilities:</div>
+      <div class="clause-content">
         The Tenant shall pay for electricity consumed in their premises separately from the rent whether such electricity is supplied through the mains or through the Landlord's generator (if any) at the rate as shall be determined by the Landlord from time to time. All electricity will be sub-metered by the Landlord.<br><br>
         The Tenant shall not make any alterations or additions to the electrical equipment or appliances installed in the Demised Premises (even if the said equipment or appliances have been installed by the Tenant) without the prior written consent of the Landlord.<br><br>
         In the event the Tenant requires any riser or risers for the supply of the Tenant's electrical requirements the Tenant shall make written request therefor to the Landlord. The Landlord shall if in its sole judgement (which judgement will be final and binding upon the Tenant) decide whether or not to permit the installation of such riser or risers as are necessary and/or whether or not such riser or risers will cause damage or injury to the Mall or any part of it or to the electrical circuits to the Demised Premises or cause or create a dangerous or hazardous condition or entail extensive or unreasonable alterations repairs or expense. If the Landlord decides to permit such riser or risers, then the Tenant at the sole cost and expense of the Tenant and subject to the aforesaid terms and conditions also install in addition to such riser or risers all other equipment proper and necessary in connection therewith.<br><br>
         The Tenant shall procure the connection and provision of telephone, internet services and all other required utilities from the respective service providers of the Tenant's choice, and shall pay for telephone, water, internet and all such utilities to the respective service providers.<br><br>
         The Landlord shall not be responsible for the connection or provision of utilities and therefore, the Term or any of the Tenant's obligations under the Lease or this Letter of Offer shall not be affected by any delay or failure of provision of any of these utilities.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '11' : '10'}.</td>
-      <td>Security Deposit:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '11' : '10'}.</div>
+      <div class="clause-title">Security Deposit:</div>
+      <div class="clause-content">
         Together with the acceptance of this offer, the tenant will pay a Security Deposit of Rent and Service Charge in form of cash or bank guarantee and maintain with the landlord such Security during the Term of the Lease of a sum of Kenya Shillings ${formatCurrency(securityDepositValue)} (Ksh. ${formatCurrency(securityDepositValue)} /=) (equivalent to ${securityDepositMonths} month${securityDepositMonths !== 1 ? 's' : ''} rent and Service Charge.)<br><br>
         The deposit shall be retained by the landlord as security for the due performance by the tenant of its obligations under the lease.<br><br>
         The deposit will not be utilized by the tenant on account of the payment of rent, service charge or car park license fees for the last month (or longer period) of the term of lease.<br><br>
         During the period of the lease the deposit will be adjusted from time to time so that at no time during the term shall the rents payable be higher than the deposit held.<br><br>
         The deposit shall be refundable without interest to the tenant after expiry of the lease and return of the premises in accordance with the covenants contained in the lease.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '12' : '11'}.</td>
-      <td>User:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '12' : '11'}.</div>
+      <div class="clause-title">User:</div>
+      <div class="clause-content">
         The premises shall be used for the sole purpose as ${formatField(userPurpose, 'General Business Purpose')} and any change of user will not be permitted without the landlord's or its Agents prior approval.<br><br>
         The usage of the space will have to be in accordance with the design of the building.<br><br>
         The Tenant shall at all times during the Term comply with all Laws, Acts, Rules, Regulations or By-Laws now in force, or as shall be enacted, passed, made or issued by the Government of Kenya or any Municipal, Township, Local or other competent authority in relation to the occupation, conduct and user of the Premise AND obtain all such licenses consents certificates or approvals thereon.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '13' : '12'}.</td>
-      <td>Subletting:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '13' : '12'}.</div>
+      <div class="clause-title">Subletting:</div>
+      <div class="clause-content">
         The tenant will not be permitted to transfer, assign, sublet or part with possession of the premises. Upon breach of the covenant, the Landlord may re-enter the premises and there upon the lease shall be terminated absolutely.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '14' : '13'}.</td>
-      <td>Partitioning, Fixtures and Fittings:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '14' : '13'}.</div>
+      <div class="clause-title">Partitioning, Fixtures and Fittings:</div>
+      <div class="clause-content">
         The landlord shall grant vacant possession of the premises as a cold shell.<br><br>
         The Tenant shall obtain the Landlord's written approval of any proposed design and layout of the interior of the Premises.<br><br>
         Before commencing any alterations or improvements to the interior, the Tenant shall submit plans of the intended layout and design specifying the materials to be used to the Landlord for approval. The Tenant shall pay the Landlord and his consultants the cost of considering the proposed plan.<br><br>
@@ -469,119 +519,164 @@ export const generateCommercialOfferLetter = (data) => {
         <strong>Work Hours:</strong> All fit out works shall be done during the specific working hours of <strong>8:00 a.m. to 6:00 p.m.</strong> or such other extended period that may be agreed in writing by the Landlord.<br><br>
         Any damage to the building or part thereof and fixtures and fittings thereon forming the Mall, external or internal, (i.e., including but not limited to sidewalks, doors, slab, studs, drywall, ceiling, ductwork, electrical work, plumbing, plumbing fixtures, painting, etc.) caused by the Tenant and/or the Tenant's contractor or agents shall be repaired by the Landlord's contractor at the Tenant's expense and shall be payable forthwith by the Tenant.<br><br>
         All the costs of the improvements or alterations shall be borne by the Tenant.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '15' : '14'}.</td>
-      <td>Restrictions on Signs, Notices etc:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '15' : '14'}.</div>
+      <div class="clause-title">Restrictions on Signs, Notices etc:</div>
+      <div class="clause-content">
         The Landlord shall allow paint, affix or exhibit of any name or writing or any sign placard, advertisement in the landing or passage upon or outside any private entrance door to the Premises from the landings or passage giving access with the prior written consent of the Landlord.<br><br>
         The Tenant will supply the Landlord with the design, size, type, color and placing of such signboards and also pay all the respective local authority fees and levies if required.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '16' : '15'}.</td>
-      <td>Hours of Operation:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '16' : '15'}.</div>
+      <div class="clause-title">Hours of Operation:</div>
+      <div class="clause-content">
         The minimum hours of operation shall be 7.00 am to 9.00 pm seven (7) days a week throughout the lease term or such other extended hours specified by the Landlord from time to time. For clarity the Mall hours of operation herein would not stop the Tenant from operating prior or beyond those hours up to 24 Hours a day Seven Days a week.<br><br>
         The Tenant covenants to open for business to the public with the Premises fully furnished and stocked with merchandise on or before the Rent commencement date and thereafter, subject to temporary closures for casualty, condemnation or remodelling, that prevents the Tenant from conducting its normal business operations in the Premises, provided that, where the Tenant shall intend to close the business for a continuous period exceeding Fourteen (14) days, the Tenant shall notify the Landlord.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '17' : '16'}.</td>
-      <td>Use of Brand:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '17' : '16'}.</div>
+      <div class="clause-title">Use of Brand:</div>
+      <div class="clause-content">
         By accepting this letter of offer, the Tenant consents to the Landlord using its name and brand in the promotion of the Mall both to other potential tenants and to the market in general. The Tenant's prior approval on artwork shall be deemed to have been sought and obtained, and no further approvals shall be required during the Term.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '18' : '17'}.</td>
-      <td>Internal Repair:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '18' : '17'}.</div>
+      <div class="clause-title">Internal Repair:</div>
+      <div class="clause-content">
         The Tenant shall repair and maintain the Premises, including finishes, partitions, doors, windows and internal fixtures and fittings in a tenantable state of repair and condition, fair wear and tear excepted.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '19' : '18'}.</td>
-      <td>Insurance:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '19' : '18'}.</div>
+      <div class="clause-title">Insurance:</div>
+      <div class="clause-content">
         The Tenant shall at its own cost insure and keep insured the Premises and its personal contents and all the glass plates if any with a reputable underwriter to the full insurable value thereof. The Tenant shall also take out an employer's liability and public liability covers with a reputable underwriter to the full insurable value thereof.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '20' : '19'}.</td>
-      <td>Re-entry:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '20' : '19'}.</div>
+      <div class="clause-title">Re-entry:</div>
+      <div class="clause-content">
         If the rent agreed or any part thereof shall remain unpaid for fourteen (14) days after becoming payable (whether formally demanded or not) or if at any time thereafter the tenant in breach of any of the covenants or conditions referred to in the standard form lease, it will be lawful for the landlord to re- enter the premises or any part thereof in the name of the whole and thereupon the lease shall be terminated absolutely.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '21' : '20'}.</td>
-      <td>Possession:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '21' : '20'}.</div>
+      <div class="clause-title">Possession:</div>
+      <div class="clause-content">
         The Tenant shall only be granted possession of the Premises on acceptance of this Letter of Offer, execution of the Lease and payment of all the amounts reserved under this Letter of Offer. The Term and the provisions of this Letter of Offer and the Lease shall not be affected by any delay in executing and returning of this Letter of Offer or the Lease.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '22' : '21'}.</td>
-      <td>Standard Lease:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '22' : '21'}.</div>
+      <div class="clause-title">Standard Lease:</div>
+      <div class="clause-content">
         The Lease shall be in the Landlord's Standard Lease for the Property which shall be prepared by the Landlord's Advocates. Being a standard Lease for all premises on the Property, no material changes to the standard Lease shall be accepted or incorporated therein save for what is contained in this Letter of Offer.
-      </td>
-    </tr>
-    <tr>
-      <td>${fitOutPeriod ? '23' : '22'}.</td>
-      <td>Legal Fees and all Incidental Costs:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '23' : '22'}.</div>
+      <div class="clause-title">Legal Fees and all Incidental Costs:</div>
+      <div class="clause-content">
         All costs including Legal Fees to scale for the preparation of the Lease, Stamp Duty, registration fees and other related disbursements shall be borne by the Tenant and paid to the Landlord's Advocates on acceptance of the Letter of Offer and before execution of the Lease. The Legal Fees shall be assessed according to the Advocates (Remuneration) (Amendment) Order 2014.
-      </td>
-    </tr>
-    <tr>
-      <td></td>
-      <td></td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number"></div>
+      <div class="clause-title"></div>
+      <div class="clause-content">
         By accepting the terms of this letter of offer, the tenant is deemed to approve the standard form lease and agrees to execute and return the lease promptly and within seven days when it is submitted to the tenant together with its remittances to cover the Landlord's advocate's estimate of their charges for completion of the lease which is payable by the tenant immediately on demand.
-      </td>
-    </tr>
-    ${promotionExpenses ? `
-    <tr>
-      <td>${fitOutPeriod ? '24' : '23'}.</td>
-      <td>Promotional Expenses:</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  ${promotionExpenses ? `
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${fitOutPeriod ? '24' : '23'}.</div>
+      <div class="clause-title">Promotional Expenses:</div>
+      <div class="clause-content">
         In order to promote the Mall, the Landlord may arrange for certain advertising and promotional activities, the costs of which shall be apportioned among the Tenants of the Mall.<br><br>
         The promotion expenses shall be assessed by the Landlord and payable quarterly in advance and will be subject to adjustments at the end of each calendar year following an audit of the promotion fund by the Landlord.<br><br>
         The Tenant shall be informed of all activities prior to its implementation.<br><br>
         Upon the execution of the Lease, the Tenant shall pay the Initial Provisional Promotion Expenses in the manner provided for in the Lease.<br><br>
         Further details in relation to the Promotion Fund will be set out in the Lease.
-      </td>
-    </tr>
-    ` : ''}
-    <tr>
-      <td>${getClauseNumber(fitOutPeriod, promotionExpenses, 25)}.</td>
-      <td>Confidentiality</td>
-      <td>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${getClauseNumber(fitOutPeriod, promotionExpenses, 25)}.</div>
+      <div class="clause-title">Confidentiality</div>
+      <div class="clause-content">
         This offer is made in confidence. No terms shall be discussed with any third party save for the Lessor's and the Lessee's legal advisors who shall, in turn, be bound by this confidentiality clause.
-      </td>
-    </tr>
-    <tr>
-      <td>${getClauseNumber(fitOutPeriod, promotionExpenses, 26)}.</td>
-      <td>Security</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${getClauseNumber(fitOutPeriod, promotionExpenses, 26)}.</div>
+      <div class="clause-title">Security</div>
+      <div class="clause-content">
         The Lessor will provide day and night security services to the Centre.<br><br>
         The Lessee acknowledges and agrees that no warranty or guarantee is given by the Lessor in respect thereof and the Lessor, its agents and employees are under no liability whatsoever to the Lessee, the Lessee's agents, customers, visitors, licensees, guests, invitees or employees against injury, damage or loss (including loss of property, items or valuables) caused by burglary, theft or otherwise in the Premises.
-      </td>
-    </tr>
-    <tr>
-      <td>${getClauseNumber(fitOutPeriod, promotionExpenses, 28)}.</td>
-      <td>Governing Law</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${getClauseNumber(fitOutPeriod, promotionExpenses, 28)}.</div>
+      <div class="clause-title">Governing Law</div>
+      <div class="clause-content">
         This Offer Letter shall be governed by and construed in accordance with the laws of Kenya.
-      </td>
-    </tr>
-    <tr>
-      <td>${getClauseNumber(fitOutPeriod, promotionExpenses, 29)}.</td>
-      <td>Acceptance.</td>
-      <td>
+      </div>
+    </div>
+  </div>
+
+  <div class="clause-container">
+    <div class="clause-row">
+      <div class="clause-number">${getClauseNumber(fitOutPeriod, promotionExpenses, 29)}.</div>
+      <div class="clause-title">Acceptance.</div>
+      <div class="clause-content">
         The invitation will remain open for acceptance for a period of Seven (7) days from the date hereof, and may only be accepted on the following conditions. Acceptance shall be in writing and duly signed on this Letter of Offer and shall be effective only when the signed Letter together with the unconditional payment of the amounts specified here below are received within the said period of Seven (7) days failure to which this offer will lapse, unless the late acceptance of the offer is approved by Landlord:<br><br>
         <table class="payment-table">
           <tr>
@@ -625,9 +720,9 @@ export const generateCommercialOfferLetter = (data) => {
         <div class="list-item">e) Legal Fees.</div>
         <br>
         The Letter of Offer is not binding on the Landlord or at all until the Tenant has returned the same properly executed together with all the respective payments and the documents herein requested and the Landlord has accepted the same.
-      </td>
-    </tr>
-  </table>
+      </div>
+    </div>
+  </div>
 
   <p>Yours faithfully,</p>
 
