@@ -7,7 +7,8 @@ import {
   createIncome,
   previewPayment, // added
   updatePaymentReportWithIncome,
-  getPropertyArrears
+  getPropertyArrears,
+  getOutstandingInvoices
 } from '../controllers/paymentReport.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
@@ -22,6 +23,7 @@ router.route('/')
   .post(authorize('ADMIN', 'MANAGER'), createPaymentReport);
 
 router.get('/tenant/:tenantId', getPaymentsByTenant);
+router.get('/outstanding/:tenantId', getOutstandingInvoices);
 
 // Preview expected charges (useful for frontend before submitting)
 router.get('/preview/:tenantId', authorize('ADMIN', 'MANAGER'), previewPayment);

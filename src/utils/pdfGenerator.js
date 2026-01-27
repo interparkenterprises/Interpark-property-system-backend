@@ -1,28 +1,41 @@
 import puppeteer from 'puppeteer';
 
+let browserInstance = null;
+
 /**
- * Generate PDF from HTML using Puppeteer (proper HTML/CSS rendering)
- * @param {string} htmlContent 
- * @param {object} options 
- * @returns {Promise<Buffer>}
+ * Get or create browser instance
  */
-export const generatePDF = async (htmlContent, options = {}) => {
-  let browser;
-  try {
-    // Launch browser
-    browser = await puppeteer.launch({
+const getBrowser = async () => {
+  if (!browserInstance) {
+    browserInstance = await puppeteer.launch({
       headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote'
+      ],
+      timeout: 60000,
     });
+  }
+  return browserInstance;
+};
+
+export const generatePDF = async (htmlContent, options = {}) => {
+  let page;
+  try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
     
-    const page = await browser.newPage();
-    
-    // Set the HTML content
     await page.setContent(htmlContent, {
-      waitUntil: 'networkidle0'
+      waitUntil: 'load',
+      timeout: 30000
     });
+
+    await page.evaluateHandle('document.fonts.ready');
     
-    // Generate PDF
     const pdfBuffer = await page.pdf({
       format: 'A4',
       margin: {
@@ -35,14 +48,22 @@ export const generatePDF = async (htmlContent, options = {}) => {
       ...options
     });
     
-    await browser.close();
+    await page.close();
     return pdfBuffer;
     
   } catch (error) {
     console.error('PDF generation error:', error);
-    if (browser) {
-      await browser.close();
+    if (page && !page.isClosed()) {
+      await page.close();
     }
     throw new Error(`Failed to generate PDF: ${error.message}`);
+  }
+};
+
+// Optional: Cleanup function to close browser
+export const closeBrowser = async () => {
+  if (browserInstance) {
+    await browserInstance.close();
+    browserInstance = null;
   }
 };

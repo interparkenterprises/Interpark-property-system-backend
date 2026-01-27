@@ -453,15 +453,22 @@ export const recordBillInvoicePayment = async (req, res) => {
       newInvoiceStatus = 'OVERDUE';
     }
 
-    // Start transaction: update invoice + update bill + generate new invoice if partial payment
-    const [updatedInvoice, updatedBill, newInvoice] = await prisma.$transaction(async (tx) => {
-      // 1. Update this invoice
+    // Start transaction: update invoice + update bill
+    const [updatedInvoice, updatedBill] = await prisma.$transaction(async (tx) => {
+      // 1. Update this invoice with cumulative payment information
+      const paymentNote = notes 
+        ? `${notes} - Payment of Ksh ${amountPaid.toLocaleString()} recorded on ${parsedPaymentDate.toLocaleDateString()}`
+        : `Payment of Ksh ${amountPaid.toLocaleString()} recorded on ${parsedPaymentDate.toLocaleDateString()}`;
+      
       const updatedInvoice = await tx.billInvoice.update({
         where: { id },
         data: {
           amountPaid: finalAmountPaid,
           balance: newBalance,
           status: newInvoiceStatus,
+          notes: billInvoice.notes 
+            ? `${billInvoice.notes}\n${paymentNote}`
+            : paymentNote,
           updatedAt: new Date()
         },
         include: {
@@ -480,7 +487,6 @@ export const recordBillInvoicePayment = async (req, res) => {
       const billNewAmountPaid = billInvoice.bill.amountPaid + amountPaid;
       const billGrandTotal = Number(billInvoice.bill.grandTotal);
       const billFinalAmountPaid = Math.min(billNewAmountPaid, billGrandTotal);
-      const billNewBalance = Math.max(0, billGrandTotal - billFinalAmountPaid);
 
       let billNewStatus = billInvoice.bill.status;
       if (billFinalAmountPaid >= billGrandTotal) {
@@ -489,7 +495,7 @@ export const recordBillInvoicePayment = async (req, res) => {
         billNewStatus = 'PARTIAL';
       }
 
-      if (now > new Date(billInvoice.bill.dueDate) && billNewStatus !== 'PAID') {
+      if (billInvoice.bill.dueDate && now > new Date(billInvoice.bill.dueDate) && billNewStatus !== 'PAID') {
         billNewStatus = 'OVERDUE';
       }
 
@@ -498,58 +504,39 @@ export const recordBillInvoicePayment = async (req, res) => {
         data: {
           amountPaid: billFinalAmountPaid,
           status: billNewStatus,
-          paidAt: billNewStatus === 'PAID' ? new Date() : null
+          paidAt: billNewStatus === 'PAID' ? new Date() : billInvoice.bill.paidAt
         }
       });
 
-      // 3. If this is a partial payment and there's still balance, generate a new invoice for remaining balance
-      let newInvoice = null;
-      if (newBalance > 0 && newInvoiceStatus === 'PARTIAL') {
-        try {
-          const newInvoiceNumber = await generateBillInvoiceNumber();
-          const billReferenceNumber = `BILL-${billInvoice.billType}-${billInvoice.billId.substring(0, 8).toUpperCase()}`;
-
-          newInvoice = await tx.billInvoice.create({
-            data: {
-              invoiceNumber: newInvoiceNumber,
-              billId: billInvoice.billId,
-              billReferenceNumber,
-              billReferenceDate: billInvoice.bill.issuedAt,
-              tenantId: billInvoice.tenantId,
-              issueDate: new Date(),
-              dueDate: billInvoice.dueDate,
-              billType: billInvoice.billType,
-              previousReading: Number(billInvoice.previousReading) || 0,
-              currentReading: Number(billInvoice.currentReading) || 0,
-              units: Number(billInvoice.units) || 0,
-              chargePerUnit: Number(billInvoice.chargePerUnit) || 0,
-              totalAmount: Number(billInvoice.totalAmount) || 0,
-              vatRate: billInvoice.vatRate ? Number(billInvoice.vatRate) : null,
-              vatAmount: billInvoice.vatAmount ? Number(billInvoice.vatAmount) : null,
-              grandTotal: newBalance,
-              amountPaid: 0,
-              balance: newBalance,
-              status: 'UNPAID',
-              notes: `New invoice generated for remaining balance after partial payment`
-            }
-          });
-        } catch (invoiceError) {
-          console.error('Error generating new invoice for remaining balance:', invoiceError);
-          // Don't fail the transaction if new invoice generation fails
-        }
-      }
-
-      return [updatedInvoice, updatedBill, newInvoice];
+      return [updatedInvoice, updatedBill];
     });
 
-    res.status(201).json({
+    // 3. Regenerate PDF with updated payment information (OUTSIDE transaction)
+    let pdfUrl = null;
+    try {
+      const pdfBuffer = await generateBillInvoicePDF(updatedInvoice, billInvoice.bill.description);
+      pdfUrl = await uploadToStorage(pdfBuffer, `${updatedInvoice.invoiceNumber}.pdf`);
+      
+      // Update invoice with new PDF URL
+      await prisma.billInvoice.update({
+        where: { id: updatedInvoice.id },
+        data: { pdfUrl }
+      });
+    } catch (pdfError) {
+      console.error('Invoice PDF regeneration failed:', pdfError);
+      // Don't fail the payment if PDF generation fails
+    }
+
+    res.status(200).json({
       success: true,
       data: {
-        invoice: updatedInvoice,
-        bill: updatedBill,
-        newInvoice: newInvoice
+        invoice: {
+          ...updatedInvoice,
+          pdfUrl: pdfUrl || updatedInvoice.pdfUrl
+        },
+        bill: updatedBill
       },
-      message: 'Payment recorded successfully' + (newInvoice ? ' and new invoice generated for remaining balance' : '')
+      message: 'Payment recorded successfully and invoice updated'
     });
   } catch (error) {
     console.error('Error recording bill invoice payment:', error);
@@ -559,6 +546,7 @@ export const recordBillInvoicePayment = async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to record payment' });
   }
 };
+
 
 // @desc    Download bill invoice PDF
 // @route   GET /api/bill-invoices/:id/download

@@ -22,19 +22,21 @@ model User {
   createdOffers      OfferLetter[]
   dailyReports       DailyReport[]
   activationRequests ActivationRequest[]
+  demandLetters      DemandLetter[]
 }
 
 model Landlord {
-  id           String        @id @default(uuid())
-  name         String
-  email        String?
-  phone        String?
-  address      String?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  idNumber     String?
-  offerLetters OfferLetter[]
-  properties   Property[]
+  id            String         @id @default(uuid())
+  name          String
+  email         String?
+  phone         String?
+  address       String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  idNumber      String?
+  offerLetters  OfferLetter[]
+  properties    Property[]
+  demandLetters DemandLetter[]
 }
 
 model Property {
@@ -65,10 +67,11 @@ model Property {
   units              Unit[]
   dailyReports       DailyReport[]
   activationRequests ActivationRequest[]
+  demandLetters      DemandLetter[]
 }
 
 model ManagerCommission {
-  id               String           @id @default(uuid())
+  id               String             @id @default(uuid())
   propertyId       String
   managerId        String
   commissionFee    Float
@@ -76,36 +79,84 @@ model ManagerCommission {
   commissionAmount Float
   periodStart      DateTime
   periodEnd        DateTime
-  status           CommissionStatus @default(PENDING)
+  status           CommissionStatus   @default(PENDING)
   paidDate         DateTime?
   notes            String?
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
-  manager          User             @relation(fields: [managerId], references: [id])
-  property         Property         @relation(fields: [propertyId], references: [id])
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  manager          User               @relation(fields: [managerId], references: [id])
+  property         Property           @relation(fields: [propertyId], references: [id])
+  invoice          CommissionInvoice?
 
   @@unique([managerId, propertyId, periodStart, periodEnd])
   @@index([managerId, periodStart, periodEnd])
   @@index([propertyId, periodStart, periodEnd])
 }
 
+model CommissionInvoice {
+  id String @id @default(cuid())
+
+  invoiceNumber String   @unique
+  invoiceDate   DateTime @default(now())
+
+  // Relations
+  commissionId String            @unique // Add @unique for one-to-one
+  commission   ManagerCommission @relation(fields: [commissionId], references: [id], onDelete: Cascade)
+
+  // Header info
+  propertyName String
+  lrNumber     String?
+
+  landlordName    String
+  landlordAddress String?
+
+  // User entered
+  description String
+
+  // Money
+  collectionAmount Float
+  commissionRate   Float
+  commissionAmount Float
+  vatRate          Float @default(0)
+  vatAmount        Float @default(0)
+  totalAmount      Float
+
+  // Bank details (user input)
+  bankName      String
+  accountName   String
+  accountNumber String
+  branch        String?
+  bankCode      String?
+  swiftCode     String?
+  currency      String? @default("KES")
+
+  // Generated file
+  pdfUrl String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([commissionId])
+}
+
 model Unit {
-  id           String        @id @default(uuid())
-  propertyId   String
-  bedrooms     Int?
-  bathrooms    Int?
-  sizeSqFt     Int
-  type         String?
-  status       UnitStatus    @default(VACANT)
-  rentType     RentType
-  rentAmount   Float
-  floor        String?
-  unitNo       String?
-  unitType     UnitType
-  usage        String?
-  offerLetters OfferLetter[]
-  tenant       Tenant?
-  property     Property      @relation(fields: [propertyId], references: [id])
+  id            String         @id @default(uuid())
+  propertyId    String
+  bedrooms      Int?
+  bathrooms     Int?
+  sizeSqFt      Int
+  type          String?
+  status        UnitStatus     @default(VACANT)
+  rentType      RentType
+  rentAmount    Float
+  floor         String?
+  unitNo        String?
+  unitType      UnitType
+  usage         String?
+  offerLetters  OfferLetter[]
+  tenant        Tenant?
+  property      Property       @relation(fields: [propertyId], references: [id])
+  demandLetters DemandLetter[]
 }
 
 model Tenant {
@@ -135,6 +186,7 @@ model Tenant {
   paymentReports      PaymentReport[]
   serviceCharge       ServiceCharge?
   unit                Unit                 @relation(fields: [unitId], references: [id])
+  demandLetters       DemandLetter[]
 }
 
 model ServiceCharge {
@@ -199,14 +251,15 @@ model Invoice {
   notes           String?
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
-  paymentPolicy   PaymentPolicy?  // Added this field
+  paymentPolicy   PaymentPolicy? // Added this field
   paymentReport   PaymentReport? @relation(fields: [paymentReportId], references: [id])
   tenant          Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  demandLetters   DemandLetter[]
 
   @@index([tenantId])
   @@index([invoiceNumber])
   @@index([status])
-  @@index([paymentPolicy])  // Added index for paymentPolicy
+  @@index([paymentPolicy]) // Added index for paymentPolicy
 }
 
 model BillInvoice {
@@ -238,13 +291,13 @@ model BillInvoice {
   bill                Bill           @relation(fields: [billId], references: [id], onDelete: Cascade)
   paymentReport       PaymentReport? @relation(fields: [paymentReportId], references: [id])
   tenant              Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Removed: @@index([paymentPolicy])  // Added index for paymentPolicy
 
   @@index([billId])
   @@index([tenantId])
   @@index([invoiceNumber])
   @@index([status])
   @@index([billReferenceNumber])
- // Removed: @@index([paymentPolicy])  // Added index for paymentPolicy
 }
 
 model ServiceProvider {
@@ -441,14 +494,14 @@ model ActivationRequest {
   managerId     String
 
   // Part 1 - Client Information (Required for template)
-  companyName   String
-  postalAddress String
-  telephone     String
-  contactPerson String
+  companyName        String
+  postalAddress      String
+  telephone          String
+  contactPerson      String
   alternativeContact String?
-  designation   String
-  email         String
-  mobileNo      String
+  designation        String
+  email              String
+  mobileNo           String
 
   // Part 2 - Description of Activation/Exhibition (Required for template)
   startDate        DateTime
@@ -458,7 +511,7 @@ model ActivationRequest {
   activationType   String
   description      String?
   expectedVisitors Int?
-  soundSystem      Boolean @default(false)
+  soundSystem      Boolean  @default(false)
 
   // Part 3 - Cost of Activation/Exhibition (Required for template)
   licenseFeePerDay Float?
@@ -479,15 +532,14 @@ model ActivationRequest {
   managerDesignation String? // Manager's designation
 
   // Document Management
-  documentUrl   String? // Generated PDF URL
-  status        ActivationStatus @default(DRAFT)
-  
+  documentUrl String? // Generated PDF URL
+  status      ActivationStatus @default(DRAFT)
 
   // Timestamps (Used in template)
   submittedAt DateTime?
   approvedAt  DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   // Signature Information
   signatureDate DateTime?
@@ -528,6 +580,71 @@ model News {
   title       String
   content     String
   publishedAt DateTime @default(now())
+}
+
+model DemandLetter {
+  id            String   @id @default(uuid())
+  letterNumber  String   @unique
+  tenantId      String
+  propertyId    String
+  landlordId    String
+  unitId        String
+  invoiceId     String? // Link to specific invoice
+  generatedById String? // User who generated the letter
+  issueDate     DateTime @default(now())
+
+  // Letter-specific data
+  outstandingAmount  Float
+  rentalPeriod       String // e.g., "Month of June 2025"
+  dueDate            DateTime // Date when payment was due
+  demandPeriod       String? // e.g., "7 days"
+  partialPayment     Float?         @default(0)
+  partialPaymentDate DateTime?
+  generatedAt        DateTime? // When PDF was generated
+  paymentPolicy      PaymentPolicy? // Link to tenant's payment policy
+
+  // Contact information
+  landlordContact String? // Auto-filled from landlord
+  tenantContact   String? // Auto-filled from tenant
+
+  // References
+  referenceNumber    String?
+  previousInvoiceRef String? // Reference to original invoice
+
+  // Status
+  status DemandLetterStatus @default(DRAFT)
+
+  // Document
+  documentUrl String? // Generated PDF URL
+  notes       String?
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+  property    Property @relation(fields: [propertyId], references: [id])
+  landlord    Landlord @relation(fields: [landlordId], references: [id])
+  unit        Unit     @relation(fields: [unitId], references: [id])
+  invoice     Invoice? @relation(fields: [invoiceId], references: [id])
+  generatedBy User?    @relation(fields: [generatedById], references: [id])
+
+  @@index([tenantId])
+  @@index([propertyId])
+  @@index([landlordId])
+  @@index([status])
+  @@index([issueDate])
+  @@index([generatedById])
+}
+
+enum DemandLetterStatus {
+  DRAFT
+  GENERATED
+  SENT
+  ACKNOWLEDGED
+  SETTLED
+  ESCALATED
 }
 
 enum Role {

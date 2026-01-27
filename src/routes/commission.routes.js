@@ -8,7 +8,9 @@ import {
   updateCommissionStatus,
   getCommissionsByProperty,
   markAsProcessing,
-  markAsPaid
+  markAsPaid,
+  generateCommissionInvoice,
+  downloadCommissionInvoice,
 } from '../controllers/commission.controller.js';
 
 const router = express.Router();
@@ -35,5 +37,9 @@ router.patch('/:id', authorize('ADMIN'), updateCommissionStatus);
 router.patch('/:id/processing', authorize('ADMIN', 'MANAGER'), markAsProcessing);
 // Mark commission as paid
 router.patch('/:id/paid', authorize('ADMIN', 'MANAGER'), markAsPaid);
+// Generate commission invoice PDF
+router.post('/:id/commission-invoice', authorize('ADMIN', 'MANAGER'), generateCommissionInvoice);
 
+//Download commission invoice PDF
+router.get('/:id/commission-invoice/download', authorize('ADMIN', 'MANAGER'), downloadCommissionInvoice);
 export default router;

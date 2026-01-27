@@ -62,9 +62,9 @@ export const generateInvoice = async (req, res) => {
     
     // Calculate VAT based on tenant's VAT configuration
     let vat = 0;
-    let vatRate = tenant.vatRate || 0;
-    
-    if (vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
+    let vatRate = 16; // Changed from tenant.vatRate || 0 to fixed 16%
+        
+    if (tenant.vatType !== 'NOT_APPLICABLE') {
       if (tenant.vatType === 'INCLUSIVE') {
         // VAT is already included in the rent amount
         // Extract VAT from the subtotal: VAT = subtotal - (subtotal / (1 + vatRate/100))
@@ -74,7 +74,7 @@ export const generateInvoice = async (req, res) => {
         vat = (subtotal * vatRate) / 100;
       }
     }
-    
+
     // Use payment report VAT if provided, otherwise use calculated VAT
     vat = paymentReport?.vat !== undefined ? paymentReport.vat : vat;
 

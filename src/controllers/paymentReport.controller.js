@@ -69,14 +69,14 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
   // Calculate VAT based on tenant's VAT configuration
   let vat = 0;
   let baseAmount = expectedRent + serviceCharge;
-  
+  const vatRate = 16; // Fixed 16% VAT rate
+
   if (tenant.vatType === 'EXCLUSIVE') {
     // VAT is added on top of rent + service charge
-    vat = baseAmount * (tenant.vatRate || 0) / 100;
+    vat = baseAmount * vatRate / 100;
   } else if (tenant.vatType === 'INCLUSIVE') {
     // VAT is already included in the rent amount
     // Extract VAT from the inclusive amount: VAT = Amount × (VAT Rate / (100 + VAT Rate))
-    const vatRate = tenant.vatRate || 0;
     vat = baseAmount * (vatRate / (100 + vatRate));
     // Note: The rent already includes VAT, so we don't add it to totalDue
   } else {
@@ -299,388 +299,585 @@ export const getPaymentsByTenant = async (req, res) => {
   }
 };
 
-// @desc    Create payment report
+// @desc    Get outstanding invoices for a tenant
+// @route   GET /api/payments/outstanding/:tenantId
+// @access  Private
+export const getOutstandingInvoices = async (req, res) => {
+  try {
+    const { tenantId } = req.params;
+    const { includeBills = true } = req.query;
+
+    // Get unpaid/partial rent invoices
+    const rentInvoices = await prisma.invoice.findMany({
+      where: {
+        tenantId,
+        status: {
+          in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+        }
+      },
+      orderBy: { dueDate: 'asc' },
+      select: {
+        id: true,
+        invoiceNumber: true,
+        issueDate: true,
+        dueDate: true,
+        paymentPeriod: true,
+        paymentPolicy: true,
+        rent: true,
+        serviceCharge: true,
+        vat: true,
+        totalDue: true,
+        amountPaid: true,
+        balance: true,
+        status: true,
+        pdfUrl: true
+      }
+    });
+
+    let billInvoices = [];
+    if (includeBills) {
+      // Get unpaid/partial bill invoices
+      billInvoices = await prisma.billInvoice.findMany({
+        where: {
+          tenantId,
+          status: {
+            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+          }
+        },
+        orderBy: { dueDate: 'asc' },
+        select: {
+          id: true,
+          invoiceNumber: true,
+          issueDate: true,
+          dueDate: true,
+          billType: true,
+          billReferenceNumber: true,
+          grandTotal: true,
+          amountPaid: true,
+          balance: true,
+          status: true,
+          pdfUrl: true
+        }
+      });
+    }
+
+    // Calculate totals
+    const totalRentBalance = rentInvoices.reduce((sum, inv) => sum + inv.balance, 0);
+    const totalBillBalance = billInvoices.reduce((sum, bi) => sum + bi.balance, 0);
+    const totalOutstanding = totalRentBalance + totalBillBalance;
+
+    res.json({
+      success: true,
+      data: {
+        rentInvoices,
+        billInvoices,
+        totals: {
+          totalRentBalance,
+          totalBillBalance,
+          totalOutstanding,
+          invoiceCount: rentInvoices.length,
+          billInvoiceCount: billInvoices.length
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching outstanding invoices:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch outstanding invoices' 
+    });
+  }
+};
+
+// @desc    Create payment report (Invoice-based)
 // @route   POST /api/payments
 // @access  Private (ADMIN, MANAGER)
 export const createPaymentReport = async (req, res) => {
+  let transactionResult = null;
+  
   try {
     const { 
       tenantId, 
-      amountPaid, 
-      paymentPeriod, 
-      notes, 
-      billIds,
-      createRentInvoice = true,
-      rentInvoiceDueDate,
-      autoGenerateBalanceInvoice = false
+      amountPaid,
+      invoiceIds = [], // Array of invoice IDs being paid
+      billInvoiceIds = [], // Array of bill invoice IDs being paid
+      notes,
+      paymentPeriod,
+      autoGenerateBalanceInvoice = false,
+      createMissingInvoices = false,
+      updateExistingInvoices = true // NEW: Flag to update existing invoices
     } = req.body;
 
     // Input validation
     if (!tenantId) {
-      return res.status(400).json({ success: false, message: 'tenantId is required' });
+      return res.status(400).json({ 
+        success: false, 
+        message: 'tenantId is required' 
+      });
     }
-    if (amountPaid == null || isNaN(amountPaid)) {
-      return res.status(400).json({ success: false, message: 'Valid amountPaid is required' });
+
+    if (amountPaid == null || isNaN(amountPaid) || parseFloat(amountPaid) < 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Valid non-negative amountPaid is required' 
+      });
     }
 
     const parsedAmountPaid = parseFloat(amountPaid);
-    if (parsedAmountPaid < 0) {
-      return res.status(400).json({ success: false, message: 'amountPaid cannot be negative' });
-    }
 
     // Validate paymentPeriod date format
     let paymentPeriodDate = null;
     if (paymentPeriod) {
       paymentPeriodDate = new Date(paymentPeriod);
       if (isNaN(paymentPeriodDate.getTime())) {
-        return res.status(400).json({ success: false, message: 'Invalid paymentPeriod date format' });
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Invalid paymentPeriod date format' 
+        });
       }
     }
 
-    // 1. Fetch tenant + property (outside transaction)
+    // 1. Fetch tenant with related data
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
         unit: {
           include: {
             property: {
-              select: { id: true, name: true, managerId: true }
+              select: { 
+                id: true, 
+                name: true, 
+                managerId: true,
+                commissionFee: true 
+              }
             }
           }
-        }
+        },
+        serviceCharge: true
       }
     });
 
     if (!tenant) {
-      return res.status(404).json({ success: false, message: 'Tenant not found' });
-    }
-    if (!tenant.unit?.propertyId) {
-      return res.status(400).json({ success: false, message: 'Tenant must be assigned to a unit with a property' });
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Tenant not found' 
+      });
     }
 
-    // 2. Compute expected charges (outside transaction)
-    const expected = await computeExpectedCharges(
-      tenantId,
-      paymentPeriodDate
-    );
+    // 2. Process invoices being paid
+    let invoicesToProcess = [];
+    let billInvoicesToProcess = [];
+    let totalInvoiceBalance = 0;
+    let paymentPolicy = tenant.paymentPolicy; // Default to tenant's policy
+    let paymentPeriodStr = paymentPeriodDate ? 
+      paymentPeriodDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 
+      new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    
+    // If invoiceIds provided, fetch those specific invoices
+    if (invoiceIds && invoiceIds.length > 0) {
+      invoicesToProcess = await prisma.invoice.findMany({
+        where: {
+          id: { in: invoiceIds },
+          tenantId: tenantId,
+          status: {
+            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+          }
+        },
+        orderBy: { dueDate: 'asc' } // Pay oldest first
+      });
 
-    const arrears = parseFloat((expected.totalDue - parsedAmountPaid).toFixed(2));
-    const status = parsedAmountPaid >= expected.totalDue
-      ? 'PAID'
-      : parsedAmountPaid > 0
-        ? 'PARTIAL'
-        : 'UNPAID';
-
-    // 3. Generate invoice numbers BEFORE transaction to reduce transaction time
-    let invoiceNumber = null;
-    let balanceInvoiceNumber = null;
-    
-    if (createRentInvoice) {
-      invoiceNumber = await generateInvoiceNumber();
-    }
-    
-    if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice) {
-      balanceInvoiceNumber = await generateInvoiceNumber();
-    }
-    
-    // 4. Generate bill invoice numbers if needed (outside transaction)
-    let billInvoiceNumbers = [];
-    if (billIds && Array.isArray(billIds) && billIds.length > 0) {
-      for (let i = 0; i < billIds.length; i++) {
-        const number = await generateBillInvoiceNumber();
-        billInvoiceNumbers.push(number);
+      if (invoicesToProcess.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'No unpaid/partial invoices found for the provided IDs'
+        });
       }
+
+      // Calculate total balance from selected invoices
+      totalInvoiceBalance = invoicesToProcess.reduce((sum, inv) => sum + inv.balance, 0);
+      
+      // Use payment policy from first invoice if available
+      paymentPolicy = invoicesToProcess[0].paymentPolicy || tenant.paymentPolicy;
+      paymentPeriodStr = invoicesToProcess[0].paymentPeriod || paymentPeriodStr;
+      
+      console.log(`Processing ${invoicesToProcess.length} invoices with total balance: ${totalInvoiceBalance}`);
     }
 
-    // 5. Format payment period string for display (outside transaction)
-    const paymentPeriodStr = expected.periodStart.toLocaleDateString('en-US', { 
-      month: 'long', 
-      year: 'numeric' 
-    });
+    // If billInvoiceIds provided, fetch those specific bill invoices
+    if (billInvoiceIds && billInvoiceIds.length > 0) {
+      billInvoicesToProcess = await prisma.billInvoice.findMany({
+        where: {
+          id: { in: billInvoiceIds },
+          tenantId: tenantId,
+          status: {
+            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+          }
+        },
+        orderBy: { dueDate: 'asc' }
+      });
 
-    // Calculate invoice due dates (outside transaction)
-    const issueDate = new Date();
-    const dueDate = rentInvoiceDueDate ? new Date(rentInvoiceDueDate) : new Date(issueDate.setDate(issueDate.getDate() + 30));
-    
-    let balanceDueDate = null;
-    if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice) {
-      const balanceIssueDate = new Date();
-      balanceDueDate = rentInvoiceDueDate 
-        ? new Date(rentInvoiceDueDate) 
-        : new Date(balanceIssueDate.setDate(balanceIssueDate.getDate() + 30));
+      const totalBillInvoiceBalance = billInvoicesToProcess.reduce((sum, bi) => sum + bi.balance, 0);
+      totalInvoiceBalance += totalBillInvoiceBalance;
+      
+      console.log(`Processing ${billInvoicesToProcess.length} bill invoices with total balance: ${totalBillInvoiceBalance}`);
     }
 
-    // 6. Now run the transaction with pre-generated numbers and increased timeout
-    const result = await prisma.$transaction(async (tx) => {
-      // 6.1 Create PaymentReport
-      const report = await tx.paymentReport.create({
+    // If no specific invoices provided and createMissingInvoices is true, create new invoice
+    if (invoiceIds.length === 0 && billInvoiceIds.length === 0 && createMissingInvoices) {
+      const expected = await computeExpectedCharges(
+        tenantId,
+        paymentPeriodDate
+      );
+      
+      // Generate invoice number
+      const invoiceNumber = await generateInvoiceNumber();
+      
+      // Create invoice for current period
+      const newInvoice = await prisma.invoice.create({
         data: {
+          invoiceNumber,
           tenantId,
+          issueDate: new Date(),
+          dueDate: paymentPeriodDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          paymentPeriod: expected.periodStart.toLocaleDateString('en-US', { 
+            month: 'long', 
+            year: 'numeric' 
+          }),
           rent: expected.rent,
           serviceCharge: expected.serviceCharge,
           vat: expected.vat,
           totalDue: expected.totalDue,
+          amountPaid: 0,
+          balance: expected.totalDue,
+          status: 'UNPAID',
+          paymentPolicy: tenant.paymentPolicy,
+          notes: `Auto-generated for payment recording`
+        }
+      });
+      
+      invoicesToProcess = [newInvoice];
+      totalInvoiceBalance = expected.totalDue;
+      paymentPeriodStr = newInvoice.paymentPeriod;
+      console.log(`Created new invoice for payment: ${newInvoice.invoiceNumber}`);
+    }
+
+    // 3. Validate payment amount
+    if (parsedAmountPaid > totalInvoiceBalance) {
+      return res.status(400).json({
+        success: false,
+        message: `Payment amount (${parsedAmountPaid}) exceeds total invoice balance (${totalInvoiceBalance})`,
+        data: {
+          totalInvoiceBalance,
+          paymentAmount: parsedAmountPaid,
+          difference: parsedAmountPaid - totalInvoiceBalance
+        }
+      });
+    }
+
+    // 4. Calculate frequency based on payment policy
+    let frequency = 'MONTHLY'; // Default
+    switch (paymentPolicy) {
+      case 'QUARTERLY':
+        frequency = 'QUARTERLY';
+        break;
+      case 'ANNUAL':
+        frequency = 'ANNUAL';
+        break;
+      case 'MONTHLY':
+      default:
+        frequency = 'MONTHLY';
+    }
+
+    // 5. Process payment in transaction with increased timeout
+    transactionResult = await prisma.$transaction(async (tx) => {
+      // Create PaymentReport
+      const report = await tx.paymentReport.create({
+        data: {
+          tenantId,
+          rent: invoicesToProcess.reduce((sum, inv) => sum + inv.rent, 0),
+          serviceCharge: invoicesToProcess.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
+          vat: invoicesToProcess.reduce((sum, inv) => sum + (inv.vat || 0), 0),
+          totalDue: invoicesToProcess.reduce((sum, inv) => sum + inv.totalDue, 0),
           amountPaid: parsedAmountPaid,
-          arrears,
-          status,
-          paymentPeriod: expected.periodStart,
+          arrears: Math.max(0, totalInvoiceBalance - parsedAmountPaid),
+          status: parsedAmountPaid >= totalInvoiceBalance ? 'PAID' : 
+                  parsedAmountPaid > 0 ? 'PARTIAL' : 'UNPAID',
+          paymentPeriod: paymentPeriodDate || new Date(),
           datePaid: new Date(),
           notes: notes || null
-        },
-        include: {
-          tenant: {
-            select: {
-              id: true,
-              fullName: true,
-              contact: true,
-              vatType: true,
-              vatRate: true,
-              escalationRate: true,
-              escalationFrequency: true,
-              unit: {
-                include: {
-                  property: {
-                    select: { id: true, name: true }
-                  }
-                }
-              }
-            }
-          }
         }
       });
 
-      // 6.2 Create Rent Invoice if requested
-      let rentInvoice = null;
-      if (createRentInvoice && invoiceNumber) {
-        const rentBalance = arrears > 0 ? arrears : 0;
-
-        rentInvoice = await tx.invoice.create({
-          data: {
-            invoiceNumber,
-            tenantId,
-            paymentReportId: report.id,
-            issueDate: new Date(),
-            dueDate,
-            paymentPeriod: paymentPeriodStr,
-            rent: expected.rent,
-            serviceCharge: expected.serviceCharge || 0,
-            vat: expected.vat || 0,
-            totalDue: expected.totalDue,
-            amountPaid: parsedAmountPaid,
-            balance: rentBalance,
-            status: status === 'PAID' ? 'PAID' : status === 'PARTIAL' ? 'PARTIAL' : 'UNPAID',
-            notes: notes || null
-          }
-        });
+      // NEW: Update existing invoices if flag is true
+      let invoiceUpdateResult = null;
+      if (updateExistingInvoices && (parsedAmountPaid > 0)) {
+        invoiceUpdateResult = await updateExistingInvoicesForPayment(
+          tx,
+          tenantId,
+          paymentPeriodStr,
+          parsedAmountPaid,
+          report.id,
+          paymentPeriodDate || new Date(),
+          parsedAmountPaid >= totalInvoiceBalance ? 'PAID' : 
+            parsedAmountPaid > 0 ? 'PARTIAL' : 'UNPAID'
+        );
+        
+        console.log(`Updated ${invoiceUpdateResult.updatedInvoices.length} existing invoices, applied ${invoiceUpdateResult.totalApplied} to existing invoices`);
       }
 
-      // 6.3 Auto-generate balance invoice if payment is partial
-      let balanceInvoice = null;
-      if (status === 'PARTIAL' && arrears > 0 && autoGenerateBalanceInvoice && balanceInvoiceNumber && balanceDueDate) {
-        balanceInvoice = await tx.invoice.create({
+      // Apply payment to invoices (if any remaining payment after updating existing invoices)
+      let remainingPayment = invoiceUpdateResult ? 
+        (parsedAmountPaid - invoiceUpdateResult.totalApplied) : 
+        parsedAmountPaid;
+      
+      const updatedInvoices = [];
+      const updatedBillInvoices = [];
+
+      // Process specified rent invoices (if payment still remaining)
+      for (const invoice of invoicesToProcess) {
+        if (remainingPayment <= 0) break;
+        
+        // Check if this invoice was already updated by updateExistingInvoicesForPayment
+        const alreadyUpdated = invoiceUpdateResult?.updatedInvoices?.find(
+          ui => ui.id === invoice.id
+        );
+        
+        if (alreadyUpdated) {
+          // Skip, already updated
+          updatedInvoices.push({
+            id: invoice.id,
+            invoiceNumber: invoice.invoiceNumber,
+            ...alreadyUpdated
+          });
+          continue;
+        }
+        
+        const paymentToApply = Math.min(invoice.balance, remainingPayment);
+        const newAmountPaid = invoice.amountPaid + paymentToApply;
+        const newBalance = invoice.balance - paymentToApply;
+        
+        let newStatus = invoice.status;
+        if (newBalance <= 0) {
+          newStatus = 'PAID';
+        } else if (paymentToApply > 0) {
+          newStatus = 'PARTIAL';
+        }
+
+        const updatedInvoice = await tx.invoice.update({
+          where: { id: invoice.id },
           data: {
-            invoiceNumber: balanceInvoiceNumber,
-            tenantId,
+            amountPaid: newAmountPaid,
+            balance: newBalance,
+            status: newStatus,
             paymentReportId: report.id,
-            issueDate: new Date(),
-            dueDate: balanceDueDate,
-            paymentPeriod: paymentPeriodStr,
-            rent: expected.rent,
-            serviceCharge: expected.serviceCharge || 0,
-            vat: expected.vat || 0,
-            totalDue: arrears,
-            amountPaid: 0,
-            balance: arrears,
-            status: 'UNPAID',
-            notes: `Balance invoice for partial payment of ${paymentPeriodStr}`
+            updatedAt: new Date()
           }
         });
+
+        updatedInvoices.push(updatedInvoice);
+        remainingPayment -= paymentToApply;
       }
 
-      // 6.4 Create Income
+      // Process specified bill invoices
+      for (const billInvoice of billInvoicesToProcess) {
+        if (remainingPayment <= 0) break;
+        
+        const paymentToApply = Math.min(billInvoice.balance, remainingPayment);
+        const newAmountPaid = billInvoice.amountPaid + paymentToApply;
+        const newBalance = billInvoice.balance - paymentToApply;
+        
+        let newStatus = billInvoice.status;
+        if (newBalance <= 0) {
+          newStatus = 'PAID';
+        } else if (paymentToApply > 0) {
+          newStatus = 'PARTIAL';
+        }
+
+        const updatedBillInvoice = await tx.billInvoice.update({
+          where: { id: billInvoice.id },
+          data: {
+            amountPaid: newAmountPaid,
+            balance: newBalance,
+            status: newStatus,
+            paymentReportId: report.id,
+            updatedAt: new Date()
+          }
+        });
+
+        updatedBillInvoices.push(updatedBillInvoice);
+        remainingPayment -= paymentToApply;
+      }
+
+      // Create Income record
       const income = await tx.income.create({
         data: {
           propertyId: tenant.unit.propertyId,
           tenantId,
           amount: parsedAmountPaid,
-          frequency: 'MONTHLY'
+          frequency: frequency // Use calculated frequency
         }
       });
 
-      // 6.5 Create Bill Invoices if bill IDs provided
-      let createdBillInvoices = [];
-      if (billIds && Array.isArray(billIds) && billIds.length > 0 && billInvoiceNumbers.length === billIds.length) {
-        // Fetch bills in batch
-        const bills = await tx.bill.findMany({
-          where: {
-            id: { in: billIds },
-            tenantId
-          }
-        });
-
-        // Create bill invoices in parallel using Promise.all for better performance
-        const billInvoicePromises = bills.map(async (bill, index) => {
-          const billInvoiceNumber = billInvoiceNumbers[index];
-          
-          const billIssueDate = new Date();
-          const billDueDate = bill.dueDate || new Date(billIssueDate.setDate(billIssueDate.getDate() + 30));
-
-          const billBalance = parseFloat((bill.grandTotal - bill.amountPaid).toFixed(2));
-          const billStatus = bill.amountPaid >= bill.grandTotal
-            ? 'PAID'
-            : bill.amountPaid > 0
-              ? 'PARTIAL'
-              : 'UNPAID';
-
-          const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
-
-          return await tx.billInvoice.create({
+      // Auto-generate balance invoice for partial payments if requested
+      let balanceInvoice = null;
+      const finalRemainingBalance = totalInvoiceBalance - (parsedAmountPaid - (invoiceUpdateResult?.totalApplied || 0));
+      
+      if (autoGenerateBalanceInvoice && finalRemainingBalance > 0) {
+        const balanceInvoiceNumber = await generateInvoiceNumber();
+        
+        // Use the first invoice as template for balance invoice
+        const templateInvoice = invoicesToProcess.length > 0 ? invoicesToProcess[0] : null;
+        
+        if (templateInvoice) {
+          balanceInvoice = await tx.invoice.create({
             data: {
-              invoiceNumber: billInvoiceNumber,
-              billId: bill.id,
-              billReferenceNumber,
-              billReferenceDate: bill.issuedAt,
+              invoiceNumber: balanceInvoiceNumber,
               tenantId,
               paymentReportId: report.id,
               issueDate: new Date(),
-              dueDate: billDueDate,
-              billType: bill.type,
-              previousReading: bill.previousReading,
-              currentReading: bill.currentReading,
-              units: bill.units,
-              chargePerUnit: bill.chargePerUnit,
-              totalAmount: bill.totalAmount,
-              vatRate: bill.vatRate,
-              vatAmount: bill.vatAmount,
-              grandTotal: bill.grandTotal,
-              amountPaid: bill.amountPaid,
-              balance: billBalance,
-              status: billStatus,
-              notes: notes || null
+              dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+              paymentPeriod: templateInvoice.paymentPeriod,
+              rent: templateInvoice.rent,
+              serviceCharge: templateInvoice.serviceCharge,
+              vat: templateInvoice.vat,
+              totalDue: finalRemainingBalance,
+              amountPaid: 0,
+              balance: finalRemainingBalance,
+              status: 'UNPAID',
+              paymentPolicy: paymentPolicy,
+              notes: `Balance invoice for partial payment of ${templateInvoice.paymentPeriod}`
             }
           });
-        });
-
-        createdBillInvoices = await Promise.all(billInvoicePromises);
+        }
       }
 
-      // 6.6 Process commission (consider using a simpler/optimized version)
-      const commission = await processCommissionForIncome(tx, income.id);
+      // Process commission INSIDE transaction but simplified
+      let commission = null;
+      if (tenant.unit?.property?.commissionFee && tenant.unit?.property?.commissionFee > 0) {
+        const commissionAmount = (parsedAmountPaid * tenant.unit.property.commissionFee) / 100;
+        
+        // Determine period based on payment frequency
+        const periodStart = new Date();
+        let periodEnd = new Date();
+        
+        switch (frequency) {
+          case 'QUARTERLY':
+            periodEnd.setMonth(periodEnd.getMonth() + 3);
+            break;
+          case 'ANNUAL':
+            periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+            break;
+          case 'MONTHLY':
+          default:
+            periodEnd.setMonth(periodEnd.getMonth() + 1);
+            break;
+        }
 
-      return { 
-        report, 
-        income, 
-        commission, 
-        rentInvoice, 
-        billInvoices: createdBillInvoices,
-        balanceInvoice
+        commission = await tx.managerCommission.create({
+          data: {
+            propertyId: tenant.unit.propertyId,
+            managerId: tenant.unit.property.managerId,
+            commissionFee: tenant.unit.property.commissionFee,
+            incomeAmount: parsedAmountPaid,
+            commissionAmount: commissionAmount,
+            periodStart: periodStart,
+            periodEnd: periodEnd,
+            status: 'PENDING'
+          }
+        });
+      }
+
+      return {
+        report,
+        income,
+        commission,
+        updatedInvoices: [
+          ...(invoiceUpdateResult?.updatedInvoices || []),
+          ...updatedInvoices
+        ],
+        updatedBillInvoices,
+        balanceInvoice,
+        invoiceUpdateResult,
+        tenant
       };
     }, {
       // Increased transaction timeout
-      maxWait: 15000, // Maximum time to wait for a transaction
-      timeout: 60000, // Increase timeout to 60 seconds
+      maxWait: 20000,
+      timeout: 60000,
     });
 
-    // Format response
-    const formattedReport = {
-      id: result.report.id,
-      tenantId: result.report.tenantId,
-      rent: result.report.rent,
-      serviceCharge: result.report.serviceCharge,
-      vat: result.report.vat,
-      vatType: result.report.tenant.vatType,
-      vatRate: result.report.tenant.vatRate,
-      totalDue: result.report.totalDue,
-      amountPaid: result.report.amountPaid,
-      arrears: result.report.arrears,
-      status: result.report.status,
-      paymentPeriod: result.report.paymentPeriod,
-      datePaid: result.report.datePaid,
-      notes: result.report.notes,
-      createdAt: result.report.createdAt,
-      updatedAt: result.report.updatedAt,
-      tenant: {
-        id: result.report.tenant.id,
-        fullName: result.report.tenant.fullName,
-        contact: result.report.tenant.contact,
-        vatType: result.report.tenant.vatType,
-        vatRate: result.report.tenant.vatRate,
-        unit: {
-          property: {
-            id: result.report.tenant.unit.property.id,
-            name: result.report.tenant.unit.property.name
-          }
-        }
-      }
-    };
-
+    // 7. Format response
     res.status(201).json({
       success: true,
-      data: formattedReport,
-      income: {
-        id: result.income.id,
-        propertyId: result.income.propertyId,
-        tenantId: result.income.tenantId,
-        amount: result.income.amount,
-        frequency: result.income.frequency,
-        createdAt: result.income.createdAt
+      data: {
+        paymentReport: {
+          id: transactionResult.report.id,
+          tenantId: transactionResult.report.tenantId,
+          amountPaid: transactionResult.report.amountPaid,
+          arrears: transactionResult.report.arrears,
+          status: transactionResult.report.status,
+          paymentPeriod: transactionResult.report.paymentPeriod,
+          datePaid: transactionResult.report.datePaid,
+          notes: transactionResult.report.notes
+        },
+        income: {
+          id: transactionResult.income.id,
+          propertyId: transactionResult.income.propertyId,
+          amount: transactionResult.income.amount,
+          frequency: transactionResult.income.frequency
+        },
+        invoices: transactionResult.updatedInvoices.map(inv => ({
+          id: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          previousBalance: inv.previousBalance,
+          paymentApplied: inv.paymentApplied,
+          newAmountPaid: inv.newAmountPaid || inv.amountPaid,
+          newBalance: inv.newBalance || inv.balance,
+          newStatus: inv.newStatus || inv.status,
+          previousStatus: inv.previousStatus,
+          wasAutoPaid: inv.wasAutoPaid || false,
+          paymentPolicy: inv.paymentPolicy
+        })),
+        billInvoices: transactionResult.updatedBillInvoices.map(bi => ({
+          id: bi.id,
+          invoiceNumber: bi.invoiceNumber,
+          amountPaid: bi.amountPaid,
+          balance: bi.balance,
+          status: bi.status
+        })),
+        balanceInvoice: transactionResult.balanceInvoice ? {
+          id: transactionResult.balanceInvoice.id,
+          invoiceNumber: transactionResult.balanceInvoice.invoiceNumber,
+          amountDue: transactionResult.balanceInvoice.totalDue,
+          paymentPolicy: transactionResult.balanceInvoice.paymentPolicy
+        } : null,
+        existingInvoicesUpdated: transactionResult.invoiceUpdateResult ? {
+          count: transactionResult.invoiceUpdateResult.updatedInvoices.length,
+          totalApplied: transactionResult.invoiceUpdateResult.totalApplied,
+          remainingPayment: transactionResult.invoiceUpdateResult.remainingPayment
+        } : null,
+        commission: transactionResult.commission ? {
+          id: transactionResult.commission.id,
+          commissionAmount: transactionResult.commission.commissionAmount,
+          status: transactionResult.commission.status
+        } : null
       },
-      rentInvoice: result.rentInvoice ? {
-        id: result.rentInvoice.id,
-        invoiceNumber: result.rentInvoice.invoiceNumber,
-        issueDate: result.rentInvoice.issueDate,
-        dueDate: result.rentInvoice.dueDate,
-        paymentPeriod: result.rentInvoice.paymentPeriod,
-        totalDue: result.rentInvoice.totalDue,
-        amountPaid: result.rentInvoice.amountPaid,
-        balance: result.rentInvoice.balance,
-        status: result.rentInvoice.status
-      } : null,
-      balanceInvoice: result.balanceInvoice ? {
-        id: result.balanceInvoice.id,
-        invoiceNumber: result.balanceInvoice.invoiceNumber,
-        issueDate: result.balanceInvoice.issueDate,
-        dueDate: result.balanceInvoice.dueDate,
-        totalDue: result.balanceInvoice.totalDue,
-        balance: result.balanceInvoice.balance,
-        status: result.balanceInvoice.status
-      } : null,
-      billInvoices: result.billInvoices.map(bi => ({
-        id: bi.id,
-        invoiceNumber: bi.invoiceNumber,
-        issueDate: bi.issueDate,
-        dueDate: bi.dueDate,
-        billType: bi.billType,
-        billReferenceNumber: bi.billReferenceNumber,
-        grandTotal: bi.grandTotal,
-        amountPaid: bi.amountPaid,
-        balance: bi.balance,
-        status: bi.status
-      })),
-      commission: result.commission
-        ? {
-            id: result.commission.id,
-            propertyId: result.commission.propertyId,
-            managerId: result.commission.managerId,
-            commissionFee: result.commission.commissionFee,
-            incomeAmount: result.commission.incomeAmount,
-            commissionAmount: result.commission.commissionAmount,
-            periodStart: result.commission.periodStart,
-            periodEnd: result.commission.periodEnd,
-            status: result.commission.status,
-            paidDate: result.commission.paidDate,
-            createdAt: result.commission.createdAt
-          }
-        : null,
-      message: result.commission
-        ? 'Payment, income, invoices, and commission recorded'
-        : 'Payment, income, and invoices recorded (no commission configured)'
+      message: 'Payment recorded successfully' + 
+        (transactionResult.invoiceUpdateResult ? 
+          ` (${transactionResult.invoiceUpdateResult.totalApplied} applied to existing invoices)` : 
+          '') +
+        (transactionResult.commission ? ' with commission' : '')
     });
 
   } catch (error) {
     console.error('Error creating payment report:', error);
     
-    // More specific error handling
+    // Check if we have partial transaction data
+    if (transactionResult) {
+      console.warn('Transaction partially completed:', transactionResult);
+    }
+    
     if (error.code === 'P2028') {
       return res.status(408).json({ 
         success: false, 
@@ -709,6 +906,138 @@ export const createPaymentReport = async (req, res) => {
   }
 };
 
+// Helper function to update existing invoices when payment is made
+async function updateExistingInvoicesForPayment(tx, tenantId, paymentPeriodStr, parsedAmountPaid, paymentReportId, periodStartDate, paymentStatus) {
+  try {
+    // Find all unpaid/partial invoices for this tenant in the same payment period
+    const existingInvoices = await tx.invoice.findMany({
+      where: {
+        tenantId,
+        paymentPeriod: paymentPeriodStr,
+        status: {
+          in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+        },
+        paymentReportId: null // Only invoices not already linked to a payment report
+      },
+      orderBy: {
+        dueDate: 'asc' // Pay oldest first
+      }
+    });
+
+    if (existingInvoices.length === 0) {
+      return {
+        updatedInvoices: [],
+        remainingPayment: parsedAmountPaid,
+        totalApplied: 0
+      };
+    }
+
+    let remainingPayment = parsedAmountPaid;
+    const updatedInvoices = [];
+
+    // Apply payment to existing invoices
+    for (const invoice of existingInvoices) {
+      if (remainingPayment <= 0) break;
+
+      // Check if invoice is for the same period (based on paymentPeriod string)
+      if (invoice.paymentPeriod === paymentPeriodStr) {
+        if (invoice.balance > 0) {
+          const paymentToApply = Math.min(invoice.balance, remainingPayment);
+          const newAmountPaid = invoice.amountPaid + paymentToApply;
+          const newBalance = invoice.balance - paymentToApply;
+          
+          // Determine new status
+          let newStatus = invoice.status;
+          if (newBalance <= 0) {
+            newStatus = 'PAID';
+          } else if (paymentToApply > 0 && invoice.status === 'UNPAID') {
+            newStatus = 'PARTIAL';
+          }
+
+          await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+              amountPaid: newAmountPaid,
+              balance: newBalance,
+              status: newStatus,
+              paymentReportId: paymentReportId, // Link to current payment report
+              updatedAt: new Date()
+            }
+          });
+
+          remainingPayment -= paymentToApply;
+          updatedInvoices.push({
+            id: invoice.id,
+            invoiceNumber: invoice.invoiceNumber,
+            previousBalance: invoice.balance,
+            previousAmountPaid: invoice.amountPaid,
+            paymentApplied: paymentToApply,
+            newAmountPaid,
+            newBalance,
+            newStatus,
+            previousStatus: invoice.status,
+            paymentPolicy: invoice.paymentPolicy
+          });
+        }
+      }
+    }
+
+    // If payment status is PAID, ensure all invoices for this period are marked as PAID
+    if (paymentStatus === 'PAID' && updatedInvoices.length > 0 && remainingPayment > 0) {
+      // Find any remaining unpaid invoices for this period
+      const remainingUnpaidInvoices = await tx.invoice.findMany({
+        where: {
+          tenantId,
+          paymentPeriod: paymentPeriodStr,
+          status: {
+            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+          },
+          id: {
+            notIn: updatedInvoices.map(i => i.id)
+          },
+          paymentReportId: null
+        }
+      });
+
+      // Mark all remaining invoices as PAID
+      for (const invoice of remainingUnpaidInvoices) {
+        await tx.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            amountPaid: invoice.totalDue,
+            balance: 0,
+            status: 'PAID',
+            paymentReportId: paymentReportId,
+            updatedAt: new Date()
+          }
+        });
+
+        updatedInvoices.push({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          previousBalance: invoice.balance,
+          previousAmountPaid: invoice.amountPaid,
+          paymentApplied: invoice.balance,
+          newAmountPaid: invoice.totalDue,
+          newBalance: 0,
+          newStatus: 'PAID',
+          previousStatus: invoice.status,
+          paymentPolicy: invoice.paymentPolicy,
+          wasAutoPaid: true
+        });
+      }
+    }
+
+    return {
+      updatedInvoices,
+      remainingPayment,
+      totalApplied: parsedAmountPaid - remainingPayment
+    };
+  } catch (error) {
+    console.error('Error in updateExistingInvoicesForPayment:', error);
+    throw error;
+  }
+}
 // @desc    Get income reports (with basic filtering)
 // @route   GET /api/payments/income
 // @access  Private
