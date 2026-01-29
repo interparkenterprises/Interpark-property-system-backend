@@ -3,7 +3,8 @@ import { generatePDF } from "../utils/pdfGenerator.js";
 import { uploadToStorage } from "../utils/storage.js";
 import { generateCommissionInvoiceNumber } from "../utils/commissionInvoiceHelpers.js";
 import { commissionInvoiceHTML } from "../utils/commissionInvoiceTemplate.js";
-import fs from 'fs/promises';
+import fs from 'fs';
+import fsPromises from 'fs/promises';
 import path from 'path';
 
 /**
@@ -71,7 +72,8 @@ export const getManagerCommissions = async (req, res) => {
             name: true,
             email: true
           }
-        }
+        },
+        
       },
       orderBy: {
         periodStart: 'desc'
@@ -637,7 +639,10 @@ export const generateCommissionInvoice = async (req, res) => {
     } = req.body;
 
     if (!description) {
-      return res.status(400).json({ success: false, message: "Description is required" });
+      return res.status(400).json({ 
+        success: false, 
+        message: "Description is required" 
+      });
     }
 
     if (!bankName || !accountName || !accountNumber) {
@@ -647,26 +652,55 @@ export const generateCommissionInvoice = async (req, res) => {
       });
     }
 
+    // Fetch commission with related data
     const commission = await prisma.managerCommission.findUnique({
       where: { id },
       include: {
         property: {
           include: {
-            landlord: { select: { id: true, name: true, address: true } }
+            landlord: { 
+              select: { 
+                id: true, 
+                name: true, 
+                address: true 
+              } 
+            }
           }
         },
-        manager: { select: { id: true, name: true, email: true } }
+        manager: { 
+          select: { 
+            id: true, 
+            name: true, 
+            email: true 
+          } 
+        }
       }
     });
 
     if (!commission) {
-      return res.status(404).json({ success: false, message: "Commission not found" });
+      return res.status(404).json({ 
+        success: false, 
+        message: "Commission not found" 
+      });
     }
 
+    // Check permissions
     if (req.user.role !== "ADMIN" && req.user.id !== commission.managerId) {
       return res.status(403).json({
         success: false,
         message: "Access denied. You can only generate invoices for your own commissions."
+      });
+    }
+
+    // Check if invoice already exists to prevent duplicate transactions
+    const existingInvoice = await prisma.commissionInvoice.findFirst({
+      where: { commissionId: id }
+    });
+
+    if (existingInvoice) {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice already generated for this commission"
       });
     }
 
@@ -679,19 +713,18 @@ export const generateCommissionInvoice = async (req, res) => {
     const year = periodStart.getFullYear();
     const refText = `COM-${monthShort}-${year}-${commission.property?.name || "PROPERTY"}`;
 
-    // ----- FIXED COMMISSION RATE CALCULATION -----
+    // ----- COMMISSION CALCULATION -----
     const collectionAmount = Number(commission.incomeAmount || 0);
     
-    // If commissionFee is stored as percentage (e.g., 85), convert to decimal
+    // Convert commission fee to decimal
     const commissionFeeFromDB = Number(commission.commissionFee || 0);
-    
-    // Check if it's likely a percentage (e.g., 85) vs decimal (e.g., 0.85)
     let commissionRateDecimal;
+    
     if (commissionFeeFromDB > 1) {
-      // If it's > 1, it's likely a percentage (e.g., 85)
-      commissionRateDecimal = commissionFeeFromDB / 100; // Convert to decimal (0.85)
+      // Likely a percentage (e.g., 85)
+      commissionRateDecimal = commissionFeeFromDB / 100;
     } else {
-      // If it's <= 1, it's likely already a decimal
+      // Likely already a decimal
       commissionRateDecimal = commissionFeeFromDB;
     }
     
@@ -701,11 +734,13 @@ export const generateCommissionInvoice = async (req, res) => {
     const vatAmount = Number((commissionAmount * vatRateNum).toFixed(2));
     const totalAmount = Number((commissionAmount + vatAmount).toFixed(2));
 
+    // Generate invoice number
     const invoiceNumber = await generateCommissionInvoiceNumber();
 
     const invoiceDate = new Date();
     const invoiceDateText = invoiceDate.toLocaleDateString("en-GB");
 
+    // Generate HTML for PDF
     const html = commissionInvoiceHTML({
       propertyName: commission.property?.name || "",
       lrNumber,
@@ -716,7 +751,7 @@ export const generateCommissionInvoice = async (req, res) => {
       landlordAddress,
       description,
       collectionAmount,
-      commissionRate: commissionRateDecimal, // Pass decimal rate to HTML function
+      commissionRate: commissionRateDecimal,
       commissionAmount,
       vatAmount,
       totalAmount,
@@ -732,11 +767,14 @@ export const generateCommissionInvoice = async (req, res) => {
     // Generate PDF buffer
     const pdfBuffer = await generatePDF(html);
 
+    // Upload PDF to storage
     const safeInvoiceNumber = invoiceNumber.replaceAll("/", "-");
     const fileName = `commission_invoice_${safeInvoiceNumber}.pdf`;
     const pdfUrl = await uploadToStorage(pdfBuffer, fileName, "commission-invoice");
 
+    // Transaction with timeout configuration
     const result = await prisma.$transaction(async (tx) => {
+      // Create commission invoice
       const createdInvoice = await tx.commissionInvoice.create({
         data: {
           invoiceNumber,
@@ -748,7 +786,7 @@ export const generateCommissionInvoice = async (req, res) => {
           landlordAddress: landlordAddress || null,
           description,
           collectionAmount,
-          commissionRate: commissionRateDecimal, // Store as decimal
+          commissionRate: commissionRateDecimal,
           commissionAmount,
           vatRate: vatRateNum,
           vatAmount,
@@ -764,12 +802,16 @@ export const generateCommissionInvoice = async (req, res) => {
         }
       });
 
+      // Update commission status
       const updatedCommission = await tx.managerCommission.update({
         where: { id: commission.id },
         data: { status: "PROCESSING" }
       });
 
       return { createdInvoice, updatedCommission };
+    }, {
+      maxWait: 10000, // 10 seconds max wait for transaction to start
+      timeout: 30000, // 30 seconds max for transaction to complete
     });
 
     return res.status(201).json({
@@ -783,6 +825,28 @@ export const generateCommissionInvoice = async (req, res) => {
 
   } catch (error) {
     console.error("Error generating commission invoice:", error);
+    
+    // Handle specific transaction timeout error
+    if (error.code === 'P2028') {
+      return res.status(503).json({
+        success: false,
+        message: "Database transaction timeout. The system is busy. Please try again in a moment.",
+        error: "Transaction timeout",
+        code: error.code
+      });
+    }
+    
+    // Handle other Prisma errors
+    if (error.code && error.code.startsWith('P')) {
+      return res.status(500).json({
+        success: false,
+        message: "Database error occurred",
+        error: error.message,
+        code: error.code
+      });
+    }
+    
+    // Handle generic errors
     return res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -792,16 +856,15 @@ export const generateCommissionInvoice = async (req, res) => {
 };
 
 /**
- * Download commission invoice PDF
+ * Download commission invoice PDF by invoice number
  * Manager/Admin
  */
 export const downloadCommissionInvoice = async (req, res) => {
   try {
-    const { invoiceId } = req.params;
+    const { id } = req.params;
 
-    // Find the invoice record
     const invoice = await prisma.commissionInvoice.findUnique({
-      where: { id: invoiceId },
+      where: { commissionId: id },
       include: {
         commission: {
           include: {
@@ -814,20 +877,25 @@ export const downloadCommissionInvoice = async (req, res) => {
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: 'Invoice not found for this commission'
       });
     }
 
-    // Check if user has access to this invoice
-    // Admin can access any invoice, manager can only access their own
+    // DEBUG: Log the invoice data
+   // console.log('Invoice found:', {
+     // id: invoice.id,
+     // invoiceNumber: invoice.invoiceNumber,
+     // pdfUrl: invoice.pdfUrl
+   // });
+
+    // Check if user has access
     if (req.user.role !== 'ADMIN' && req.user.id !== invoice.commission.managerId) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only download invoices for your own commissions.'
+        message: 'Access denied.'
       });
     }
 
-    // Extract filename from the pdfUrl
     const pdfUrl = invoice.pdfUrl;
     if (!pdfUrl) {
       return res.status(404).json({
@@ -836,9 +904,14 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Extract the filename from the URL
-    // URL format: /uploads/commission-invoice/commission_invoice_COM-INV-YYYYMM-000001.pdf
-    const fileName = pdfUrl.split('/').pop();
+    // DEBUG: Log the original pdfUrl
+    console.log('Original pdfUrl:', pdfUrl);
+    
+    // Extract the filename from the URL - handle both forward and backslashes
+    const fileName = pdfUrl.split(/[/\\]/).pop();
+    
+    // DEBUG: Log extracted filename
+    console.log('Extracted fileName:', fileName);
     
     if (!fileName) {
       return res.status(404).json({
@@ -847,21 +920,65 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Determine the file path
-    const filePath = path.join(
+    // Determine the file path - use consistent path resolution
+    const filePath = path.resolve(
       process.cwd(),
       'uploads',
       'commission-invoice',
       fileName
     );
 
+    // Alternative: If pdfUrl is an absolute path, use it directly
+    // const filePath = path.resolve(pdfUrl);
+
+    // DEBUG: Log the constructed file path
+    console.log('Constructed filePath:', filePath);
+
     // Check if file exists
     try {
-      await fs.access(filePath);
+      await fsPromises.access(filePath, fs.constants.R_OK);
+      console.log('File exists and is readable at path:', filePath);
+      
+      // Get file stats for additional debugging
+      const stats = await fsPromises.stat(filePath);
+      console.log('File stats:', {
+        size: stats.size,
+        created: stats.birthtime,
+        modified: stats.mtime
+      });
     } catch (error) {
+      console.error('File not found or not accessible at path:', filePath);
+      console.error('Error details:', error.message);
+      
+      // Try to list files in the directory to see what's there
+      try {
+        const dirPath = path.join(process.cwd(), 'uploads', 'commission-invoice');
+        console.log('Attempting to list directory:', dirPath);
+        
+        const files = await fsPromises.readdir(dirPath);
+        console.log('Files in directory:', files);
+        
+        // Check if file exists with different case (Windows is case-insensitive)
+        const fileExists = files.some(file => 
+          file.toLowerCase() === fileName.toLowerCase()
+        );
+        
+        if (fileExists) {
+          console.log('File exists with different case. Actual files:');
+          files.forEach(file => {
+            if (file.toLowerCase() === fileName.toLowerCase()) {
+              console.log(`Found: "${file}" (looking for: "${fileName}")`);
+            }
+          });
+        }
+      } catch (dirError) {
+        console.error('Could not read directory:', dirError.message);
+      }
+      
       return res.status(404).json({
         success: false,
-        message: 'PDF file not found on server'
+        message: 'PDF file not found on server',
+        details: 'File path may be incorrect or permissions issue'
       });
     }
 
@@ -870,17 +987,41 @@ export const downloadCommissionInvoice = async (req, res) => {
     
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}"`);
+    res.setHeader('Cache-Control', 'no-cache');
     
-    // Stream the file
+    // Stream the file with error handling
     const fileStream = fs.createReadStream(filePath);
+    
+    fileStream.on('error', (streamError) => {
+      console.error('File stream error:', streamError);
+      if (!res.headersSent) {
+        return res.status(500).json({
+          success: false,
+          message: 'Error streaming file',
+          error: streamError.message
+        });
+      }
+    });
+    
     fileStream.pipe(res);
 
   } catch (error) {
     console.error('Error downloading commission invoice:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: error.message
-    });
+    
+    if (error.name === 'PrismaClientValidationError') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid commission ID format'
+      });
+    }
+    
+    // Check if headers were already sent
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Internal server error',
+        error: error.message
+      });
+    }
   }
 };

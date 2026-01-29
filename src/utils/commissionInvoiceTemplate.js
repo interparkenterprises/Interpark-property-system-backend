@@ -101,7 +101,7 @@ export function commissionInvoiceHTML(data) {
   <style>
     @page {
       size: A4;
-      margin: 20mm;
+      margin: 20mm 20mm 30mm 20mm; /* Extra bottom margin for footer */
     }
     
     body { 
@@ -111,7 +111,6 @@ export function commissionInvoiceHTML(data) {
       margin: 0;
       padding: 0;
       position: relative;
-      min-height: 297mm;
     }
     
     .h1 { 
@@ -124,6 +123,7 @@ export function commissionInvoiceHTML(data) {
     .row { margin: 6px 0; }
     .label { font-weight: 700; }
     .spacer { height: 10px; }
+    .spacer-lg { height: 20px; }
     
     table { 
       width: 100%; 
@@ -150,34 +150,36 @@ export function commissionInvoiceHTML(data) {
     .muted { color: #333; }
     
     .footer-info { 
-      position: absolute;
-      bottom: 15mm;
-      left: 0;
-      right: 0;
-      padding-top: 15px; 
+      position: fixed;
+      bottom: 10mm;
+      left: 20mm;
+      right: 20mm;
+      padding-top: 10px; 
       border-top: 1px solid #ddd; 
       text-align: center; 
       font-size: 10px; 
       color: #444;
+      height: 20mm;
     }
     
-    .content {
-      min-height: calc(297mm - 55mm);
-      padding-bottom: 50px;
+    .main-content {
+      min-height: calc(297mm - 40mm); /* Account for margins */
+      margin-bottom: 30mm; /* Space for footer */
+      padding-bottom: 10mm;
     }
     
     .letterhead-container {
       text-align: center;
       margin-bottom: 15px;
       width: 100%;
-      max-height: 120px;
+      max-height: 100px;
       overflow: hidden;
     }
     
     .letterhead-img {
       max-width: 100%;
       height: auto;
-      max-height: 100px;
+      max-height: 80px;
       object-fit: contain;
     }
     
@@ -194,11 +196,27 @@ export function commissionInvoiceHTML(data) {
       margin-top: 10px;
       margin-bottom: 15px;
     }
+    
+    /* Keep content together */
+    .keep-together {
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+    
+    /* Ensure table doesn't break across pages */
+    table {
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+    
+    .bank {
+      margin-top: 20px;
+      margin-bottom: 10px;
+    }
   </style>
 </head>
 <body>
-
-  <div class="content">
+  <div class="main-content">
     <!-- Letterhead Section -->
     ${letterheadBase64 ? `
     <div class="letterhead-container">
@@ -229,6 +247,8 @@ export function commissionInvoiceHTML(data) {
     <div class="row"><span class="label">Name:</span> ${escapeHtml(landlordName || '')}</div>
     <div class="row"><span class="label">PO BOX:</span> ${escapeHtml(landlordAddress || '')}</div>
 
+    <div class="spacer"></div>
+
     <table>
       <thead>
         <tr>
@@ -256,7 +276,9 @@ export function commissionInvoiceHTML(data) {
       </tbody>
     </table>
 
-    <div class="bank">
+    <div class="spacer-lg"></div>
+
+    <div class="bank keep-together">
       <h3>BANK DETAILS</h3>
       <div class="row"><span class="label">Bank:</span> ${escapeHtml(bankName)}</div>
       <div class="row"><span class="label">Account Name:</span> ${escapeHtml(accountName)}</div>
@@ -267,10 +289,12 @@ export function commissionInvoiceHTML(data) {
       <div class="row"><span class="label">Currency:</span> ${escapeHtml(currency || 'KSH')}</div>
     </div>
 
-    <div class="spacer"></div>
+    <div class="spacer-lg"></div>
 
-    <div class="row"><b>Sincere regards</b></div>
-    <div class="footer-signature">Interpark Enterprises Limited</div>
+    <div class="keep-together">
+      <div class="row"><b>Sincere regards</b></div>
+      <div class="footer-signature">Interpark Enterprises Limited</div>
+    </div>
   </div>
 
   <div class="footer-info">
