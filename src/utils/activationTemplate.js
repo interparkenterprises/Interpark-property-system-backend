@@ -240,6 +240,62 @@ export async function generateActivationPDF(activation) {
       };
 
       // ===========================================
+      // VAT CALCULATION LOGIC
+      // ===========================================
+      
+      const calculateCosts = () => {
+        const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
+        const numberOfDays = activation.numberOfDays || 0;
+        const vatType = activation.vatType || 'EXCLUSIVE'; // Default to EXCLUSIVE
+        const vatRate = 0.16;
+        
+        let subTotal = 0;
+        let vatAmount = 0;
+        let totalAmount = 0;
+        let displayLicenseFee = licenseFeePerDay;
+        
+        switch (vatType) {
+          case 'INCLUSIVE':
+            // License fee already includes VAT
+            totalAmount = licenseFeePerDay * numberOfDays;
+            subTotal = totalAmount / (1 + vatRate);
+            vatAmount = totalAmount - subTotal;
+            break;
+            
+          case 'EXCLUSIVE':
+            // VAT needs to be added
+            subTotal = licenseFeePerDay * numberOfDays;
+            vatAmount = subTotal * vatRate;
+            totalAmount = subTotal + vatAmount;
+            break;
+            
+          case 'NOT_APPLICABLE':
+            // No VAT
+            subTotal = licenseFeePerDay * numberOfDays;
+            vatAmount = 0;
+            totalAmount = subTotal;
+            break;
+            
+          default:
+            // Fallback to EXCLUSIVE
+            subTotal = licenseFeePerDay * numberOfDays;
+            vatAmount = subTotal * vatRate;
+            totalAmount = subTotal + vatAmount;
+        }
+        
+        return {
+          licenseFeePerDay: displayLicenseFee,
+          numberOfDays,
+          subTotal,
+          vatAmount,
+          totalAmount,
+          vatType
+        };
+      };
+
+      const costs = calculateCosts();
+
+      // ===========================================
       // DOCUMENT TITLE
       // ===========================================
       
@@ -400,22 +456,22 @@ export async function generateActivationPDF(activation) {
       doc.moveDown(0.5);
       currentY = doc.y;
 
-      // Calculate costs
-      const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
-      const numberOfDays = activation.numberOfDays || 0;
-      const subTotal = licenseFeePerDay * numberOfDays;
-      const vatRate = 0.16;
-      const vatAmount = subTotal * vatRate;
-      const totalAmount = subTotal + vatAmount;
-
-      // Cost table
+      // Cost table with VAT handling
       const costRows = [
-        { label: 'License Fee per day:', value: formatCurrency(licenseFeePerDay) },
-        { label: 'No. of days:', value: numberOfDays.toString() },
-        { label: 'Sub Total:', value: formatCurrency(subTotal) },
-        { label: 'VAT (16%):', value: formatCurrency(vatAmount) },
-        { label: 'Total:', value: formatCurrency(totalAmount) }
+        { label: 'License Fee per day:', value: formatCurrency(costs.licenseFeePerDay) },
+        { label: 'No. of days:', value: costs.numberOfDays.toString() },
+        { label: 'Sub Total:', value: formatCurrency(costs.subTotal) }
       ];
+
+      // Add VAT row based on vatType
+      if (costs.vatType === 'NOT_APPLICABLE') {
+        costRows.push({ label: 'VAT:', value: 'Not Applicable' });
+      } else {
+        const vatLabel = costs.vatType === 'INCLUSIVE' ? 'VAT (16%) - Inclusive:' : 'VAT (16%):';
+        costRows.push({ label: vatLabel, value: formatCurrency(costs.vatAmount) });
+      }
+
+      costRows.push({ label: 'Total:', value: formatCurrency(costs.totalAmount) });
 
       currentY = drawTable(leftMargin, currentY, 495, costRows);
       currentY += 12;
@@ -740,14 +796,53 @@ export const generateActivationHTML = (activation) => {
     return `KES ${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   };
 
-  // Calculate costs
-  const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
-  const numberOfDays = activation.numberOfDays || 0;
-  const subTotal = licenseFeePerDay * numberOfDays;
-  const vatRate = 0.16;
-  const vatAmount = subTotal * vatRate;
-  const totalAmount = subTotal + vatAmount;
+  // VAT Calculation Logic for HTML
+  const calculateCosts = () => {
+    const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
+    const numberOfDays = activation.numberOfDays || 0;
+    const vatType = activation.vatType || 'EXCLUSIVE';
+    const vatRate = 0.16;
+    
+    let subTotal = 0;
+    let vatAmount = 0;
+    let totalAmount = 0;
+    
+    switch (vatType) {
+      case 'INCLUSIVE':
+        totalAmount = licenseFeePerDay * numberOfDays;
+        subTotal = totalAmount / (1 + vatRate);
+        vatAmount = totalAmount - subTotal;
+        break;
+        
+      case 'EXCLUSIVE':
+        subTotal = licenseFeePerDay * numberOfDays;
+        vatAmount = subTotal * vatRate;
+        totalAmount = subTotal + vatAmount;
+        break;
+        
+      case 'NOT_APPLICABLE':
+        subTotal = licenseFeePerDay * numberOfDays;
+        vatAmount = 0;
+        totalAmount = subTotal;
+        break;
+        
+      default:
+        subTotal = licenseFeePerDay * numberOfDays;
+        vatAmount = subTotal * vatRate;
+        totalAmount = subTotal + vatAmount;
+    }
+    
+    return {
+      licenseFeePerDay,
+      numberOfDays,
+      subTotal,
+      vatAmount,
+      totalAmount,
+      vatType
+    };
+  };
 
+  const costs = calculateCosts();
   const paidStatus = activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
 
   // Helper to format postal address
@@ -757,6 +852,25 @@ export const generateActivationHTML = (activation) => {
       return `P.O Box ${postal}`;
     }
     return postal;
+  };
+
+  // Generate VAT row label
+  const getVATLabel = () => {
+    if (costs.vatType === 'NOT_APPLICABLE') {
+      return 'VAT:';
+    } else if (costs.vatType === 'INCLUSIVE') {
+      return 'VAT (16%) - Inclusive:';
+    } else {
+      return 'VAT (16%):';
+    }
+  };
+
+  const getVATValue = () => {
+    if (costs.vatType === 'NOT_APPLICABLE') {
+      return 'Not Applicable';
+    } else {
+      return formatCurrency(costs.vatAmount);
+    }
   };
 
   return `
@@ -1022,23 +1136,23 @@ export const generateActivationHTML = (activation) => {
   <table>
     <tr>
       <td>License Fee per day:</td>
-      <td>${formatCurrency(licenseFeePerDay)}</td>
+      <td>${formatCurrency(costs.licenseFeePerDay)}</td>
     </tr>
     <tr>
       <td>No. of days:</td>
-      <td>${numberOfDays}</td>
+      <td>${costs.numberOfDays}</td>
     </tr>
     <tr>
       <td>Sub Total:</td>
-      <td>${formatCurrency(subTotal)}</td>
+      <td>${formatCurrency(costs.subTotal)}</td>
     </tr>
     <tr>
-      <td>VAT (16%):</td>
-      <td>${formatCurrency(vatAmount)}</td>
+      <td>${getVATLabel()}</td>
+      <td>${getVATValue()}</td>
     </tr>
     <tr>
       <td>Total:</td>
-      <td>${formatCurrency(totalAmount)}</td>
+      <td>${formatCurrency(costs.totalAmount)}</td>
     </tr>
   </table>
 
