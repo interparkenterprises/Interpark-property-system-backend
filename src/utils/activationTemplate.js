@@ -141,8 +141,8 @@ export async function generateActivationPDF(activation) {
       };
 
       const formatValue = (value) => {
-        if (value === null || value === undefined) return '…………………………';
-        if (typeof value === 'string' && value.trim() === '') return '…………………………';
+        if (value === null || value === undefined) return null;
+        if (typeof value === 'string' && value.trim() === '') return null;
         return value;
       };
 
@@ -155,8 +155,11 @@ export async function generateActivationPDF(activation) {
         return `KES ${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
       };
 
-      const drawUnderline = (x, y, width) => {
-        doc.moveTo(x, y).lineTo(x + width, y).stroke();
+      // Updated drawUnderline - only draws if value is null/empty
+      const drawUnderline = (x, y, width, hasValue) => {
+        if (!hasValue) {
+          doc.moveTo(x, y).lineTo(x + width, y).stroke();
+        }
       };
 
       // Helper function to draw a table
@@ -192,6 +195,50 @@ export async function generateActivationPDF(activation) {
         return currentY;
       };
 
+      // Helper function to wrap text into multiple lines with numbering
+      const wrapTextWithNumbering = (text, number, x, startY, maxWidth, lineSpacing = 13) => {
+        const prefix = `${number}. `;
+        const availableWidth = maxWidth - doc.widthOfString(prefix);
+        
+        // Split text into words
+        const words = text.split(' ');
+        const lines = [];
+        let currentLine = '';
+        
+        for (const word of words) {
+          const testLine = currentLine ? `${currentLine} ${word}` : word;
+          const testWidth = doc.widthOfString(testLine);
+          
+          if (testWidth <= availableWidth) {
+            currentLine = testLine;
+          } else {
+            lines.push(currentLine);
+            currentLine = word;
+          }
+        }
+        
+        if (currentLine) {
+          lines.push(currentLine);
+        }
+        
+        // Draw lines with proper numbering
+        let currentY = startY;
+        
+        for (let i = 0; i < lines.length; i++) {
+          if (i === 0) {
+            // First line includes the number
+            doc.text(`${prefix}${lines[i]}`, x, currentY);
+          } else {
+            // Subsequent lines are indented
+            const indent = doc.widthOfString(prefix);
+            doc.text(lines[i], x + indent, currentY);
+          }
+          currentY += lineSpacing;
+        }
+        
+        return currentY;
+      };
+
       // ===========================================
       // DOCUMENT TITLE
       // ===========================================
@@ -220,51 +267,69 @@ export async function generateActivationPDF(activation) {
       const fieldSpacing = 16;
 
       // Company Name
+      const companyName = formatValue(activation.companyName);
       doc.fontSize(9).font('Helvetica').text('Company Name', leftMargin, currentY);
-      drawUnderline(leftMargin + 85, currentY + 10, 350);
-      doc.text(formatValue(activation.companyName), leftMargin + 90, currentY);
+      drawUnderline(leftMargin + 85, currentY + 10, 350, companyName);
+      if (companyName) {
+        doc.text(companyName, leftMargin + 90, currentY);
+      }
       currentY += fieldSpacing;
 
       // Postal address - SIMPLIFIED: Show as "P.O Box [number]" if numeric
-      doc.text('Postal address', leftMargin, currentY);
-      drawUnderline(leftMargin + 85, currentY + 10, 395);
-      
-      // Format postal address as "P.O Box [number]" if it's numeric
-      let postalDisplay = formatValue(activation.postalAddress);
-      if (postalDisplay && /^\d+$/.test(postalDisplay.trim())) {
-        postalDisplay = `P.O Box ${postalDisplay}`;
+      let postalAddress = formatValue(activation.postalAddress);
+      if (postalAddress && /^\d+$/.test(postalAddress.trim())) {
+        postalAddress = `P.O Box ${postalAddress}`;
       }
-      doc.text(postalDisplay, leftMargin + 90, currentY);
+      doc.text('Postal address', leftMargin, currentY);
+      drawUnderline(leftMargin + 85, currentY + 10, 395, postalAddress);
+      if (postalAddress) {
+        doc.text(postalAddress, leftMargin + 90, currentY);
+      }
       currentY += fieldSpacing;
 
       // Telephone
+      const telephone = formatValue(activation.telephone);
       doc.text('Telephone:', leftMargin, currentY);
-      drawUnderline(leftMargin + 60, currentY + 10, 395);
-      doc.text(formatValue(activation.telephone), leftMargin + 65, currentY);
+      drawUnderline(leftMargin + 60, currentY + 10, 395, telephone);
+      if (telephone) {
+        doc.text(telephone, leftMargin + 65, currentY);
+      }
       currentY += fieldSpacing;
 
       // Contact Person
+      const contactPerson = formatValue(activation.contactPerson);
       doc.text('Contact Person:', leftMargin, currentY);
-      drawUnderline(leftMargin + 90, currentY + 10, 365);
-      doc.text(formatValue(activation.contactPerson), leftMargin + 95, currentY);
+      drawUnderline(leftMargin + 90, currentY + 10, 365, contactPerson);
+      if (contactPerson) {
+        doc.text(contactPerson, leftMargin + 95, currentY);
+      }
       currentY += fieldSpacing;
 
       // Designation/Title
+      const designation = formatValue(activation.designation);
       doc.text('Designation/Title:', leftMargin, currentY);
-      drawUnderline(leftMargin + 95, currentY + 10, 360);
-      doc.text(formatValue(activation.designation), leftMargin + 100, currentY);
+      drawUnderline(leftMargin + 95, currentY + 10, 360, designation);
+      if (designation) {
+        doc.text(designation, leftMargin + 100, currentY);
+      }
       currentY += fieldSpacing;
 
       // Email
+      const email = formatValue(activation.email);
       doc.text('Email:', leftMargin, currentY);
-      drawUnderline(leftMargin + 40, currentY + 10, 420);
-      doc.text(formatValue(activation.email), leftMargin + 45, currentY);
+      drawUnderline(leftMargin + 40, currentY + 10, 420, email);
+      if (email) {
+        doc.text(email, leftMargin + 45, currentY);
+      }
       currentY += fieldSpacing;
 
       // Mobile No
+      const mobileNo = formatValue(activation.mobileNo);
       doc.text('Mobile No:', leftMargin, currentY);
-      drawUnderline(leftMargin + 60, currentY + 10, 395);
-      doc.text(formatValue(activation.mobileNo), leftMargin + 65, currentY);
+      drawUnderline(leftMargin + 60, currentY + 10, 395, mobileNo);
+      if (mobileNo) {
+        doc.text(mobileNo, leftMargin + 65, currentY);
+      }
       currentY += fieldSpacing + 8;
 
       doc.y = currentY;
@@ -296,23 +361,26 @@ export async function generateActivationPDF(activation) {
       currentY = drawTable(leftMargin, currentY, 495, dateRows);
       currentY += 12;
 
-      // Nature of activation
+      // Nature of activation - FIXED to handle multiline text
       doc.font('Helvetica-Bold').text('Nature of the activation:', leftMargin, currentY);
       currentY += 15;
 
       doc.font('Helvetica');
-      const natureItems = [
-        `1. ${formatValue(activation.activationType)}`,
-        `2. ${formatValue(activation.description || 'Distribution details')}`,
-        `3. ${activation.soundSystem ? 'With PA system' : 'No PA system'}`
-      ];
+      
+      // Point 1: Activation Type
+      const activationType = formatValue(activation.activationType) || '…………………………';
+      doc.text(`1. ${activationType}`, leftMargin, currentY);
+      currentY += 13;
+      
+      // Point 2: Description - Use the new wrap function
+      const description = formatValue(activation.description) || 'Distribution details';
+      currentY = wrapTextWithNumbering(description, 2, leftMargin, currentY, 495, 13);
+      
+      // Point 3: PA System
+      const paSystemText = activation.soundSystem ? 'With PA system' : 'No PA system';
+      doc.text(`3. ${paSystemText}`, leftMargin, currentY);
+      currentY += 20;
 
-      natureItems.forEach(item => {
-        doc.text(item, leftMargin + 10, currentY);
-        currentY += 13;
-      });
-
-      currentY += 8;
       doc.y = currentY;
 
       // ===========================================
@@ -357,35 +425,73 @@ export async function generateActivationPDF(activation) {
       currentY += 15;
 
       doc.font('Helvetica');
-      const paymentFields = [
-        { label: 'Bank name:', value: formatValue(activation.bankName), width: 70 },
-        { label: 'Branch:', value: formatValue(activation.bankBranch), width: 50 },
-        { label: 'A/c name:', value: formatValue(activation.accountName), width: 65 },
-        { label: 'A/c no.', value: formatValue(activation.accountNumber), width: 50 },
-        { label: 'Swift Code:', value: formatValue(activation.swiftCode), width: 70 }
-      ];
+      
+      // Bank name
+      const bankName = formatValue(activation.bankName);
+      doc.text('Bank name:', leftMargin, currentY);
+      drawUnderline(leftMargin + 70, currentY + 10, 200, bankName);
+      if (bankName) {
+        doc.text(bankName, leftMargin + 75, currentY);
+      }
+      currentY += fieldSpacing;
 
-      paymentFields.forEach(field => {
-        doc.text(field.label, leftMargin, currentY);
-        drawUnderline(leftMargin + field.width, currentY + 10, 200);
-        doc.text(field.value, leftMargin + field.width + 5, currentY);
-        currentY += fieldSpacing;
-      });
+      // Branch
+      const bankBranch = formatValue(activation.bankBranch);
+      doc.text('Branch:', leftMargin, currentY);
+      drawUnderline(leftMargin + 50, currentY + 10, 200, bankBranch);
+      if (bankBranch) {
+        doc.text(bankBranch, leftMargin + 55, currentY);
+      }
+      currentY += fieldSpacing;
 
-      currentY += 5;
+      // A/c name
+      const accountName = formatValue(activation.accountName);
+      doc.text('A/c name:', leftMargin, currentY);
+      drawUnderline(leftMargin + 65, currentY + 10, 200, accountName);
+      if (accountName) {
+        doc.text(accountName, leftMargin + 70, currentY);
+      }
+      currentY += fieldSpacing;
+
+      // A/c no
+      const accountNumber = formatValue(activation.accountNumber);
+      doc.text('A/c no.', leftMargin, currentY);
+      drawUnderline(leftMargin + 50, currentY + 10, 200, accountNumber);
+      if (accountNumber) {
+        doc.text(accountNumber, leftMargin + 55, currentY);
+      }
+      currentY += fieldSpacing;
+
+      // Swift Code
+      const swiftCode = formatValue(activation.swiftCode);
+      doc.text('Swift Code:', leftMargin, currentY);
+      drawUnderline(leftMargin + 70, currentY + 10, 200, swiftCode);
+      if (swiftCode) {
+        doc.text(swiftCode, leftMargin + 75, currentY);
+      }
+      currentY += fieldSpacing + 5;
 
       // Mpesa Payment
       doc.font('Helvetica-Bold').text('Mpesa Payment:', leftMargin, currentY);
       currentY += 15;
 
       doc.font('Helvetica');
-      doc.text('Paybill Number:', leftMargin, currentY);
-      drawUnderline(leftMargin + 90, currentY + 10, 100);
-      doc.text(formatValue(activation.paybillNumber), leftMargin + 95, currentY);
       
+      // Paybill Number
+      const paybillNumber = formatValue(activation.paybillNumber);
+      doc.text('Paybill Number:', leftMargin, currentY);
+      drawUnderline(leftMargin + 90, currentY + 10, 100, paybillNumber);
+      if (paybillNumber) {
+        doc.text(paybillNumber, leftMargin + 95, currentY);
+      }
+      
+      // Account
+      const mpesaAccount = formatValue(activation.mpesaAccount);
       doc.text('Account:', leftMargin + 230, currentY);
-      drawUnderline(leftMargin + 275, currentY + 10, 160);
-      doc.text(formatValue(activation.mpesaAccount), leftMargin + 280, currentY);
+      drawUnderline(leftMargin + 275, currentY + 10, 160, mpesaAccount);
+      if (mpesaAccount) {
+        doc.text(mpesaAccount, leftMargin + 280, currentY);
+      }
       currentY += fieldSpacing + 8;
 
       // Payment Note
@@ -475,30 +581,45 @@ export async function generateActivationPDF(activation) {
       currentY = doc.y;
       doc.fontSize(9).font('Helvetica');
 
-      // Acceptance fields
+      // Acceptance fields - Name
+      const acceptanceName = formatValue(activation.contactPerson);
       doc.text('Name:', leftMargin, currentY);
-      drawUnderline(leftMargin + 40, currentY + 10, 445);
-      doc.text(formatValue(activation.contactPerson), leftMargin + 45, currentY);
+      drawUnderline(leftMargin + 40, currentY + 10, 445, acceptanceName);
+      if (acceptanceName) {
+        doc.text(acceptanceName, leftMargin + 45, currentY);
+      }
       currentY += fieldSpacing;
 
       // Two columns for title and company
+      const acceptanceDesignation = formatValue(activation.designation);
       doc.text('Your Title / Post:', leftMargin, currentY);
-      drawUnderline(leftMargin + 85, currentY + 10, 140);
-      doc.text(formatValue(activation.designation), leftMargin + 90, currentY);
+      drawUnderline(leftMargin + 85, currentY + 10, 140, acceptanceDesignation);
+      if (acceptanceDesignation) {
+        doc.text(acceptanceDesignation, leftMargin + 90, currentY);
+      }
       
+      const acceptanceCompany = formatValue(activation.companyName);
       doc.text('Company Name:', leftMargin + 240, currentY);
-      drawUnderline(leftMargin + 325, currentY + 10, 140);
-      doc.text(formatValue(activation.companyName), leftMargin + 330, currentY);
+      drawUnderline(leftMargin + 325, currentY + 10, 140, acceptanceCompany);
+      if (acceptanceCompany) {
+        doc.text(acceptanceCompany, leftMargin + 330, currentY);
+      }
       currentY += fieldSpacing;
 
       // Two columns for email and mobile
+      const acceptanceEmail = formatValue(activation.email);
       doc.text('E-Mail Address:', leftMargin, currentY);
-      drawUnderline(leftMargin + 85, currentY + 10, 140);
-      doc.text(formatValue(activation.email), leftMargin + 90, currentY);
+      drawUnderline(leftMargin + 85, currentY + 10, 140, acceptanceEmail);
+      if (acceptanceEmail) {
+        doc.text(acceptanceEmail, leftMargin + 90, currentY);
+      }
       
+      const acceptanceMobile = formatValue(activation.mobileNo);
       doc.text('Mobile No:', leftMargin + 240, currentY);
-      drawUnderline(leftMargin + 290, currentY + 10, 175);
-      doc.text(formatValue(activation.mobileNo), leftMargin + 295, currentY);
+      drawUnderline(leftMargin + 290, currentY + 10, 175, acceptanceMobile);
+      if (acceptanceMobile) {
+        doc.text(acceptanceMobile, leftMargin + 295, currentY);
+      }
       currentY += fieldSpacing + 8;
 
       // Signature and Date
@@ -528,32 +649,43 @@ export async function generateActivationPDF(activation) {
 
       doc.fontSize(9).font('Helvetica');
 
-      // Management fields
+      // Management fields - Name
+      const managerName = formatValue(activation.manager?.name);
       doc.text('Name:', leftMargin, currentY);
-      drawUnderline(leftMargin + 40, currentY + 10, 445);
-      doc.text(formatValue(activation.manager?.name), leftMargin + 45, currentY);
+      drawUnderline(leftMargin + 40, currentY + 10, 445, managerName);
+      if (managerName) {
+        doc.text(managerName, leftMargin + 45, currentY);
+      }
       currentY += fieldSpacing;
 
+      // Designation and Signature
+      const managerDesignation = formatValue(activation.managerDesignation || activation.manager?.role);
       doc.text('Designation/Title:', leftMargin, currentY);
-      drawUnderline(leftMargin + 95, currentY + 10, 160);
-      doc.text(formatValue(activation.managerDesignation || activation.manager?.role), leftMargin + 100, currentY);
+      drawUnderline(leftMargin + 95, currentY + 10, 160, managerDesignation);
+      if (managerDesignation) {
+        doc.text(managerDesignation, leftMargin + 100, currentY);
+      }
       
       doc.text('Signature:', leftMargin + 270, currentY);
-      drawUnderline(leftMargin + 320, currentY + 10, 145);
+      drawUnderline(leftMargin + 320, currentY + 10, 145, false); // Always show signature line
       currentY += fieldSpacing;
 
+      // Date and Paid status
+      const approvalDate = activation.approvedAt || activation.updatedAt;
       doc.text('Date:', leftMargin, currentY);
-      drawUnderline(leftMargin + 30, currentY + 10, 150);
-      doc.text(formatDate(activation.approvedAt || activation.updatedAt), leftMargin + 35, currentY);
+      drawUnderline(leftMargin + 30, currentY + 10, 150, approvalDate);
+      if (approvalDate) {
+        doc.text(formatDate(approvalDate), leftMargin + 35, currentY);
+      }
       
       // Paid status
       const paidStatus = activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
       doc.text('Paid: Yes:', leftMargin + 220, currentY);
-      drawUnderline(leftMargin + 270, currentY + 10, 50);
+      drawUnderline(leftMargin + 270, currentY + 10, 50, false);
       if (paidStatus) doc.text('✓', leftMargin + 285, currentY);
       
       doc.text('No:', leftMargin + 340, currentY);
-      drawUnderline(leftMargin + 365, currentY + 10, 50);
+      drawUnderline(leftMargin + 365, currentY + 10, 50, false);
       if (!paidStatus) doc.text('✓', leftMargin + 380, currentY);
 
       currentY += 30;
@@ -592,7 +724,11 @@ export const generateActivationHTML = (activation) => {
   };
 
   const formatValue = (value) => {
-    return value || '…………………………';
+    return value || null;
+  };
+
+  const hasValue = (value) => {
+    return value !== null && value !== undefined && value !== '';
   };
 
   const formatBoolean = (value) => {
@@ -613,6 +749,15 @@ export const generateActivationHTML = (activation) => {
   const totalAmount = subTotal + vatAmount;
 
   const paidStatus = activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
+
+  // Helper to format postal address
+  const getFormattedPostalAddress = () => {
+    const postal = formatValue(activation.postalAddress);
+    if (postal && /^\d+$/.test(postal.trim())) {
+      return `P.O Box ${postal}`;
+    }
+    return postal;
+  };
 
   return `
 <!DOCTYPE html>
@@ -679,10 +824,17 @@ export const generateActivationHTML = (activation) => {
     }
 
     .field-value {
-      border-bottom: 1px solid #000;
       flex-grow: 1;
       padding: 0 5px;
       min-height: 16px;
+    }
+
+    .field-value.has-value {
+      border-bottom: none;
+    }
+
+    .field-value.no-value {
+      border-bottom: 1px solid #000;
     }
 
     .two-col {
@@ -722,6 +874,11 @@ export const generateActivationHTML = (activation) => {
     .nature-list div {
       margin-bottom: 6px;
       font-size: 9pt;
+      line-height: 1.3;
+    }
+
+    .nature-list div.multi-line {
+      margin-bottom: 12px;
     }
 
     .payment-note {
@@ -781,45 +938,51 @@ export const generateActivationHTML = (activation) => {
   
   <div class="field-row">
     <span class="field-label">Company Name</span>
-    <span class="field-value">${formatValue(activation.companyName)}</span>
+    <span class="field-value ${hasValue(activation.companyName) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.companyName) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Postal address</span>
-    <span class="field-value">
-      ${(() => {
-        const postalValue = formatValue(activation.postalAddress);
-        if (postalValue && /^\d+$/.test(postalValue.trim())) {
-          return `P.O Box ${postalValue}`;
-        }
-        return postalValue;
-      })()}
+    <span class="field-value ${hasValue(getFormattedPostalAddress()) ? 'has-value' : 'no-value'}">
+      ${getFormattedPostalAddress() || ''}
     </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Telephone:</span>
-    <span class="field-value">${formatValue(activation.telephone)}</span>
+    <span class="field-value ${hasValue(activation.telephone) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.telephone) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Contact Person:</span>
-    <span class="field-value">${formatValue(activation.contactPerson)}</span>
+    <span class="field-value ${hasValue(activation.contactPerson) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.contactPerson) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Designation/Title:</span>
-    <span class="field-value">${formatValue(activation.designation)}</span>
+    <span class="field-value ${hasValue(activation.designation) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.designation) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Email:</span>
-    <span class="field-value">${formatValue(activation.email)}</span>
+    <span class="field-value ${hasValue(activation.email) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.email) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Mobile No:</span>
-    <span class="field-value">${formatValue(activation.mobileNo)}</span>
+    <span class="field-value ${hasValue(activation.mobileNo) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.mobileNo) || ''}
+    </span>
   </div>
 
   <!-- PART 2: DESCRIPTION WITH TABLE -->
@@ -848,8 +1011,8 @@ export const generateActivationHTML = (activation) => {
 
   <div style="font-weight: bold; margin-top: 10px; font-size: 9pt;">Nature of the activation:</div>
   <div class="nature-list">
-    <div>1. ${formatValue(activation.activationType)}</div>
-    <div>2. ${formatValue(activation.description || 'Distribution details')}</div>
+    <div>1. ${formatValue(activation.activationType) || '…………………………'}</div>
+    <div class="multi-line">2. ${formatValue(activation.description) || 'Distribution details'}</div>
     <div>3. ${activation.soundSystem ? 'With PA system' : 'No PA system'}</div>
   </div>
 
@@ -883,27 +1046,37 @@ export const generateActivationHTML = (activation) => {
   
   <div class="field-row">
     <span class="field-label">Bank name:</span>
-    <span class="field-value">${formatValue(activation.bankName)}</span>
+    <span class="field-value ${hasValue(activation.bankName) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.bankName) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Branch:</span>
-    <span class="field-value">${formatValue(activation.bankBranch)}</span>
+    <span class="field-value ${hasValue(activation.bankBranch) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.bankBranch) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">A/c name:</span>
-    <span class="field-value">${formatValue(activation.accountName)}</span>
+    <span class="field-value ${hasValue(activation.accountName) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.accountName) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">A/c no.</span>
-    <span class="field-value">${formatValue(activation.accountNumber)}</span>
+    <span class="field-value ${hasValue(activation.accountNumber) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.accountNumber) || ''}
+    </span>
   </div>
 
   <div class="field-row">
     <span class="field-label">Swift Code:</span>
-    <span class="field-value">${formatValue(activation.swiftCode)}</span>
+    <span class="field-value ${hasValue(activation.swiftCode) ? 'has-value' : 'no-value'}">
+      ${formatValue(activation.swiftCode) || ''}
+    </span>
   </div>
 
   <div style="font-weight: bold; margin-top: 10px; font-size: 9pt;">Mpesa Payment:</div>
@@ -911,11 +1084,15 @@ export const generateActivationHTML = (activation) => {
   <div class="two-col">
     <div class="field-row">
       <span class="field-label">Paybill Number:</span>
-      <span class="field-value">${formatValue(activation.paybillNumber)}</span>
+      <span class="field-value ${hasValue(activation.paybillNumber) ? 'has-value' : 'no-value'}">
+        ${formatValue(activation.paybillNumber) || ''}
+      </span>
     </div>
     <div class="field-row">
       <span class="field-label">Account:</span>
-      <span class="field-value">${formatValue(activation.mpesaAccount)}</span>
+      <span class="field-value ${hasValue(activation.mpesaAccount) ? 'has-value' : 'no-value'}">
+        ${formatValue(activation.mpesaAccount) || ''}
+      </span>
     </div>
   </div>
 
@@ -946,28 +1123,38 @@ export const generateActivationHTML = (activation) => {
     
     <div class="field-row">
       <span class="field-label">Name:</span>
-      <span class="field-value">${formatValue(activation.contactPerson)}</span>
+      <span class="field-value ${hasValue(activation.contactPerson) ? 'has-value' : 'no-value'}">
+        ${formatValue(activation.contactPerson) || ''}
+      </span>
     </div>
 
     <div class="two-col">
       <div class="field-row">
         <span class="field-label">Your Title / Post:</span>
-        <span class="field-value">${formatValue(activation.designation)}</span>
+        <span class="field-value ${hasValue(activation.designation) ? 'has-value' : 'no-value'}">
+          ${formatValue(activation.designation) || ''}
+        </span>
       </div>
       <div class="field-row">
         <span class="field-label">Company Name:</span>
-        <span class="field-value">${formatValue(activation.companyName)}</span>
+        <span class="field-value ${hasValue(activation.companyName) ? 'has-value' : 'no-value'}">
+          ${formatValue(activation.companyName) || ''}
+        </span>
       </div>
     </div>
 
     <div class="two-col">
       <div class="field-row">
         <span class="field-label">E-Mail Address:</span>
-        <span class="field-value">${formatValue(activation.email)}</span>
+        <span class="field-value ${hasValue(activation.email) ? 'has-value' : 'no-value'}">
+          ${formatValue(activation.email) || ''}
+        </span>
       </div>
       <div class="field-row">
         <span class="field-label">Mobile No:</span>
-        <span class="field-value">${formatValue(activation.mobileNo)}</span>
+        <span class="field-value ${hasValue(activation.mobileNo) ? 'has-value' : 'no-value'}">
+          ${formatValue(activation.mobileNo) || ''}
+        </span>
       </div>
     </div>
 
@@ -983,24 +1170,30 @@ export const generateActivationHTML = (activation) => {
     
     <div class="field-row">
       <span class="field-label">Name:</span>
-      <span class="field-value">${formatValue(activation.manager?.name)}</span>
+      <span class="field-value ${hasValue(activation.manager?.name) ? 'has-value' : 'no-value'}">
+        ${formatValue(activation.manager?.name) || ''}
+      </span>
     </div>
 
     <div class="two-col">
       <div class="field-row">
         <span class="field-label">Designation/Title:</span>
-        <span class="field-value">${formatValue(activation.managerDesignation || activation.manager?.role)}</span>
+        <span class="field-value ${hasValue(activation.managerDesignation || activation.manager?.role) ? 'has-value' : 'no-value'}">
+          ${formatValue(activation.managerDesignation || activation.manager?.role) || ''}
+        </span>
       </div>
       <div class="field-row">
         <span class="field-label">Signature:</span>
-        <span class="field-value"></span>
+        <span class="field-value no-value"></span>
       </div>
     </div>
 
     <div class="two-col" style="margin-top: 10px;">
       <div class="field-row">
         <span class="field-label">Date:</span>
-        <span class="field-value">${formatDate(activation.approvedAt || activation.updatedAt)}</span>
+        <span class="field-value ${hasValue(activation.approvedAt || activation.updatedAt) ? 'has-value' : 'no-value'}">
+          ${formatDate(activation.approvedAt || activation.updatedAt)}
+        </span>
       </div>
       <div>
         Paid: Yes: ${paidStatus ? '✓' : '______'} &nbsp;&nbsp; No: ${!paidStatus ? '✓' : '______'}

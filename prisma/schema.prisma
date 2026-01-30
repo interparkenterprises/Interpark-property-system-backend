@@ -517,6 +517,10 @@ model ActivationRequest {
   licenseFeePerDay Float?
   numberOfDays     Int?
   proposedBudget   Float? // Fallback for licenseFeePerDay
+  
+  // VAT Information (NEW FIELDS)
+  vatType VATType @default(NOT_APPLICABLE) // Added this field
+  vat     Float?  @default(16)            // Added this field with 16% default
 
   // Payment Details (Required for template)
   bankName      String?

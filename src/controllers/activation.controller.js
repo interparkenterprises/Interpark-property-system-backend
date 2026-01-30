@@ -52,7 +52,8 @@ const sanitizeActivationData = (data) => {
   const numericFields = [
     'expectedVisitors',
     'licenseFeePerDay',
-    'proposedBudget'
+    'proposedBudget',
+    'vat' // Added vat to numeric fields
   ];
   
   numericFields.forEach(field => {
@@ -84,6 +85,15 @@ const sanitizeActivationData = (data) => {
     }
   });
 
+  // Handle vatType enum
+  if (sanitizedData.vatType) {
+    // Ensure vatType is one of the allowed enum values
+    const allowedVATTypes = ['INCLUSIVE', 'EXCLUSIVE', 'NOT_APPLICABLE'];
+    if (!allowedVATTypes.includes(sanitizedData.vatType)) {
+      delete sanitizedData.vatType;
+    }
+  }
+
   // Remove undefined values to let Prisma use defaults
   Object.keys(sanitizedData).forEach(key => {
     if (sanitizedData[key] === undefined || sanitizedData[key] === '') {
@@ -92,6 +102,44 @@ const sanitizeActivationData = (data) => {
   });
 
   return sanitizedData;
+};
+
+/**
+ * Calculate VAT amount based on vatType and vat rate
+ */
+const calculateVATDetails = (baseAmount, vatRate, vatType) => {
+  if (!baseAmount || !vatRate || vatType === 'NOT_APPLICABLE') {
+    return {
+      baseAmount: baseAmount || 0,
+      vatAmount: 0,
+      totalAmount: baseAmount || 0
+    };
+  }
+
+  if (vatType === 'INCLUSIVE') {
+    // VAT is already included in the base amount
+    const vatAmount = (baseAmount * vatRate) / (100 + vatRate);
+    const netAmount = baseAmount - vatAmount;
+    return {
+      baseAmount: netAmount,
+      vatAmount,
+      totalAmount: baseAmount
+    };
+  } else if (vatType === 'EXCLUSIVE') {
+    // VAT is added to base amount
+    const vatAmount = (baseAmount * vatRate) / 100;
+    return {
+      baseAmount,
+      vatAmount,
+      totalAmount: baseAmount + vatAmount
+    };
+  }
+
+  return {
+    baseAmount: baseAmount || 0,
+    vatAmount: 0,
+    totalAmount: baseAmount || 0
+  };
 };
 
 /**
@@ -127,6 +175,15 @@ export const createActivationRequest = async (req, res) => {
     // Sanitize data
     const sanitizedData = sanitizeActivationData(activationData);
 
+    // Calculate VAT details if applicable
+    let vat = sanitizedData.vat !== undefined ? sanitizedData.vat : 16; // Default to 16%
+    let vatType = sanitizedData.vatType || 'NOT_APPLICABLE';
+    
+    // Validate vat is a number
+    if (typeof vat !== 'number' || isNaN(vat)) {
+      vat = 16;
+    }
+
     // Create activation request with all fields from your model
     const activation = await prisma.activationRequest.create({
       data: {
@@ -134,6 +191,8 @@ export const createActivationRequest = async (req, res) => {
         requestNumber,
         managerId,
         status: 'DRAFT',
+        vat,
+        vatType,
         // Set default values for required fields
         companyName: sanitizedData.companyName || '',
         postalAddress: sanitizedData.postalAddress || '',
@@ -212,6 +271,7 @@ export const getActivationRequests = async (req, res) => {
       endDate, 
       activationType,
       companyName,
+      vatType, // Added vatType filter
       page = 1, 
       limit = 10 
     } = req.query;
@@ -222,6 +282,7 @@ export const getActivationRequests = async (req, res) => {
     if (status) where.status = status;
     if (activationType) where.activationType = activationType;
     if (companyName) where.companyName = { contains: companyName, mode: 'insensitive' };
+    if (vatType) where.vatType = vatType; // Added vatType filter
     
     if (startDate || endDate) {
       where.startDate = {};
@@ -260,11 +321,25 @@ export const getActivationRequests = async (req, res) => {
       prisma.activationRequest.count({ where })
     ]);
 
+    // Calculate total amounts with VAT for each activation
+    const activationsWithCalculations = activations.map(activation => {
+      const vatDetails = calculateVATDetails(
+        activation.proposedBudget || activation.licenseFeePerDay || 0,
+        activation.vat,
+        activation.vatType
+      );
+      
+      return {
+        ...activation,
+        vatDetails
+      };
+    });
+
     res.json({
       success: true,
       count: activations.length,
       totalCount,
-      data: activations,
+      data: activationsWithCalculations,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -319,9 +394,19 @@ export const getActivationRequest = async (req, res) => {
       });
     }
 
+    // Calculate VAT details
+    const vatDetails = calculateVATDetails(
+      activation.proposedBudget || activation.licenseFeePerDay || 0,
+      activation.vat,
+      activation.vatType
+    );
+
     res.json({
       success: true,
-      data: activation
+      data: {
+        ...activation,
+        vatDetails
+      }
     });
 
   } catch (error) {
@@ -372,7 +457,9 @@ export const updateActivationRequest = async (req, res) => {
         'soundSystem',
         'licenseFeePerDay',
         'numberOfDays',
-        'proposedBudget'
+        'proposedBudget',
+        'vat', // Allow vat updates
+        'vatType' // Allow vatType updates
       ];
       
       // Filter out fields that shouldn't be updated
@@ -385,6 +472,17 @@ export const updateActivationRequest = async (req, res) => {
 
     // Sanitize data
     const sanitizedData = sanitizeActivationData(updateData);
+
+    // Handle vat and vatType defaults if not provided
+    if (sanitizedData.vat === undefined && sanitizedData.vatType === undefined) {
+      // Keep existing values
+    } else if (sanitizedData.vatType === 'NOT_APPLICABLE') {
+      // If vatType is NOT_APPLICABLE, vat should be null
+      sanitizedData.vat = null;
+    } else if (sanitizedData.vat === undefined) {
+      // If vatType is set but vat is not, use default
+      sanitizedData.vat = 16;
+    }
 
     const activation = await prisma.activationRequest.update({
       where: { id },
@@ -405,10 +503,20 @@ export const updateActivationRequest = async (req, res) => {
       }
     });
 
+    // Calculate VAT details for response
+    const vatDetails = calculateVATDetails(
+      activation.proposedBudget || activation.licenseFeePerDay || 0,
+      activation.vat,
+      activation.vatType
+    );
+
     res.json({
       success: true,
       message: 'Activation request updated successfully',
-      data: activation
+      data: {
+        ...activation,
+        vatDetails
+      }
     });
 
   } catch (error) {
@@ -455,8 +563,18 @@ export const generateActivationPDFController = async (req, res) => {
       });
     }
 
-    // Generate PDF using new template with all fields
-    const pdfBuffer = await generateActivationPDFTemplate(activation);
+    // Calculate VAT details to pass to template
+    const vatDetails = calculateVATDetails(
+      activation.proposedBudget || activation.licenseFeePerDay || 0,
+      activation.vat,
+      activation.vatType
+    );
+
+    // Generate PDF using new template with all fields including VAT
+    const pdfBuffer = await generateActivationPDFTemplate({
+      ...activation,
+      vatDetails
+    });
 
     // Upload to storage
     const fileName = generateFileName(`activation_${activation.requestNumber}`);
@@ -582,8 +700,18 @@ export const submitActivationRequest = async (req, res) => {
     let pdfBuffer = null;
 
     if (!documentUrl) {
-      // Generate PDF with all fields
-      pdfBuffer = await generateActivationPDFTemplate(activation);
+      // Calculate VAT details
+      const vatDetails = calculateVATDetails(
+        activation.proposedBudget || activation.licenseFeePerDay || 0,
+        activation.vat,
+        activation.vatType
+      );
+
+      // Generate PDF with all fields including VAT
+      pdfBuffer = await generateActivationPDFTemplate({
+        ...activation,
+        vatDetails
+      });
       const fileName = generateFileName(`activation_${activation.requestNumber}`);
       documentUrl = await uploadToStorage(pdfBuffer, fileName, 'activations');
     }
@@ -607,10 +735,20 @@ export const submitActivationRequest = async (req, res) => {
       await sendActivationSubmissionEmail(updatedActivation, pdfBuffer);
     }
 
+    // Calculate VAT details for response
+    const vatDetails = calculateVATDetails(
+      updatedActivation.proposedBudget || updatedActivation.licenseFeePerDay || 0,
+      updatedActivation.vat,
+      updatedActivation.vatType
+    );
+
     res.json({
       success: true,
       message: 'Activation request submitted successfully',
-      data: updatedActivation,
+      data: {
+        ...updatedActivation,
+        vatDetails
+      },
       documentUrl
     });
 
@@ -727,8 +865,18 @@ export const downloadActivationPDF = async (req, res) => {
 
     // If no PDF buffer yet (either no documentUrl or fetch failed), generate fresh
     if (!pdfBuffer) {
-      // Use the new PDF generation function that includes all fields
-      pdfBuffer = await generateActivationPDFTemplate(activation);
+      // Calculate VAT details
+      const vatDetails = calculateVATDetails(
+        activation.proposedBudget || activation.licenseFeePerDay || 0,
+        activation.vat,
+        activation.vatType
+      );
+
+      // Use the new PDF generation function that includes all fields including VAT
+      pdfBuffer = await generateActivationPDFTemplate({
+        ...activation,
+        vatDetails
+      });
       
       // Optionally update the documentUrl in database
       if (req.query.updateUrl === 'true') {
@@ -809,12 +957,25 @@ export const getActivationStats = async (req, res) => {
       }
     });
 
+    // Additional stats for VAT
+    const vatStats = await prisma.activationRequest.groupBy({
+      by: ['vatType'],
+      where: { managerId },
+      _count: {
+        vatType: true
+      }
+    });
+
     res.json({
       success: true,
       data: {
         total: totalCount,
         byStatus: stats.reduce((acc, curr) => {
           acc[curr.status] = curr._count.status;
+          return acc;
+        }, {}),
+        byVATType: vatStats.reduce((acc, curr) => {
+          acc[curr.vatType] = curr._count.vatType;
           return acc;
         }, {}),
         upcoming: upcomingActivations
@@ -826,6 +987,110 @@ export const getActivationStats = async (req, res) => {
     res.status(500).json({ 
       success: false,
       message: 'Failed to fetch activation statistics',
+      error: error.message 
+    });
+  }
+};
+
+/**
+ * Get VAT summary for activations
+ * GET /api/activations/vat-summary
+ */
+export const getVATSummary = async (req, res) => {
+  try {
+    const managerId = req.user.id;
+    const { startDate, endDate, propertyId } = req.query;
+
+    const where = { 
+      managerId,
+      vatType: { not: 'NOT_APPLICABLE' },
+      vat: { not: null }
+    };
+
+    if (propertyId) where.propertyId = propertyId;
+    if (startDate) where.startDate = { gte: new Date(startDate) };
+    if (endDate) where.startDate = { ...where.startDate, lte: new Date(endDate) };
+
+    const activations = await prisma.activationRequest.findMany({
+      where,
+      include: {
+        property: {
+          select: {
+            id: true,
+            name: true
+          }
+        }
+      }
+    });
+
+    // Calculate VAT summary
+    let totalBaseAmount = 0;
+    let totalVATAmount = 0;
+    let totalWithVAT = 0;
+    const vatByType = {
+      INCLUSIVE: { count: 0, base: 0, vat: 0, total: 0 },
+      EXCLUSIVE: { count: 0, base: 0, vat: 0, total: 0 }
+    };
+
+    activations.forEach(activation => {
+      const baseAmount = activation.proposedBudget || activation.licenseFeePerDay || 0;
+      const vatDetails = calculateVATDetails(
+        baseAmount,
+        activation.vat,
+        activation.vatType
+      );
+
+      totalBaseAmount += vatDetails.baseAmount;
+      totalVATAmount += vatDetails.vatAmount;
+      totalWithVAT += vatDetails.totalAmount;
+
+      if (vatDetails.vatAmount > 0) {
+        const vatType = activation.vatType;
+        vatByType[vatType].count += 1;
+        vatByType[vatType].base += vatDetails.baseAmount;
+        vatByType[vatType].vat += vatDetails.vatAmount;
+        vatByType[vatType].total += vatDetails.totalAmount;
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        summary: {
+          totalActivations: activations.length,
+          totalBaseAmount: parseFloat(totalBaseAmount.toFixed(2)),
+          totalVATAmount: parseFloat(totalVATAmount.toFixed(2)),
+          totalWithVAT: parseFloat(totalWithVAT.toFixed(2))
+        },
+        breakdownByVATType: vatByType,
+        activations: activations.map(activation => {
+          const baseAmount = activation.proposedBudget || activation.licenseFeePerDay || 0;
+          const vatDetails = calculateVATDetails(
+            baseAmount,
+            activation.vat,
+            activation.vatType
+          );
+          
+          return {
+            id: activation.id,
+            requestNumber: activation.requestNumber,
+            companyName: activation.companyName,
+            propertyName: activation.property?.name,
+            baseAmount: vatDetails.baseAmount,
+            vatRate: activation.vat,
+            vatAmount: vatDetails.vatAmount,
+            totalAmount: vatDetails.totalAmount,
+            vatType: activation.vatType
+          };
+        })
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching VAT summary:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Failed to fetch VAT summary',
       error: error.message 
     });
   }
