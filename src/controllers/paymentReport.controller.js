@@ -1,6 +1,6 @@
 import prisma from "../lib/prisma.js";
 import { processCommissionForIncome } from '../services/commissionService.js';
-import { generateInvoiceNumber, generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
+import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 
 //const prisma = new PrismaClient();
 
@@ -188,17 +188,6 @@ export const getPaymentReports = async (req, res) => {
             issueDate: true,
             dueDate: true
           }
-        },
-        billInvoices: {
-          select: {
-            id: true,
-            invoiceNumber: true,
-            grandTotal: true,
-            amountPaid: true,
-            status: true,
-            issueDate: true,
-            dueDate: true
-          }
         }
       },
       orderBy: { paymentPeriod: 'desc' },
@@ -265,17 +254,6 @@ export const getPaymentsByTenant = async (req, res) => {
             issueDate: true,
             dueDate: true
           }
-        },
-        billInvoices: {
-          select: {
-            id: true,
-            invoiceNumber: true,
-            grandTotal: true,
-            amountPaid: true,
-            status: true,
-            issueDate: true,
-            dueDate: true
-          }
         }
       },
       orderBy: { paymentPeriod: 'desc' },
@@ -305,9 +283,8 @@ export const getPaymentsByTenant = async (req, res) => {
 export const getOutstandingInvoices = async (req, res) => {
   try {
     const { tenantId } = req.params;
-    const { includeBills = true } = req.query;
 
-    // Get unpaid/partial rent invoices
+    // Get unpaid/partial rent invoices only
     const rentInvoices = await prisma.invoice.findMany({
       where: {
         tenantId,
@@ -334,49 +311,17 @@ export const getOutstandingInvoices = async (req, res) => {
       }
     });
 
-    let billInvoices = [];
-    if (includeBills) {
-      // Get unpaid/partial bill invoices
-      billInvoices = await prisma.billInvoice.findMany({
-        where: {
-          tenantId,
-          status: {
-            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
-          }
-        },
-        orderBy: { dueDate: 'asc' },
-        select: {
-          id: true,
-          invoiceNumber: true,
-          issueDate: true,
-          dueDate: true,
-          billType: true,
-          billReferenceNumber: true,
-          grandTotal: true,
-          amountPaid: true,
-          balance: true,
-          status: true,
-          pdfUrl: true
-        }
-      });
-    }
-
     // Calculate totals
     const totalRentBalance = rentInvoices.reduce((sum, inv) => sum + inv.balance, 0);
-    const totalBillBalance = billInvoices.reduce((sum, bi) => sum + bi.balance, 0);
-    const totalOutstanding = totalRentBalance + totalBillBalance;
 
     res.json({
       success: true,
       data: {
         rentInvoices,
-        billInvoices,
         totals: {
           totalRentBalance,
-          totalBillBalance,
-          totalOutstanding,
-          invoiceCount: rentInvoices.length,
-          billInvoiceCount: billInvoices.length
+          totalOutstanding: totalRentBalance,
+          invoiceCount: rentInvoices.length
         }
       }
     });
@@ -390,7 +335,91 @@ export const getOutstandingInvoices = async (req, res) => {
   }
 };
 
-// @desc    Create payment report (Invoice-based)
+// Helper: Get or create tenant credit balance for overpayments
+async function getTenantCreditBalance(tx, tenantId) {
+  // Look for existing credit balance (stored as a special payment report with status 'CREDIT')
+  const creditBalance = await tx.paymentReport.findFirst({
+    where: {
+      tenantId,
+      status: 'CREDIT' // We'll add this to PaymentStatus enum
+    },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  if (creditBalance) {
+    return parseFloat(creditBalance.amountPaid);
+  }
+  return 0;
+}
+
+// Helper: Update or create tenant credit balance
+async function updateTenantCreditBalance(tx, tenantId, amount) {
+  const existingCredit = await tx.paymentReport.findFirst({
+    where: {
+      tenantId,
+      status: 'CREDIT'
+    }
+  });
+
+  if (existingCredit) {
+    return await tx.paymentReport.update({
+      where: { id: existingCredit.id },
+      data: {
+        amountPaid: amount,
+        updatedAt: new Date()
+      }
+    });
+  } else {
+    return await tx.paymentReport.create({
+      data: {
+        tenantId,
+        amountPaid: amount,
+        status: 'CREDIT',
+        paymentPeriod: new Date(),
+        datePaid: new Date(),
+        rent: 0,
+        serviceCharge: 0,
+        vat: 0,
+        totalDue: 0,
+        arrears: 0,
+        notes: 'Credit balance for overpayment'
+      }
+    });
+  }
+}
+
+// Helper: Calculate how many periods are covered by overpayment
+function calculateCoveredPeriods(overpaymentAmount, monthlyRent, paymentPolicy) {
+  if (monthlyRent <= 0) return { months: 0, remainder: 0 };
+  
+  let monthsCovered = 0;
+  let remaining = overpaymentAmount;
+  
+  // Calculate based on payment policy
+  switch (paymentPolicy) {
+    case 'MONTHLY':
+      monthsCovered = Math.floor(remaining / monthlyRent);
+      remaining = remaining % monthlyRent;
+      break;
+    case 'QUARTERLY':
+      const quarterlyRent = monthlyRent * 3;
+      monthsCovered = Math.floor(remaining / quarterlyRent) * 3;
+      remaining = remaining % quarterlyRent;
+      break;
+    case 'ANNUAL':
+      const annualRent = monthlyRent * 12;
+      monthsCovered = Math.floor(remaining / annualRent) * 12;
+      remaining = remaining % annualRent;
+      break;
+    default:
+      monthsCovered = Math.floor(remaining / monthlyRent);
+      remaining = remaining % monthlyRent;
+  }
+  
+  return { months: monthsCovered, remainder: parseFloat(remaining.toFixed(2)) };
+}
+
+// @desc    Create payment report (Invoice-based, RENT ONLY)
 // @route   POST /api/payments
 // @access  Private (ADMIN, MANAGER)
 export const createPaymentReport = async (req, res) => {
@@ -401,12 +430,12 @@ export const createPaymentReport = async (req, res) => {
       tenantId, 
       amountPaid,
       invoiceIds = [], // Array of invoice IDs being paid
-      billInvoiceIds = [], // Array of bill invoice IDs being paid
       notes,
       paymentPeriod,
       autoGenerateBalanceInvoice = false,
       createMissingInvoices = false,
-      updateExistingInvoices = true // NEW: Flag to update existing invoices
+      updateExistingInvoices = true,
+      handleOverpayment = true
     } = req.body;
 
     // Input validation
@@ -465,16 +494,24 @@ export const createPaymentReport = async (req, res) => {
       });
     }
 
-    // 2. Process invoices being paid
+    // 2. Check for existing credit balance
+    let existingCredit = 0;
+    if (handleOverpayment) {
+      existingCredit = await getTenantCreditBalance(prisma, tenantId);
+      if (existingCredit > 0) {
+        console.log(`Found existing credit balance for tenant: ${existingCredit}`);
+      }
+    }
+
+    // 3. Determine invoices to process based on user selection
     let invoicesToProcess = [];
-    let billInvoicesToProcess = [];
     let totalInvoiceBalance = 0;
-    let paymentPolicy = tenant.paymentPolicy; // Default to tenant's policy
+    let paymentPolicy = tenant.paymentPolicy;
     let paymentPeriodStr = paymentPeriodDate ? 
       paymentPeriodDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 
       new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-    
-    // If invoiceIds provided, fetch those specific invoices
+
+    // If user selected specific invoices
     if (invoiceIds && invoiceIds.length > 0) {
       invoicesToProcess = await prisma.invoice.findMany({
         where: {
@@ -484,7 +521,7 @@ export const createPaymentReport = async (req, res) => {
             in: ['UNPAID', 'PARTIAL', 'OVERDUE']
           }
         },
-        orderBy: { dueDate: 'asc' } // Pay oldest first
+        orderBy: { dueDate: 'asc' }
       });
 
       if (invoicesToProcess.length === 0) {
@@ -494,21 +531,17 @@ export const createPaymentReport = async (req, res) => {
         });
       }
 
-      // Calculate total balance from selected invoices
       totalInvoiceBalance = invoicesToProcess.reduce((sum, inv) => sum + inv.balance, 0);
-      
-      // Use payment policy from first invoice if available
       paymentPolicy = invoicesToProcess[0].paymentPolicy || tenant.paymentPolicy;
       paymentPeriodStr = invoicesToProcess[0].paymentPeriod || paymentPeriodStr;
       
-      console.log(`Processing ${invoicesToProcess.length} invoices with total balance: ${totalInvoiceBalance}`);
-    }
-
-    // If billInvoiceIds provided, fetch those specific bill invoices
-    if (billInvoiceIds && billInvoiceIds.length > 0) {
-      billInvoicesToProcess = await prisma.billInvoice.findMany({
+      console.log(`Processing ${invoicesToProcess.length} selected invoices with total balance: ${totalInvoiceBalance}`);
+    } 
+    // If user didn't select any invoices
+    else {
+      // Get all unpaid/partial invoices ordered by due date (FIFO)
+      invoicesToProcess = await prisma.invoice.findMany({
         where: {
-          id: { in: billInvoiceIds },
           tenantId: tenantId,
           status: {
             in: ['UNPAID', 'PARTIAL', 'OVERDUE']
@@ -517,66 +550,101 @@ export const createPaymentReport = async (req, res) => {
         orderBy: { dueDate: 'asc' }
       });
 
-      const totalBillInvoiceBalance = billInvoicesToProcess.reduce((sum, bi) => sum + bi.balance, 0);
-      totalInvoiceBalance += totalBillInvoiceBalance;
+      totalInvoiceBalance = invoicesToProcess.reduce((sum, inv) => sum + inv.balance, 0);
       
-      console.log(`Processing ${billInvoicesToProcess.length} bill invoices with total balance: ${totalBillInvoiceBalance}`);
-    }
-
-    // If no specific invoices provided and createMissingInvoices is true, create new invoice
-    if (invoiceIds.length === 0 && billInvoiceIds.length === 0 && createMissingInvoices) {
-      const expected = await computeExpectedCharges(
-        tenantId,
-        paymentPeriodDate
-      );
-      
-      // Generate invoice number
-      const invoiceNumber = await generateInvoiceNumber();
-      
-      // Create invoice for current period
-      const newInvoice = await prisma.invoice.create({
-        data: {
-          invoiceNumber,
-          tenantId,
-          issueDate: new Date(),
-          dueDate: paymentPeriodDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-          paymentPeriod: expected.periodStart.toLocaleDateString('en-US', { 
-            month: 'long', 
-            year: 'numeric' 
-          }),
-          rent: expected.rent,
-          serviceCharge: expected.serviceCharge,
-          vat: expected.vat,
-          totalDue: expected.totalDue,
-          amountPaid: 0,
-          balance: expected.totalDue,
-          status: 'UNPAID',
-          paymentPolicy: tenant.paymentPolicy,
-          notes: `Auto-generated for payment recording`
+      // If no existing invoices
+      if (invoicesToProcess.length === 0) {
+        // If createMissingInvoices is true, create one
+        if (createMissingInvoices) {
+          const expected = await computeExpectedCharges(tenantId, paymentPeriodDate);
+          
+          const invoiceNumber = await generateInvoiceNumber();
+          const newInvoice = await prisma.invoice.create({
+            data: {
+              invoiceNumber,
+              tenantId,
+              issueDate: new Date(),
+              dueDate: paymentPeriodDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+              paymentPeriod: expected.periodStart.toLocaleDateString('en-US', { 
+                month: 'long', 
+                year: 'numeric' 
+              }),
+              rent: expected.rent,
+              serviceCharge: expected.serviceCharge,
+              vat: expected.vat,
+              totalDue: expected.totalDue,
+              amountPaid: 0,
+              balance: expected.totalDue,
+              status: 'UNPAID',
+              paymentPolicy: tenant.paymentPolicy,
+              notes: `Auto-generated for payment recording`
+            }
+          });
+          
+          invoicesToProcess = [newInvoice];
+          totalInvoiceBalance = expected.totalDue;
+          paymentPeriodStr = newInvoice.paymentPeriod;
+          console.log(`Created new invoice for payment: ${newInvoice.invoiceNumber}`);
+        } else {
+          // createMissingInvoices is false AND no invoices exist - ERROR
+          return res.status(400).json({
+            success: false,
+            message: 'No invoices found for this tenant. Either create an invoice first, set createMissingInvoices to true, or provide specific invoiceIds.',
+            data: {
+              tenantId,
+              createMissingInvoices,
+              invoiceIdsProvided: invoiceIds.length
+            }
+          });
         }
-      });
-      
-      invoicesToProcess = [newInvoice];
-      totalInvoiceBalance = expected.totalDue;
-      paymentPeriodStr = newInvoice.paymentPeriod;
-      console.log(`Created new invoice for payment: ${newInvoice.invoiceNumber}`);
+      } else {
+        // Use existing invoices (FIFO)
+        paymentPolicy = invoicesToProcess[0].paymentPolicy || tenant.paymentPolicy;
+        paymentPeriodStr = invoicesToProcess[0].paymentPeriod || paymentPeriodStr;
+        console.log(`Using FIFO: Processing ${invoicesToProcess.length} oldest invoices with total balance: ${totalInvoiceBalance}`);
+      }
     }
 
-    // 3. Validate payment amount
-    if (parsedAmountPaid > totalInvoiceBalance) {
+    // Calculate total amount available (payment + existing credit)
+    const totalAvailable = parsedAmountPaid + existingCredit;
+    
+    // Check for overpayment
+    let overpaymentAmount = 0;
+    let commissionBaseAmount = 0;
+    let actualPaymentForCurrentPeriod = parsedAmountPaid;
+
+    if (totalAvailable > totalInvoiceBalance) {
+      overpaymentAmount = totalAvailable - totalInvoiceBalance;
+      
+      // For commission calculation, use only what's due for current period
+      commissionBaseAmount = Math.min(totalInvoiceBalance, parsedAmountPaid);
+      
+      // Calculate actual cash payment for current period
+      actualPaymentForCurrentPeriod = Math.max(0, totalInvoiceBalance - existingCredit);
+      
+      console.log(`Overpayment detected: ${overpaymentAmount}`);
+      console.log(`Commission base amount: ${commissionBaseAmount}`);
+    } else {
+      commissionBaseAmount = parsedAmountPaid;
+    }
+
+    // Validate payment amount
+    if (!handleOverpayment && totalAvailable > totalInvoiceBalance) {
       return res.status(400).json({
         success: false,
-        message: `Payment amount (${parsedAmountPaid}) exceeds total invoice balance (${totalInvoiceBalance})`,
+        message: `Payment amount (${parsedAmountPaid}) plus existing credit (${existingCredit}) exceeds total invoice balance (${totalInvoiceBalance}). Enable handleOverpayment to accept overpayments.`,
         data: {
           totalInvoiceBalance,
           paymentAmount: parsedAmountPaid,
-          difference: parsedAmountPaid - totalInvoiceBalance
+          existingCredit,
+          totalAvailable,
+          difference: totalAvailable - totalInvoiceBalance
         }
       });
     }
 
-    // 4. Calculate frequency based on payment policy
-    let frequency = 'MONTHLY'; // Default
+    // Calculate frequency based on payment policy
+    let frequency = 'MONTHLY';
     switch (paymentPolicy) {
       case 'QUARTERLY':
         frequency = 'QUARTERLY';
@@ -589,9 +657,18 @@ export const createPaymentReport = async (req, res) => {
         frequency = 'MONTHLY';
     }
 
-    // 5. Process payment in transaction with increased timeout
+    // 4. Process payment in transaction
     transactionResult = await prisma.$transaction(async (tx) => {
-      // Create PaymentReport
+      // Apply existing credit first
+      let creditUsed = 0;
+      if (existingCredit > 0) {
+        creditUsed = Math.min(existingCredit, totalInvoiceBalance);
+        const remainingCredit = existingCredit - creditUsed;
+        await updateTenantCreditBalance(tx, tenantId, Math.max(0, remainingCredit));
+        console.log(`Applied ${creditUsed} from existing credit, remaining: ${Math.max(0, remainingCredit)}`);
+      }
+
+      // Create PaymentReport for current payment
       const report = await tx.paymentReport.create({
         data: {
           tenantId,
@@ -599,42 +676,194 @@ export const createPaymentReport = async (req, res) => {
           serviceCharge: invoicesToProcess.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
           vat: invoicesToProcess.reduce((sum, inv) => sum + (inv.vat || 0), 0),
           totalDue: invoicesToProcess.reduce((sum, inv) => sum + inv.totalDue, 0),
-          amountPaid: parsedAmountPaid,
-          arrears: Math.max(0, totalInvoiceBalance - parsedAmountPaid),
-          status: parsedAmountPaid >= totalInvoiceBalance ? 'PAID' : 
-                  parsedAmountPaid > 0 ? 'PARTIAL' : 'UNPAID',
+          amountPaid: actualPaymentForCurrentPeriod,
+          arrears: Math.max(0, totalInvoiceBalance - totalAvailable),
+          status: totalAvailable >= totalInvoiceBalance ? 'PAID' : 
+                  totalAvailable > 0 ? 'PARTIAL' : 'UNPAID',
           paymentPeriod: paymentPeriodDate || new Date(),
           datePaid: new Date(),
           notes: notes || null
         }
       });
 
-      // NEW: Update existing invoices if flag is true
+      // Update existing invoices for the same period if flag is true and no specific invoices selected
       let invoiceUpdateResult = null;
-      if (updateExistingInvoices && (parsedAmountPaid > 0)) {
+      let remainingPayment = totalAvailable;
+      const updatedInvoices = [];
+
+      if (updateExistingInvoices && invoiceIds.length === 0 && totalAvailable > 0) {
         invoiceUpdateResult = await updateExistingInvoicesForPayment(
           tx,
           tenantId,
           paymentPeriodStr,
-          parsedAmountPaid,
+          totalAvailable,
           report.id,
           paymentPeriodDate || new Date(),
-          parsedAmountPaid >= totalInvoiceBalance ? 'PAID' : 
-            parsedAmountPaid > 0 ? 'PARTIAL' : 'UNPAID'
+          totalAvailable >= totalInvoiceBalance ? 'PAID' : 
+            totalAvailable > 0 ? 'PARTIAL' : 'UNPAID'
         );
         
-        console.log(`Updated ${invoiceUpdateResult.updatedInvoices.length} existing invoices, applied ${invoiceUpdateResult.totalApplied} to existing invoices`);
+        // Add auto-updated invoices to the results
+        if (invoiceUpdateResult.updatedInvoices.length > 0) {
+          updatedInvoices.push(...invoiceUpdateResult.updatedInvoices.map(inv => ({
+            ...inv,
+            wasAutoPaid: true,
+            selectionType: 'AUTO_PERIOD_MATCH'
+          })));
+        }
+        
+        // Update remaining payment
+        remainingPayment = invoiceUpdateResult.remainingPayment;
+        
+        console.log(`Auto-updated ${invoiceUpdateResult.updatedInvoices.length} invoices for period ${paymentPeriodStr}, applied ${invoiceUpdateResult.totalApplied}`);
+      } else {
+        // If specific invoices selected or updateExistingInvoices is false, start with full available amount
+        remainingPayment = totalAvailable;
       }
 
-      // Apply payment to invoices (if any remaining payment after updating existing invoices)
-      let remainingPayment = invoiceUpdateResult ? 
-        (parsedAmountPaid - invoiceUpdateResult.totalApplied) : 
-        parsedAmountPaid;
+      // Handle overpayment with FIFO allocation
+      let overpaymentRecords = [];
+      let remainingOverpayment = overpaymentAmount;
       
-      const updatedInvoices = [];
-      const updatedBillInvoices = [];
+      if (overpaymentAmount > 0 && handleOverpayment) {
+        console.log(`Handling overpayment of ${overpaymentAmount} with FIFO allocation`);
+        
+        // First, allocate overpayment to other unpaid invoices (not in the current processing list)
+        const otherUnpaidInvoices = await tx.invoice.findMany({
+          where: {
+            tenantId: tenantId,
+            status: {
+              in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+            },
+            id: {
+              notIn: invoicesToProcess.map(inv => inv.id)
+            }
+          },
+          orderBy: { dueDate: 'asc' }
+        });
 
-      // Process specified rent invoices (if payment still remaining)
+        // Allocate overpayment to other unpaid invoices first
+        for (const invoice of otherUnpaidInvoices) {
+          if (remainingOverpayment <= 0) break;
+          
+          const paymentToApply = Math.min(invoice.balance, remainingOverpayment);
+          if (paymentToApply > 0) {
+            const newAmountPaid = invoice.amountPaid + paymentToApply;
+            const newBalance = invoice.balance - paymentToApply;
+            let newStatus = invoice.status;
+            
+            if (newBalance <= 0) {
+              newStatus = 'PAID';
+            } else if (paymentToApply > 0) {
+              newStatus = 'PARTIAL';
+            }
+
+            await tx.invoice.update({
+              where: { id: invoice.id },
+              data: {
+                amountPaid: newAmountPaid,
+                balance: newBalance,
+                status: newStatus,
+                paymentReportId: report.id,
+                updatedAt: new Date(),
+                notes: `Paid from overpayment of transaction #${report.id}`
+              }
+            });
+
+            overpaymentRecords.push({
+              type: 'FUTURE_INVOICE',
+              invoiceId: invoice.id,
+              invoiceNumber: invoice.invoiceNumber,
+              period: invoice.paymentPeriod,
+              amountApplied: paymentToApply,
+              commissionApplicable: false
+            });
+
+            // Add to updated invoices for response
+            updatedInvoices.push({
+              id: invoice.id,
+              invoiceNumber: invoice.invoiceNumber,
+              previousBalance: invoice.balance,
+              previousAmountPaid: invoice.amountPaid,
+              paymentApplied: paymentToApply,
+              newAmountPaid: newAmountPaid,
+              newBalance: newBalance,
+              newStatus: newStatus,
+              previousStatus: invoice.status,
+              wasAutoPaid: true,
+              paymentPolicy: invoice.paymentPolicy,
+              selectionType: 'AUTO_FIFO_OVERPAYMENT'
+            });
+
+            remainingOverpayment -= paymentToApply;
+            console.log(`Allocated ${paymentToApply} to future invoice ${invoice.invoiceNumber}`);
+          }
+        }
+
+        // If still have overpayment, create prepaid future periods
+        if (remainingOverpayment > 0) {
+          const monthlyRent = tenant.rent;
+          const { months, remainder } = calculateCoveredPeriods(remainingOverpayment, monthlyRent, paymentPolicy);
+          
+          let futureDate = new Date(paymentPeriodDate || new Date());
+          const coveredMonths = months > 0 ? months : 0;
+          
+          for (let i = 1; i <= coveredMonths; i++) {
+            switch (paymentPolicy) {
+              case 'QUARTERLY':
+                futureDate.setMonth(futureDate.getMonth() + 3);
+                break;
+              case 'ANNUAL':
+                futureDate.setFullYear(futureDate.getFullYear() + 1);
+                break;
+              case 'MONTHLY':
+              default:
+                futureDate.setMonth(futureDate.getMonth() + 1);
+                break;
+            }
+            
+            const expected = await computeExpectedCharges(tenantId, futureDate);
+            
+            const futureReport = await tx.paymentReport.create({
+              data: {
+                tenantId,
+                rent: expected.rent,
+                serviceCharge: expected.serviceCharge,
+                vat: expected.vat,
+                totalDue: expected.totalDue,
+                amountPaid: 0,
+                arrears: 0,
+                status: 'PREPAID',
+                paymentPeriod: futureDate,
+                datePaid: new Date(),
+                notes: `Covered by overpayment from ${paymentPeriodStr}. Original payment: ${parsedAmountPaid}`
+              }
+            });
+            
+            overpaymentRecords.push({
+              type: 'PREPAID_PERIOD',
+              period: futureDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+              reportId: futureReport.id,
+              amountCovered: expected.totalDue,
+              commissionApplicable: false
+            });
+          }
+          
+          // Store remainder as credit balance
+          if (remainder > 0) {
+            await updateTenantCreditBalance(tx, tenantId, remainder);
+            overpaymentRecords.push({
+              type: 'CREDIT_BALANCE',
+              amount: remainder,
+              commissionApplicable: false
+            });
+          }
+          
+          console.log(`Created ${coveredMonths} prepaid records, credit balance: ${remainder}`);
+        }
+      }
+
+      // Apply payment to selected/oldest invoices (if not already processed by updateExistingInvoicesForPayment)
       for (const invoice of invoicesToProcess) {
         if (remainingPayment <= 0) break;
         
@@ -645,11 +874,6 @@ export const createPaymentReport = async (req, res) => {
         
         if (alreadyUpdated) {
           // Skip, already updated
-          updatedInvoices.push({
-            id: invoice.id,
-            invoiceNumber: invoice.invoiceNumber,
-            ...alreadyUpdated
-          });
           continue;
         }
         
@@ -675,37 +899,21 @@ export const createPaymentReport = async (req, res) => {
           }
         });
 
-        updatedInvoices.push(updatedInvoice);
-        remainingPayment -= paymentToApply;
-      }
-
-      // Process specified bill invoices
-      for (const billInvoice of billInvoicesToProcess) {
-        if (remainingPayment <= 0) break;
-        
-        const paymentToApply = Math.min(billInvoice.balance, remainingPayment);
-        const newAmountPaid = billInvoice.amountPaid + paymentToApply;
-        const newBalance = billInvoice.balance - paymentToApply;
-        
-        let newStatus = billInvoice.status;
-        if (newBalance <= 0) {
-          newStatus = 'PAID';
-        } else if (paymentToApply > 0) {
-          newStatus = 'PARTIAL';
-        }
-
-        const updatedBillInvoice = await tx.billInvoice.update({
-          where: { id: billInvoice.id },
-          data: {
-            amountPaid: newAmountPaid,
-            balance: newBalance,
-            status: newStatus,
-            paymentReportId: report.id,
-            updatedAt: new Date()
-          }
+        updatedInvoices.push({
+          id: updatedInvoice.id,
+          invoiceNumber: updatedInvoice.invoiceNumber,
+          previousBalance: invoice.balance,
+          previousAmountPaid: invoice.amountPaid,
+          paymentApplied: paymentToApply,
+          newAmountPaid: updatedInvoice.amountPaid,
+          newBalance: updatedInvoice.balance,
+          newStatus: updatedInvoice.status,
+          previousStatus: invoice.status,
+          wasAutoPaid: false,
+          paymentPolicy: updatedInvoice.paymentPolicy,
+          selectionType: invoiceIds.length > 0 ? 'USER_SELECTED' : 'FIFO_ALLOCATION'
         });
 
-        updatedBillInvoices.push(updatedBillInvoice);
         remainingPayment -= paymentToApply;
       }
 
@@ -714,19 +922,17 @@ export const createPaymentReport = async (req, res) => {
         data: {
           propertyId: tenant.unit.propertyId,
           tenantId,
-          amount: parsedAmountPaid,
-          frequency: frequency // Use calculated frequency
+          amount: actualPaymentForCurrentPeriod,
+          frequency: frequency
         }
       });
 
-      // Auto-generate balance invoice for partial payments if requested
+      // Auto-generate balance invoice for partial payments
       let balanceInvoice = null;
-      const finalRemainingBalance = totalInvoiceBalance - (parsedAmountPaid - (invoiceUpdateResult?.totalApplied || 0));
+      const finalRemainingBalance = totalInvoiceBalance - totalAvailable;
       
       if (autoGenerateBalanceInvoice && finalRemainingBalance > 0) {
         const balanceInvoiceNumber = await generateInvoiceNumber();
-        
-        // Use the first invoice as template for balance invoice
         const templateInvoice = invoicesToProcess.length > 0 ? invoicesToProcess[0] : null;
         
         if (templateInvoice) {
@@ -736,7 +942,7 @@ export const createPaymentReport = async (req, res) => {
               tenantId,
               paymentReportId: report.id,
               issueDate: new Date(),
-              dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+              dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
               paymentPeriod: templateInvoice.paymentPeriod,
               rent: templateInvoice.rent,
               serviceCharge: templateInvoice.serviceCharge,
@@ -752,12 +958,22 @@ export const createPaymentReport = async (req, res) => {
         }
       }
 
-      // Process commission INSIDE transaction but simplified
+      // Process commission
       let commission = null;
-      if (tenant.unit?.property?.commissionFee && tenant.unit?.property?.commissionFee > 0) {
-        const commissionAmount = (parsedAmountPaid * tenant.unit.property.commissionFee) / 100;
+      if (tenant.unit?.property?.commissionFee && tenant.unit?.property?.commissionFee > 0 && commissionBaseAmount > 0) {
         
-        // Determine period based on payment frequency
+        let vatExclusiveCommissionBase = commissionBaseAmount;
+        const tenantVatType = tenant.vatType || 'NOT_APPLICABLE';
+        const tenantVatRate = tenant.vatRate || 0;
+        
+        if (tenantVatType === 'INCLUSIVE' && tenantVatRate > 0) {
+          vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
+        } else if (tenantVatType === 'EXCLUSIVE') {
+          vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
+        }
+        
+        const commissionAmount = (vatExclusiveCommissionBase * tenant.unit.property.commissionFee) / 100;
+        
         const periodStart = new Date();
         let periodEnd = new Date();
         
@@ -768,10 +984,8 @@ export const createPaymentReport = async (req, res) => {
           case 'ANNUAL':
             periodEnd.setFullYear(periodEnd.getFullYear() + 1);
             break;
-          case 'MONTHLY':
           default:
             periodEnd.setMonth(periodEnd.getMonth() + 1);
-            break;
         }
 
         commission = await tx.managerCommission.create({
@@ -779,11 +993,13 @@ export const createPaymentReport = async (req, res) => {
             propertyId: tenant.unit.propertyId,
             managerId: tenant.unit.property.managerId,
             commissionFee: tenant.unit.property.commissionFee,
-            incomeAmount: parsedAmountPaid,
+            incomeAmount: vatExclusiveCommissionBase,
+            originalIncomeAmount: actualPaymentForCurrentPeriod,
             commissionAmount: commissionAmount,
             periodStart: periodStart,
             periodEnd: periodEnd,
-            status: 'PENDING'
+            status: 'PENDING',
+            notes: `VAT Type: ${tenantVatType}, VAT Rate: ${tenantVatRate}%, Commission calculated on current period only`
           }
         });
       }
@@ -792,22 +1008,25 @@ export const createPaymentReport = async (req, res) => {
         report,
         income,
         commission,
-        updatedInvoices: [
-          ...(invoiceUpdateResult?.updatedInvoices || []),
-          ...updatedInvoices
-        ],
-        updatedBillInvoices,
+        updatedInvoices,
         balanceInvoice,
         invoiceUpdateResult,
-        tenant
+        tenant,
+        overpaymentRecords,
+        overpaymentAmount,
+        commissionBaseAmount,
+        actualPaymentForCurrentPeriod,
+        creditUsed,
+        totalInvoiceBalance,
+        totalAvailable,
+        paymentPeriodStr
       };
     }, {
-      // Increased transaction timeout
       maxWait: 20000,
       timeout: 60000,
     });
 
-    // 7. Format response
+    // 5. Format response
     res.status(201).json({
       success: true,
       data: {
@@ -832,19 +1051,13 @@ export const createPaymentReport = async (req, res) => {
           invoiceNumber: inv.invoiceNumber,
           previousBalance: inv.previousBalance,
           paymentApplied: inv.paymentApplied,
-          newAmountPaid: inv.newAmountPaid || inv.amountPaid,
-          newBalance: inv.newBalance || inv.balance,
-          newStatus: inv.newStatus || inv.status,
+          newAmountPaid: inv.newAmountPaid,
+          newBalance: inv.newBalance,
+          newStatus: inv.newStatus,
           previousStatus: inv.previousStatus,
           wasAutoPaid: inv.wasAutoPaid || false,
+          selectionType: inv.selectionType || 'UNKNOWN',
           paymentPolicy: inv.paymentPolicy
-        })),
-        billInvoices: transactionResult.updatedBillInvoices.map(bi => ({
-          id: bi.id,
-          invoiceNumber: bi.invoiceNumber,
-          amountPaid: bi.amountPaid,
-          balance: bi.balance,
-          status: bi.status
         })),
         balanceInvoice: transactionResult.balanceInvoice ? {
           id: transactionResult.balanceInvoice.id,
@@ -855,33 +1068,42 @@ export const createPaymentReport = async (req, res) => {
         existingInvoicesUpdated: transactionResult.invoiceUpdateResult ? {
           count: transactionResult.invoiceUpdateResult.updatedInvoices.length,
           totalApplied: transactionResult.invoiceUpdateResult.totalApplied,
-          remainingPayment: transactionResult.invoiceUpdateResult.remainingPayment
+          remainingPayment: transactionResult.invoiceUpdateResult.remainingPayment,
+          period: transactionResult.paymentPeriodStr
+        } : null,
+        overpayment: transactionResult.overpaymentAmount > 0 ? {
+          totalOverpayment: transactionResult.overpaymentAmount,
+          currentPeriodPayment: transactionResult.actualPaymentForCurrentPeriod,
+          invoiceBalanceCleared: transactionResult.totalInvoiceBalance,
+          allocations: transactionResult.overpaymentRecords,
+          creditUsed: transactionResult.creditUsed
         } : null,
         commission: transactionResult.commission ? {
           id: transactionResult.commission.id,
           commissionAmount: transactionResult.commission.commissionAmount,
-          status: transactionResult.commission.status
+          commissionBase: transactionResult.commission.incomeAmount,
+          originalAmount: transactionResult.commission.originalIncomeAmount,
+          status: transactionResult.commission.status,
+          note: 'Commission calculated only on current period amount'
         } : null
       },
       message: 'Payment recorded successfully' + 
         (transactionResult.invoiceUpdateResult ? 
-          ` (${transactionResult.invoiceUpdateResult.totalApplied} applied to existing invoices)` : 
+          ` (${transactionResult.invoiceUpdateResult.totalApplied} applied to existing invoices for period ${transactionResult.paymentPeriodStr})` : 
           '') +
-        (transactionResult.commission ? ' with commission' : '')
+        (transactionResult.overpaymentAmount > 0 ? 
+          ` (Overpayment of ${transactionResult.overpaymentAmount} allocated using FIFO)` : '') +
+        (transactionResult.creditUsed > 0 ? 
+          ` (${transactionResult.creditUsed} credit applied)` : '')
     });
 
   } catch (error) {
     console.error('Error creating payment report:', error);
     
-    // Check if we have partial transaction data
-    if (transactionResult) {
-      console.warn('Transaction partially completed:', transactionResult);
-    }
-    
     if (error.code === 'P2028') {
       return res.status(408).json({ 
         success: false, 
-        message: 'Transaction timeout. The operation took too long to complete. Please try again or contact support.' 
+        message: 'Transaction timeout. Please try again.' 
       });
     }
     
@@ -901,7 +1123,8 @@ export const createPaymentReport = async (req, res) => {
     
     res.status(400).json({ 
       success: false, 
-      message: error.message || 'Failed to create payment report' 
+      message: error.message || 'Failed to create payment report',
+      details: error.code ? `Error code: ${error.code}` : undefined
     });
   }
 };
@@ -976,7 +1199,8 @@ async function updateExistingInvoicesForPayment(tx, tenantId, paymentPeriodStr, 
             newBalance,
             newStatus,
             previousStatus: invoice.status,
-            paymentPolicy: invoice.paymentPolicy
+            paymentPolicy: invoice.paymentPolicy,
+            wasAutoPaid: true
           });
         }
       }
@@ -1038,6 +1262,7 @@ async function updateExistingInvoicesForPayment(tx, tenantId, paymentPeriodStr, 
     throw error;
   }
 }
+
 // @desc    Get income reports (with basic filtering)
 // @route   GET /api/payments/income
 // @access  Private
@@ -1146,8 +1371,24 @@ export const createIncome = async (req, res) => {
 export const previewPayment = async (req, res) => {
   try {
     const { tenantId } = req.params;
+    const { includeCredit = true } = req.query;
+    
     const preview = await computeExpectedCharges(tenantId);
-    res.json({ success: true, data: preview });
+    
+    // Check for existing credit balance
+    let creditBalance = 0;
+    if (includeCredit) {
+      creditBalance = await getTenantCreditBalance(prisma, tenantId);
+    }
+    
+    res.json({ 
+      success: true, 
+      data: {
+        ...preview,
+        existingCredit: creditBalance,
+        totalAvailable: preview.totalDue + creditBalance
+      }
+    });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
   }
@@ -1159,7 +1400,7 @@ export const previewPayment = async (req, res) => {
 export const updatePaymentReportWithIncome = async (req, res) => {
   try {
     const { id } = req.params;
-    const { amountPaid, paymentPeriod, notes, billIds } = req.body;
+    const { amountPaid, paymentPeriod, notes } = req.body;
 
     const result = await prisma.$transaction(async (tx) => {
       // Find existing payment report
@@ -1175,7 +1416,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               }
             }
           },
-          billInvoices: true,
           invoices: true
         }
       });
@@ -1267,17 +1507,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               issueDate: true,
               dueDate: true
             }
-          },
-          billInvoices: {
-            select: {
-              id: true,
-              invoiceNumber: true,
-              grandTotal: true,
-              amountPaid: true,
-              status: true,
-              issueDate: true,
-              dueDate: true
-            }
           }
         }
       });
@@ -1331,76 +1560,13 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         }
       }
 
-      // Create new bill invoices if bill IDs provided
-      let newBillInvoices = [];
-      if (billIds && Array.isArray(billIds) && billIds.length > 0) {
-        const bills = await tx.bill.findMany({
-          where: {
-            id: { in: billIds },
-            tenantId: existingReport.tenantId
-          }
-        });
-
-        for (const bill of bills) {
-          const billInvoiceNumber = await generateBillInvoiceNumber();
-          const issueDate = new Date();
-          const dueDate = bill.dueDate || new Date(issueDate.setDate(issueDate.getDate() + 30));
-
-          const billBalance = parseFloat((bill.grandTotal - bill.amountPaid).toFixed(2));
-          const billStatus = bill.amountPaid >= bill.grandTotal
-            ? 'PAID'
-            : bill.amountPaid > 0
-              ? 'PARTIAL'
-              : 'UNPAID';
-
-          const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
-
-          const billInvoice = await tx.billInvoice.create({
-            data: {
-              invoiceNumber: billInvoiceNumber,
-              billId: bill.id,
-              billReferenceNumber,
-              billReferenceDate: bill.issuedAt,
-              tenantId: existingReport.tenantId,
-              paymentReportId: updatedReport.id,
-              issueDate: new Date(),
-              dueDate,
-              billType: bill.type,
-              previousReading: bill.previousReading,
-              currentReading: bill.currentReading,
-              units: bill.units,
-              chargePerUnit: bill.chargePerUnit,
-              totalAmount: bill.totalAmount,
-              vatRate: bill.vatRate,
-              vatAmount: bill.vatAmount,
-              grandTotal: bill.grandTotal,
-              amountPaid: bill.amountPaid,
-              balance: billBalance,
-              status: billStatus,
-              notes: notes || null
-            }
-          });
-
-          newBillInvoices.push(billInvoice);
-        }
-      }
-
-      return { updatedReport, updatedIncome, newBillInvoices };
+      return { updatedReport, updatedIncome };
     });
 
     res.json({
       success: true,
       data: result.updatedReport,
       income: result.updatedIncome,
-      newBillInvoices: result.newBillInvoices.map(bi => ({
-        id: bi.id,
-        invoiceNumber: bi.invoiceNumber,
-        issueDate: bi.issueDate,
-        dueDate: bi.dueDate,
-        billType: bi.billType,
-        grandTotal: bi.grandTotal,
-        status: bi.status
-      })),
       message: 'Payment report and related records updated successfully'
     });
 
@@ -1482,6 +1648,9 @@ export async function getPropertyArrears(req, res) {
 
       const tenant = unit.tenant;
       
+      // Check for credit balance
+      const creditBalance = await getTenantCreditBalance(prisma, tenant.id);
+      
       // Process rent invoices (unpaid/partial)
       for (const invoice of tenant.invoices) {
         if (invoice.balance > 0) {
@@ -1493,7 +1662,7 @@ export async function getPropertyArrears(req, res) {
             unitType: unit.type || 'Unit',
             unitNo: unit.unitNo || 'N/A',
             floor: unit.floor || 'N/A',
-            invoiceNumber: invoice.invoiceNumber, // Use actual invoice number
+            invoiceNumber: invoice.invoiceNumber,
             invoiceType: 'RENT',
             expectedAmount: invoice.totalDue,
             paidAmount: invoice.amountPaid,
@@ -1502,7 +1671,9 @@ export async function getPropertyArrears(req, res) {
             status: invoice.status,
             description: `Rent for ${unit.property.name} - ${unit.type || 'Unit'} ${unit.unitNo || ''}`,
             invoiceId: invoice.id,
-            paymentPeriod: invoice.paymentPeriod
+            paymentPeriod: invoice.paymentPeriod,
+            hasCreditBalance: creditBalance > 0,
+            creditBalance: creditBalance
           });
         }
       }
@@ -1518,7 +1689,7 @@ export async function getPropertyArrears(req, res) {
             unitType: unit.type || 'Unit',
             unitNo: unit.unitNo || 'N/A',
             floor: unit.floor || 'N/A',
-            invoiceNumber: billInvoice.invoiceNumber, // Use actual bill invoice number
+            invoiceNumber: billInvoice.invoiceNumber,
             invoiceType: 'BILL',
             billType: billInvoice.billType,
             expectedAmount: billInvoice.grandTotal,
@@ -1553,10 +1724,10 @@ export async function getPropertyArrears(req, res) {
       // Calculate total paid from payment reports for current period
       const currentPeriodStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
       const currentPeriodPaid = tenant.paymentReports
-        .filter(report => new Date(report.paymentPeriod) >= currentPeriodStart)
+        .filter(report => new Date(report.paymentPeriod) >= currentPeriodStart && report.status !== 'CREDIT' && report.status !== 'PREPAID')
         .reduce((sum, report) => sum + report.amountPaid, 0);
 
-      const currentRentBalance = totalExpectedAmount - currentPeriodPaid;
+      const currentRentBalance = totalExpectedAmount - currentPeriodPaid - creditBalance;
 
       // Only add current rent arrears if there's a balance AND no existing invoice for current period
       const currentPeriodInvoiceExists = tenant.invoices.some(invoice => {
@@ -1573,26 +1744,25 @@ export async function getPropertyArrears(req, res) {
           unitType: unit.type || 'Unit',
           unitNo: unit.unitNo || 'N/A',
           floor: unit.floor || 'N/A',
-          invoiceNumber: `PENDING-RENT-${tenant.id.substring(0, 8).toUpperCase()}`, // Placeholder for pending invoice
+          invoiceNumber: `PENDING-RENT-${tenant.id.substring(0, 8).toUpperCase()}`,
           invoiceType: 'RENT',
           expectedAmount: totalExpectedAmount,
           paidAmount: currentPeriodPaid,
           balance: currentRentBalance,
-          dueDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1), // 1st of next month
+          dueDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1),
           status: currentPeriodPaid > 0 ? 'PARTIAL' : 'UNPAID',
           description: `Current period rent for ${unit.property.name}`,
-          isPendingInvoice: true
+          isPendingInvoice: true,
+          hasCreditBalance: creditBalance > 0,
+          creditBalance: creditBalance
         });
       }
     }
 
     // Sort by due date (oldest first) then by balance (highest first)
     arrearsData.sort((a, b) => {
-      // First sort by due date (oldest first)
       const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
       if (dateDiff !== 0) return dateDiff;
-      
-      // Then by balance (highest first)
       return b.balance - a.balance;
     });
 
@@ -1600,6 +1770,7 @@ export async function getPropertyArrears(req, res) {
     const totalArrears = arrearsData.reduce((sum, item) => sum + item.balance, 0);
     const totalExpected = arrearsData.reduce((sum, item) => sum + item.expectedAmount, 0);
     const totalPaid = arrearsData.reduce((sum, item) => sum + item.paidAmount, 0);
+    const totalCreditAvailable = arrearsData.reduce((sum, item) => sum + (item.creditBalance || 0), 0);
 
     return res.status(200).json({
       success: true,
@@ -1609,8 +1780,10 @@ export async function getPropertyArrears(req, res) {
           totalArrears,
           totalExpected,
           totalPaid,
+          totalCreditAvailable,
           itemCount: arrearsData.length,
-          pendingInvoicesCount: arrearsData.filter(item => item.isPendingInvoice).length
+          pendingInvoicesCount: arrearsData.filter(item => item.isPendingInvoice).length,
+          tenantsWithCredit: arrearsData.filter(item => item.hasCreditBalance).length
         }
       }
     });

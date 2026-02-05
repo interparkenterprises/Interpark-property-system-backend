@@ -8,6 +8,29 @@ import fsPromises from 'fs/promises';
 import path from 'path';
 
 /**
+ * Calculate VAT-exclusive amount from a payment for commission purposes
+ * @param {number} amount - Total amount paid
+ * @param {string} vatType - Tenant's VAT type (INCLUSIVE, EXCLUSIVE, NOT_APPLICABLE)
+ * @param {number} vatRate - VAT rate percentage (e.g., 16 for 16%)
+ * @returns {number} VAT-exclusive amount for commission calculation
+ */
+function calculateVatExclusiveAmount(amount, vatType, vatRate) {
+  if (!amount || amount <= 0) return 0;
+  
+  const normalizedVatType = vatType || 'NOT_APPLICABLE';
+  const rate = parseFloat(vatRate) || 0;
+  
+  if ((normalizedVatType === 'INCLUSIVE' || normalizedVatType === 'EXCLUSIVE') && rate > 0) {
+    // Both INCLUSIVE and EXCLUSIVE need VAT extraction for commission base
+    // Formula: VAT Exclusive = Total / (1 + VAT Rate/100)
+    return amount / (1 + (rate / 100));
+  }
+  
+  // NOT_APPLICABLE - no VAT, full amount is commission base
+  return amount;
+}
+
+/**
  * Get all commissions for a specific manager
  */
 export const getManagerCommissions = async (req, res) => {
@@ -628,7 +651,6 @@ export const generateCommissionInvoice = async (req, res) => {
 
     const {
       description,
-      vatRate = 0,
       bankName,
       accountName,
       accountNumber,
@@ -636,6 +658,7 @@ export const generateCommissionInvoice = async (req, res) => {
       bankCode,
       swiftCode,
       currency = "KES"
+      // REMOVED vatRate from request body since commission has no VAT
     } = req.body;
 
     if (!description) {
@@ -692,16 +715,43 @@ export const generateCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Check if invoice already exists to prevent duplicate transactions
-    const existingInvoice = await prisma.commissionInvoice.findFirst({
+    // ----- CHECK FOR EXISTING INVOICE -----
+    // If invoice exists, delete it to prevent duplicates
+    let existingInvoice = await prisma.commissionInvoice.findFirst({
       where: { commissionId: id }
     });
 
+    // If invoice exists, delete the old one and its associated PDF file
     if (existingInvoice) {
-      return res.status(400).json({
-        success: false,
-        message: "Invoice already generated for this commission"
+      console.log(`Deleting existing invoice for commission ${id}: ${existingInvoice.invoiceNumber}`);
+      
+      // Delete the PDF file from storage if it exists
+      if (existingInvoice.pdfUrl) {
+        try {
+          const fileName = existingInvoice.pdfUrl.split('/').pop();
+          if (fileName) {
+            const filePath = path.join(
+              process.cwd(),
+              'uploads',
+              'commission-invoice',
+              fileName
+            );
+            
+            if (fs.existsSync(filePath)) {
+              await fsPromises.unlink(filePath);
+              console.log(`Deleted PDF file: ${filePath}`);
+            }
+          }
+        } catch (fileError) {
+          console.error('Error deleting PDF file:', fileError);
+        }
+      }
+      
+      await prisma.commissionInvoice.delete({
+        where: { id: existingInvoice.id }
       });
+      
+      console.log(`Deleted existing invoice record: ${existingInvoice.invoiceNumber}`);
     }
 
     // ----- AUTO-POPULATED FIELDS -----
@@ -714,25 +764,36 @@ export const generateCommissionInvoice = async (req, res) => {
     const refText = `COM-${monthShort}-${year}-${commission.property?.name || "PROPERTY"}`;
 
     // ----- COMMISSION CALCULATION -----
+    // Use the VAT-exclusive incomeAmount stored in commission
     const collectionAmount = Number(commission.incomeAmount || 0);
+    const originalIncomeAmount = Number(commission.originalIncomeAmount || collectionAmount);
+    
+    // Extract VAT information from commission notes if available
+    let vatTypeFromNotes = 'NOT_APPLICABLE';
+    let vatRateFromNotes = 0;
+    if (commission.notes) {
+      const vatTypeMatch = commission.notes.match(/VAT Type: (\w+)/);
+      const vatRateMatch = commission.notes.match(/VAT Rate: ([\d.]+)%/);
+      if (vatTypeMatch) vatTypeFromNotes = vatTypeMatch[1];
+      if (vatRateMatch) vatRateFromNotes = parseFloat(vatRateMatch[1]);
+    }
     
     // Convert commission fee to decimal
     const commissionFeeFromDB = Number(commission.commissionFee || 0);
     let commissionRateDecimal;
     
     if (commissionFeeFromDB > 1) {
-      // Likely a percentage (e.g., 85)
       commissionRateDecimal = commissionFeeFromDB / 100;
     } else {
-      // Likely already a decimal
       commissionRateDecimal = commissionFeeFromDB;
     }
     
     const commissionAmount = Number((collectionAmount * commissionRateDecimal).toFixed(2));
 
-    const vatRateNum = Number(vatRate || 0);
-    const vatAmount = Number((commissionAmount * vatRateNum).toFixed(2));
-    const totalAmount = Number((commissionAmount + vatAmount).toFixed(2));
+    // COMMISSION TO LANDLORD HAS NO VAT
+    const vatRateNum = 0; // Always 0 for commission
+    const vatAmount = 0; // Always 0 for commission
+    const totalAmount = commissionAmount; // Total equals commission amount only
 
     // Generate invoice number
     const invoiceNumber = await generateCommissionInvoiceNumber();
@@ -750,11 +811,14 @@ export const generateCommissionInvoice = async (req, res) => {
       landlordName: commission.property?.landlord?.name || "",
       landlordAddress,
       description,
-      collectionAmount,
+      collectionAmount,  // VAT-exclusive base amount from tenant
+      originalIncomeAmount, // Original payment amount from tenant (for reference)
+      vatType: vatTypeFromNotes, // Tenant's VAT type (for reference only)
+      vatRate: vatRateFromNotes, // Tenant's VAT rate (for reference only)
       commissionRate: commissionRateDecimal,
       commissionAmount,
-      vatAmount,
-      totalAmount,
+      vatAmount: 0,  // ALWAYS 0 for commission invoice
+      totalAmount: commissionAmount, // Total equals commission amount
       bankName,
       accountName,
       accountNumber,
@@ -788,9 +852,9 @@ export const generateCommissionInvoice = async (req, res) => {
           collectionAmount,
           commissionRate: commissionRateDecimal,
           commissionAmount,
-          vatRate: vatRateNum,
-          vatAmount,
-          totalAmount,
+          vatRate: 0, // Always 0 for commission
+          vatAmount: 0, // Always 0 for commission
+          totalAmount: commissionAmount, // Total equals commission amount
           bankName,
           accountName,
           accountNumber,
@@ -802,7 +866,7 @@ export const generateCommissionInvoice = async (req, res) => {
         }
       });
 
-      // Update commission status
+      // Update commission status to PROCESSING
       const updatedCommission = await tx.managerCommission.update({
         where: { id: commission.id },
         data: { status: "PROCESSING" }
@@ -810,23 +874,33 @@ export const generateCommissionInvoice = async (req, res) => {
 
       return { createdInvoice, updatedCommission };
     }, {
-      maxWait: 10000, // 10 seconds max wait for transaction to start
-      timeout: 30000, // 30 seconds max for transaction to complete
+      maxWait: 15000,
+      timeout: 30000,
     });
 
     return res.status(201).json({
       success: true,
-      message: "Commission invoice generated successfully",
+      message: existingInvoice 
+        ? "Commission invoice regenerated successfully (previous invoice deleted)" 
+        : "Commission invoice generated successfully",
       data: {
         invoice: result.createdInvoice,
-        commission: result.updatedCommission
+        commission: result.updatedCommission,
+        vatDetails: {
+          originalAmount: originalIncomeAmount,
+          vatExclusiveBase: collectionAmount,
+          vatType: vatTypeFromNotes,
+          vatRate: vatRateFromNotes,
+          note: "Commission invoice is VAT-exempt"
+        },
+        previousInvoiceDeleted: !!existingInvoice,
+        previousInvoiceNumber: existingInvoice?.invoiceNumber
       }
     });
 
   } catch (error) {
     console.error("Error generating commission invoice:", error);
     
-    // Handle specific transaction timeout error
     if (error.code === 'P2028') {
       return res.status(503).json({
         success: false,
@@ -836,7 +910,6 @@ export const generateCommissionInvoice = async (req, res) => {
       });
     }
     
-    // Handle other Prisma errors
     if (error.code && error.code.startsWith('P')) {
       return res.status(500).json({
         success: false,
@@ -846,7 +919,6 @@ export const generateCommissionInvoice = async (req, res) => {
       });
     }
     
-    // Handle generic errors
     return res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -854,7 +926,6 @@ export const generateCommissionInvoice = async (req, res) => {
     });
   }
 };
-
 /**
  * Download commission invoice PDF by invoice number
  * Manager/Admin
@@ -881,13 +952,6 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // DEBUG: Log the invoice data
-   // console.log('Invoice found:', {
-     // id: invoice.id,
-     // invoiceNumber: invoice.invoiceNumber,
-     // pdfUrl: invoice.pdfUrl
-   // });
-
     // Check if user has access
     if (req.user.role !== 'ADMIN' && req.user.id !== invoice.commission.managerId) {
       return res.status(403).json({
@@ -904,14 +968,8 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // DEBUG: Log the original pdfUrl
-    console.log('Original pdfUrl:', pdfUrl);
-    
     // Extract the filename from the URL - handle both forward and backslashes
     const fileName = pdfUrl.split(/[/\\]/).pop();
-    
-    // DEBUG: Log extracted filename
-    console.log('Extracted fileName:', fileName);
     
     if (!fileName) {
       return res.status(404).json({
@@ -927,12 +985,6 @@ export const downloadCommissionInvoice = async (req, res) => {
       'commission-invoice',
       fileName
     );
-
-    // Alternative: If pdfUrl is an absolute path, use it directly
-    // const filePath = path.resolve(pdfUrl);
-
-    // DEBUG: Log the constructed file path
-    console.log('Constructed filePath:', filePath);
 
     // Check if file exists
     try {

@@ -21,8 +21,10 @@ export const createBill = async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!tenantId || !type || previousReading === undefined || currentReading === undefined || chargePerUnit === undefined) {
-      return res.status(400).json({ error: 'tenantId, type, previousReading, currentReading, and chargePerUnit are required.' });
+    if (!tenantId || !type || currentReading === undefined || chargePerUnit === undefined) {
+      return res.status(400).json({ 
+        error: 'tenantId, type, currentReading, and chargePerUnit are required.' 
+      });
     }
 
     // Validate tenant exists
@@ -33,8 +35,54 @@ export const createBill = async (req, res) => {
       return res.status(404).json({ error: 'Tenant not found.' });
     }
 
+    // ==============================================
+    // NEW: Get previous reading from last bill
+    // ==============================================
+    let previousReadingToUse = previousReading;
+    
+    // If previousReading is not provided, fetch the last bill's current reading
+    if (previousReading === undefined) {
+      const lastBill = await prisma.bill.findFirst({
+        where: {
+          tenantId,
+          type, // Same bill type (WATER/ELECTRICITY)
+        },
+        orderBy: {
+          issuedAt: 'desc',
+        },
+        select: {
+          currentReading: true,
+          id: true,
+          issuedAt: true,
+        },
+      });
+
+      if (lastBill) {
+        previousReadingToUse = lastBill.currentReading;
+        console.log(`Auto-filled previous reading from last ${type} bill: ${previousReadingToUse} (Bill ID: ${lastBill.id})`);
+      } else {
+        // No previous bill found, require previousReading to be provided
+        return res.status(400).json({
+          error: `No previous ${type} bill found for this tenant. Please provide a previous reading.`,
+          suggestion: 'This appears to be the first bill for this utility type.'
+        });
+      }
+    }
+
+    // Validate readings
+    if (currentReading <= previousReadingToUse) {
+      return res.status(400).json({
+        error: 'Current reading must be greater than previous reading.',
+        details: {
+          previousReading: previousReadingToUse,
+          currentReading,
+          difference: currentReading - previousReadingToUse
+        }
+      });
+    }
+
     // Compute derived values
-    const units = currentReading - previousReading;
+    const units = currentReading - previousReadingToUse;
     const totalAmount = units * chargePerUnit;
     const vatAmount = vatRate ? totalAmount * (vatRate / 100) : 0;
     const grandTotal = totalAmount + vatAmount;
@@ -44,7 +92,7 @@ export const createBill = async (req, res) => {
         tenantId,
         type,
         description,
-        previousReading,
+        previousReading: previousReadingToUse,
         currentReading,
         units,
         chargePerUnit,
@@ -53,7 +101,9 @@ export const createBill = async (req, res) => {
         vatAmount,
         grandTotal,
         dueDate: dueDate ? new Date(dueDate) : null,
-        notes,
+        notes: notes || (previousReading === undefined ? 
+          `Previous reading auto-filled from last bill` : 
+          null),
       },
       include: {
         tenant: {
@@ -72,13 +122,95 @@ export const createBill = async (req, res) => {
       }
     });
 
-    res.status(201).json(bill);
+    res.status(201).json({
+      success: true,
+      data: bill,
+      message: `Bill created successfully. ${previousReading === undefined ? 'Previous reading was auto-filled.' : ''}`,
+      autoFilled: previousReading === undefined,
+      usage: {
+        units,
+        period: 'Since last bill',
+        consumptionRate: units / (new Date().getDate()) // Approximate daily usage
+      }
+    });
   } catch (error) {
     console.error('Error creating bill:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    
+    // Handle specific errors
+    if (error.code === 'P2003') {
+      return res.status(400).json({ 
+        error: 'Invalid tenant ID.',
+        details: 'The specified tenant does not exist.'
+      });
+    }
+    
+    if (error.code === 'P2002') {
+      return res.status(400).json({ 
+        error: 'Duplicate bill detected.',
+        details: 'A bill with similar details may already exist.'
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 };
 
+// Helper function to get the last bill info
+export const getLastBillInfo = async (req, res) => {
+  try {
+    const { tenantId, type } = req.query;
+
+    if (!tenantId || !type) {
+      return res.status(400).json({ 
+        error: 'tenantId and type are required.' 
+      });
+    }
+
+    const lastBill = await prisma.bill.findFirst({
+      where: {
+        tenantId,
+        type,
+      },
+      orderBy: {
+        issuedAt: 'desc',
+      },
+      select: {
+        id: true,
+        currentReading: true,
+        issuedAt: true,
+        units: true,
+        totalAmount: true,
+        dueDate: true,
+        status: true,
+      },
+    });
+
+    if (!lastBill) {
+      return res.status(404).json({
+        success: false,
+        message: `No previous ${type} bill found for this tenant.`,
+        suggestion: 'This appears to be the first bill for this utility type.'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        lastBill,
+        suggestedPreviousReading: lastBill.currentReading,
+        daysSinceLastBill: Math.floor((new Date() - new Date(lastBill.issuedAt)) / (1000 * 60 * 60 * 24)),
+      },
+      message: `Last ${type} bill retrieved successfully.`
+    });
+
+  } catch (error) {
+    console.error('Error fetching last bill info:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
 // Get all bills
 export const getAllBills = async (req, res) => {
   try {
