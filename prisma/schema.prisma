@@ -220,6 +220,7 @@ model PaymentReport {
   billInvoices  BillInvoice[]
   invoices      Invoice[]
   tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  receiptUrl    String?  // Add this field
 }
 
 model Income {

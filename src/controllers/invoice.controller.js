@@ -1269,15 +1269,15 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
-// @desc    Delete invoice with smart linked invoice handling
+// @desc    Delete invoice with all related data (comprehensive cleanup)
 // @route   DELETE /api/invoices/:id
 // @access  Private (Admin only)
 export const deleteInvoice = async (req, res) => {
   try {
     const { id } = req.params;
-    const { deletePaymentReport = false, force = false } = req.body;
+    const { deletePaymentReport = false, deleteRelatedInvoices = false, cascadeDelete = true, force = false } = req.body;
     
-    // Find invoice with payment report info
+    // Find invoice with basic related data first
     const invoice = await prisma.invoice.findUnique({
       where: { id },
       include: {
@@ -1287,24 +1287,35 @@ export const deleteInvoice = async (req, res) => {
               select: {
                 id: true,
                 invoiceNumber: true,
+                totalDue: true,
+                amountPaid: true,
+                balance: true,
+                status: true,
                 createdAt: true,
-                tenant: {
-                  select: { fullName: true }
-                }
+                tenantId: true,
+                paymentPeriod: true,
+                paymentPolicy: true
               }
             },
-            _count: {
-              select: { invoices: true }
+            tenant: {
+              select: {
+                id: true,
+                fullName: true
+              }
             }
           }
         },
         tenant: {
           select: {
+            id: true,
             fullName: true,
             unit: {
               select: {
                 property: {
-                  select: { name: true }
+                  select: { 
+                    id: true,
+                    name: true 
+                  }
                 }
               }
             }
@@ -1320,9 +1331,9 @@ export const deleteInvoice = async (req, res) => {
       });
     }
     
-    // Check age
+    // Check age for safety
     const invoiceAge = Date.now() - new Date(invoice.createdAt).getTime();
-    const maxAge = 60 * 24 * 60 * 60 * 1000;
+    const maxAge = 60 * 24 * 60 * 60 * 1000; // 60 days
     
     if (!force && invoiceAge > maxAge) {
       return res.status(400).json({
@@ -1333,96 +1344,509 @@ export const deleteInvoice = async (req, res) => {
     }
     
     const result = {
-      deletedInvoices: [],
-      deletedPaymentReport: false,
-      deletedPdfs: 0
+      deletedInvoice: {
+        id: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        totalDue: invoice.totalDue,
+        amountPaid: invoice.amountPaid,
+        status: invoice.status
+      },
+      deletedRelatedInvoices: [],
+      deletedBillInvoices: [],
+      deletedPaymentReport: null,
+      deletedIncome: null,
+      deletedCommissions: [],
+      adjustedCreditBalance: false,
+      adjustedOverpayment: false,
+      deletedPdfs: 0,
+      cascadedDeletions: 0,
+      receiptDeleted: false
     };
     
-    // Determine which invoices to delete
-    let invoicesToDelete = [];
-    
-    if (deletePaymentReport && invoice.paymentReport) {
-      // Delete all invoices linked to this payment report
-      invoicesToDelete = invoice.paymentReport.invoices;
-    } else {
-      // Delete only this invoice
-      invoicesToDelete = [invoice];
-    }
-    
-    // Show warning if deleting multiple invoices
-    if (invoicesToDelete.length > 1) {
-      // You might want to add a confirmation step here
-      console.log(`Will delete ${invoicesToDelete.length} invoices linked to payment report ${invoice.paymentReportId}`);
-    }
-    
-    // Delete each invoice and its PDF
-    for (const inv of invoicesToDelete) {
-      try {
-        // Delete PDF
-        if (inv.pdfUrl) {
-          try {
-            const filePath = path.join(
-              process.cwd(), 
-              'uploads', 
-              'invoices', 
-              path.basename(inv.pdfUrl)
-            );
-            
-            if (fs.existsSync(filePath)) {
-              await fs.promises.unlink(filePath);
-              result.deletedPdfs++;
+    // Start transaction for comprehensive cleanup
+    await prisma.$transaction(async (tx) => {
+      // 1. FIRST: Fetch additional data needed for cleanup
+      let paymentPeriodDate = null;
+      if (invoice.paymentPeriod) {
+        // Try to parse payment period string to date
+        try {
+          const [month, year] = invoice.paymentPeriod.split(' ');
+          const monthIndex = new Date(Date.parse(month + " 1, 2000")).getMonth();
+          paymentPeriodDate = new Date(parseInt(year), monthIndex, 1);
+        } catch (e) {
+          paymentPeriodDate = invoice.createdAt;
+        }
+      }
+      
+      // 2. Delete invoice PDF
+      if (invoice.pdfUrl) {
+        try {
+          // Extract filename from URL
+          const fileName = invoice.pdfUrl.split('/').pop();
+          const filePath = path.join(
+            process.cwd(), 
+            'uploads', 
+            'invoices', 
+            fileName
+          );
+          
+          if (fs.existsSync(filePath)) {
+            await fs.promises.unlink(filePath);
+            result.deletedPdfs++;
+            console.log(`Deleted invoice PDF: ${filePath}`);
+          } else {
+            console.log(`Invoice PDF not found at: ${filePath}`);
+          }
+        } catch (fileError) {
+          console.warn(`PDF delete failed for ${invoice.invoiceNumber}:`, fileError.message);
+        }
+      }
+      
+      // 3. Handle payment report if it exists
+      if (invoice.paymentReportId) {
+        const paymentReport = await tx.paymentReport.findUnique({
+          where: { id: invoice.paymentReportId },
+          include: {
+            invoices: true,
+            billInvoices: true
+          }
+        });
+        
+        if (!paymentReport) {
+          console.warn(`Payment report ${invoice.paymentReportId} not found, but invoice has reference`);
+        } else if (deletePaymentReport || cascadeDelete) {
+          // 3a. Find and delete receipt PDF
+          if (paymentReport.receiptUrl) {
+            try {
+              // Extract filename from receipt URL
+              const receiptFileName = paymentReport.receiptUrl.split('/').pop();
+              
+              // Based on your uploadToStorage, receipts are saved in:
+              // uploads/invoices/receipts/{filename}
+              const receiptPath = path.join(
+                process.cwd(), 
+                'uploads', 
+                'invoices',  // Add 'invoices' directory
+                'receipts',   // Then 'receipts' subdirectory
+                receiptFileName
+              );
+              
+              console.log(`Looking for receipt at: ${receiptPath}`);
+              
+              if (fs.existsSync(receiptPath)) {
+                await fs.promises.unlink(receiptPath);
+                result.deletedPdfs++;
+                result.receiptDeleted = true;
+                console.log(`Deleted receipt PDF: ${receiptPath}`);
+              } else {
+                // Try alternative path (just in case)
+                const altReceiptPath = path.join(
+                  process.cwd(), 
+                  'uploads', 
+                  'receipts',
+                  receiptFileName
+                );
+                
+                if (fs.existsSync(altReceiptPath)) {
+                  await fs.promises.unlink(altReceiptPath);
+                  result.deletedPdfs++;
+                  result.receiptDeleted = true;
+                  console.log(`Deleted receipt PDF (alt path): ${altReceiptPath}`);
+                } else {
+                  console.log(`Receipt not found at either location: ${receiptPath} or ${altReceiptPath}`);
+                }
+              }
+            } catch (fileError) {
+              console.warn(`Receipt delete failed:`, fileError.message);
             }
-          } catch (fileError) {
-            console.warn(`PDF delete failed for ${inv.invoiceNumber}:`, fileError.message);
+          }
+          
+          // 3b. Find and delete related income records
+          // Look for income records created around the same time for this tenant
+          const incomeRecords = await tx.income.findMany({
+            where: { 
+              tenantId: invoice.tenantId,
+              createdAt: {
+                gte: new Date(invoice.createdAt.getTime() - 24 * 60 * 60 * 1000), // Within 1 day
+                lte: new Date(invoice.createdAt.getTime() + 24 * 60 * 60 * 1000)
+              }
+            }
+          });
+          
+          if (incomeRecords.length > 0) {
+            // Find the income record that matches the payment amount or period
+            let incomeToDelete = null;
+            
+            if (incomeRecords.length === 1) {
+              incomeToDelete = incomeRecords[0];
+            } else {
+              // Multiple income records, find the one that matches best
+              incomeToDelete = incomeRecords.find(inc => 
+                inc.amount === invoice.amountPaid || 
+                Math.abs(inc.amount - invoice.amountPaid) < 0.01
+              ) || incomeRecords[0];
+            }
+            
+            if (incomeToDelete) {
+              await tx.income.delete({
+                where: { id: incomeToDelete.id }
+              });
+              
+              result.deletedIncome = {
+                id: incomeToDelete.id,
+                amount: incomeToDelete.amount,
+                createdAt: incomeToDelete.createdAt
+              };
+            }
+          }
+          
+          // 3c. Find and delete related commission records
+          const commissionRecords = await tx.managerCommission.findMany({
+            where: {
+              OR: [
+                {
+                  notes: {
+                    contains: invoice.invoiceNumber
+                  }
+                },
+                {
+                  notes: {
+                    contains: invoice.paymentReportId
+                  }
+                },
+                {
+                  periodStart: {
+                    gte: paymentPeriodDate || new Date(invoice.createdAt.getFullYear(), invoice.createdAt.getMonth(), 1),
+                    lt: paymentPeriodDate ? 
+                      new Date(paymentPeriodDate.getFullYear(), paymentPeriodDate.getMonth() + 1, 1) :
+                      new Date(invoice.createdAt.getFullYear(), invoice.createdAt.getMonth() + 1, 1)
+                  }
+                }
+              ]
+            }
+          });
+          
+          if (commissionRecords.length > 0) {
+            await tx.managerCommission.deleteMany({
+              where: {
+                id: {
+                  in: commissionRecords.map(comm => comm.id)
+                }
+              }
+            });
+            
+            result.deletedCommissions = commissionRecords.map(comm => ({
+              id: comm.id,
+              commissionAmount: comm.commissionAmount,
+              periodStart: comm.periodStart,
+              notes: comm.notes
+            }));
+          }
+          
+          // 3d. Delete related bill invoices
+          if (paymentReport.billInvoices.length > 0) {
+            for (const billInvoice of paymentReport.billInvoices) {
+              // Delete bill invoice PDFs if they exist
+              if (billInvoice.pdfUrl) {
+                try {
+                  const fileName = billInvoice.pdfUrl.split('/').pop();
+                  const filePath = path.join(
+                    process.cwd(), 
+                    'uploads', 
+                    'invoices',  // Bill invoices might also be in invoices folder
+                    fileName
+                  );
+                  
+                  if (fs.existsSync(filePath)) {
+                    await fs.promises.unlink(filePath);
+                    result.deletedPdfs++;
+                  } else {
+                    // Try bill-invoices folder
+                    const altPath = path.join(
+                      process.cwd(), 
+                      'uploads', 
+                      'bill-invoices',
+                      fileName
+                    );
+                    
+                    if (fs.existsSync(altPath)) {
+                      await fs.promises.unlink(altPath);
+                      result.deletedPdfs++;
+                    }
+                  }
+                } catch (fileError) {
+                  console.warn(`PDF delete failed for bill invoice:`, fileError.message);
+                }
+              }
+              
+              await tx.billInvoice.delete({
+                where: { id: billInvoice.id }
+              });
+              
+              result.deletedBillInvoices.push({
+                id: billInvoice.id,
+                invoiceNumber: billInvoice.invoiceNumber,
+                billType: billInvoice.billType,
+                amount: billInvoice.grandTotal,
+                status: billInvoice.status
+              });
+              result.cascadedDeletions++;
+            }
+          }
+          
+          // 3e. Check if we should delete ALL invoices for this payment report
+          if (deleteRelatedInvoices || cascadeDelete) {
+            // Delete all invoices linked to this payment report
+            for (const relatedInvoice of paymentReport.invoices) {
+              if (relatedInvoice.id !== invoice.id) {
+                // Delete related invoice PDFs
+                const relatedInv = await tx.invoice.findUnique({
+                  where: { id: relatedInvoice.id },
+                  select: { pdfUrl: true }
+                });
+                
+                if (relatedInv?.pdfUrl) {
+                  try {
+                    const fileName = relatedInv.pdfUrl.split('/').pop();
+                    const filePath = path.join(
+                      process.cwd(), 
+                      'uploads', 
+                      'invoices', 
+                      fileName
+                    );
+                    
+                    if (fs.existsSync(filePath)) {
+                      await fs.promises.unlink(filePath);
+                      result.deletedPdfs++;
+                    }
+                  } catch (fileError) {
+                    console.warn(`PDF delete failed for related invoice:`, fileError.message);
+                  }
+                }
+                
+                await tx.invoice.delete({
+                  where: { id: relatedInvoice.id }
+                });
+                
+                result.deletedRelatedInvoices.push({
+                  id: relatedInvoice.id,
+                  invoiceNumber: relatedInvoice.invoiceNumber,
+                  amount: relatedInvoice.totalDue,
+                  status: relatedInvoice.status
+                });
+                result.cascadedDeletions++;
+              }
+            }
+          }
+          
+          // 3f. Handle credit and overpayment reversal BEFORE deleting payment report
+          if (paymentReport.amountPaid > 0) {
+            // Find tenant's credit balance
+            const creditBalance = await tx.paymentReport.findFirst({
+              where: {
+                tenantId: invoice.tenantId,
+                status: 'CREDIT'
+              }
+            });
+            
+            if (creditBalance) {
+              console.log(`Found credit balance: ${creditBalance.amountPaid}`);
+              
+              // Check if this payment used credit from notes
+              if (paymentReport.notes && paymentReport.notes.includes('credit')) {
+                // Try to extract credit amount from notes
+                const creditMatch = paymentReport.notes.match(/(\d+\.?\d*).*credit/i);
+                if (creditMatch) {
+                  const creditUsed = parseFloat(creditMatch[1]);
+                  const newCreditBalance = creditBalance.amountPaid + creditUsed;
+                  
+                  await tx.paymentReport.update({
+                    where: { id: creditBalance.id },
+                    data: {
+                      amountPaid: newCreditBalance,
+                      updatedAt: new Date(),
+                      notes: `Credit restored from deleted invoice: ${invoice.invoiceNumber}`
+                    }
+                  });
+                  
+                  result.adjustedCreditBalance = {
+                    previous: creditBalance.amountPaid,
+                    restored: creditUsed,
+                    newBalance: newCreditBalance
+                  };
+                }
+              }
+            }
+            
+            // Check for overpayment (amountPaid > totalDue)
+            const overpaymentAmount = paymentReport.amountPaid - paymentReport.totalDue;
+            if (overpaymentAmount > 0) {
+              console.log(`Overpayment detected: ${overpaymentAmount}`);
+              
+              // Check for PREPAID payment reports created from this overpayment
+              const prepaidReports = await tx.paymentReport.findMany({
+                where: {
+                  tenantId: invoice.tenantId,
+                  status: 'PREPAID',
+                  paymentPeriod: {
+                    gte: paymentReport.paymentPeriod
+                  }
+                }
+              });
+              
+              if (prepaidReports.length > 0) {
+                await tx.paymentReport.deleteMany({
+                  where: {
+                    id: {
+                      in: prepaidReports.map(r => r.id)
+                    }
+                  }
+                });
+                
+                result.adjustedOverpayment = {
+                  deletedPrepaidReports: prepaidReports.length,
+                  totalAmount: prepaidReports.reduce((sum, r) => sum + r.totalDue, 0)
+                };
+              }
+            }
+          }
+          
+          // 3g. Delete the payment report itself
+          await tx.paymentReport.delete({
+            where: { id: paymentReport.id }
+          });
+          
+          result.deletedPaymentReport = {
+            id: paymentReport.id,
+            amountPaid: paymentReport.amountPaid,
+            totalDue: paymentReport.totalDue,
+            status: paymentReport.status,
+            paymentPeriod: paymentReport.paymentPeriod
+          };
+          
+          console.log(`Deleted payment report: ${paymentReport.id}`);
+        }
+      }
+      
+      // 4. Check for and handle balance invoices
+      if (invoice.notes && invoice.notes.includes('Balance invoice for partial payment')) {
+        console.log('This is a balance invoice, adjusting parent invoices...');
+        
+        const parentInvoiceMatch = invoice.notes.match(/partial payment of (.+)/);
+        if (parentInvoiceMatch) {
+          const periodRef = parentInvoiceMatch[1];
+          const parentInvoices = await tx.invoice.findMany({
+            where: {
+              tenantId: invoice.tenantId,
+              paymentPeriod: periodRef,
+              id: { not: invoice.id }
+            }
+          });
+          
+          for (const parentInv of parentInvoices) {
+            if (parentInv.balance === 0 && parentInv.status === 'PAID') {
+              const actualBalance = parentInv.totalDue - parentInv.amountPaid;
+              let newStatus = 'UNPAID';
+              if (actualBalance <= 0) {
+                newStatus = 'PAID';
+              } else if (parentInv.amountPaid > 0) {
+                newStatus = 'PARTIAL';
+              }
+              
+              await tx.invoice.update({
+                where: { id: parentInv.id },
+                data: {
+                  balance: actualBalance,
+                  status: newStatus,
+                  updatedAt: new Date(),
+                  notes: parentInv.notes ? `${parentInv.notes} (Balance invoice deleted)` : 'Balance invoice deleted'
+                }
+              });
+              
+              console.log(`Adjusted parent invoice ${parentInv.invoiceNumber} to status: ${newStatus}`);
+            }
           }
         }
-        
-        // Delete invoice from database
-        await prisma.invoice.delete({
-          where: { id: inv.id }
-        });
-        
-        result.deletedInvoices.push({
-          id: inv.id,
-          invoiceNumber: inv.invoiceNumber,
-          tenantName: inv.tenant?.fullName || 'Unknown'
-        });
-        
-      } catch (error) {
-        console.error(`Failed to delete invoice ${inv.id}:`, error);
       }
+      
+      // 5. Finally, delete the invoice itself
+      await tx.invoice.delete({
+        where: { id }
+      });
+      
+      console.log(`Deleted main invoice: ${invoice.invoiceNumber}`);
+      
+    }, {
+      maxWait: 30000,
+      timeout: 60000,
+      isolationLevel: 'Serializable'
+    });
+    
+    // Build response message
+    let message = `Invoice ${invoice.invoiceNumber} deleted successfully`;
+    
+    const additions = [];
+    if (result.deletedRelatedInvoices.length > 0) {
+      additions.push(`${result.deletedRelatedInvoices.length} related invoices`);
+    }
+    if (result.deletedBillInvoices.length > 0) {
+      additions.push(`${result.deletedBillInvoices.length} bill invoices`);
+    }
+    if (result.deletedPaymentReport) {
+      additions.push('payment report');
+    }
+    if (result.deletedIncome) {
+      additions.push('income record');
+    }
+    if (result.deletedCommissions.length > 0) {
+      additions.push(`${result.deletedCommissions.length} commission records`);
+    }
+    if (result.adjustedCreditBalance) {
+      additions.push('credit balance restored');
+    }
+    if (result.adjustedOverpayment) {
+      additions.push(`${result.adjustedOverpayment.deletedPrepaidReports} prepaid reports removed`);
+    }
+    if (result.receiptDeleted) {
+      additions.push('receipt PDF');
+    }
+    if (result.deletedPdfs > 0) {
+      additions.push(`${result.deletedPdfs} PDF files`);
     }
     
-    // Delete payment report if requested and all invoices are gone
-    if (deletePaymentReport && invoice.paymentReportId && result.deletedInvoices.length > 0) {
-      try {
-        await prisma.paymentReport.delete({
-          where: { id: invoice.paymentReportId }
-        });
-        result.deletedPaymentReport = true;
-      } catch (error) {
-        console.error(`Failed to delete payment report ${invoice.paymentReportId}:`, error);
-      }
+    if (additions.length > 0) {
+      message += ` along with ${additions.join(', ')}`;
     }
-    
-    // Response
-    const message = result.deletedInvoices.length === 1 
-      ? 'Invoice deleted successfully'
-      : `${result.deletedInvoices.length} invoices deleted successfully`;
     
     res.json({
       success: true,
       data: result,
-      message: result.deletedPaymentReport 
-        ? `${message} along with the payment report`
-        : message
+      message: message
     });
     
   } catch (error) {
-    console.error('Error in smart delete:', error);
+    console.error('Error in comprehensive invoice deletion:', error);
+    
+    // Provide helpful error messages
+    if (error.code === 'P2025') {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'One or more related records not found. Deletion may have been partially completed.' 
+      });
+    }
+    
+    if (error.code === 'P2014') {
+      return res.status(409).json({ 
+        success: false, 
+        message: 'Cannot delete due to existing references. Try cascadeDelete=true or deletePaymentReport=true.' 
+      });
+    }
+    
     res.status(500).json({ 
       success: false, 
-      message: error.message 
+      message: error.message || 'Failed to delete invoice and related data',
+      details: error.code ? `Error code: ${error.code}` : undefined,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 };

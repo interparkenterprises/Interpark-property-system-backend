@@ -8,7 +8,8 @@ import {
   previewPayment, // added
   updatePaymentReportWithIncome,
   getPropertyArrears,
-  getOutstandingInvoices
+  getOutstandingInvoices,
+  downloadPaymentReceipt
 } from '../controllers/paymentReport.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
@@ -36,4 +37,5 @@ router.route('/income')
   .post(authorize('ADMIN', 'MANAGER'), createIncome);
 router.route('/:id')
   .put(authorize('ADMIN', 'MANAGER'), updatePaymentReportWithIncome);
+router.get('/:id/receipt', protect, downloadPaymentReceipt);  
 export default router;

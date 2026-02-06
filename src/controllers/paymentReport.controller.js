@@ -1,7 +1,11 @@
 import prisma from "../lib/prisma.js";
+import { generatePDF } from '../utils/pdfGenerator.js';
 import { processCommissionForIncome } from '../services/commissionService.js';
 import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
-
+import { generateReceiptHTML } from '../utils/receiptTemplate.js';
+import { uploadToStorage } from '../utils/storage.js';
+import path from 'path';  // ADD THIS
+import fs from 'fs/promises';  // ADD THIS
 //const prisma = new PrismaClient();
 
 // Helper: Compute expected rent & service charge for a tenant at a given period
@@ -419,6 +423,55 @@ function calculateCoveredPeriods(overpaymentAmount, monthlyRent, paymentPolicy) 
   return { months: monthsCovered, remainder: parseFloat(remaining.toFixed(2)) };
 }
 
+// Helper: Generate and upload receipt PDF
+async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpaymentAmount = 0, creditUsed = 0) {
+  try {
+    const receiptData = {
+      receiptNumber: `RCP-${Date.now()}-${paymentReport.id.slice(-6).toUpperCase()}`,
+      paymentDate: paymentReport.datePaid,
+      tenantName: tenant.fullName,
+      tenantContact: tenant.contact,
+      propertyName: tenant.unit?.property?.name || 'N/A',
+      unitType: tenant.unit?.type || 'Unit',
+      unitNo: tenant.unit?.unitNo || '',
+      paymentPeriod: new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', { 
+        month: 'long', 
+        year: 'numeric' 
+      }),
+      amountPaid: paymentReport.amountPaid,
+      invoicesPaid: invoices.map(inv => ({
+        invoiceNumber: inv.invoiceNumber,
+        paymentPeriod: inv.paymentPeriod,
+        previousBalance: inv.totalDue,
+        paymentApplied: inv.amountPaid,
+        newBalance: inv.balance,
+        newStatus: inv.status
+      })),
+      overpaymentAmount: overpaymentAmount,
+      creditUsed: creditUsed,
+      totalAllocated: paymentReport.amountPaid,
+      paymentReportId: paymentReport.id,
+      notes: paymentReport.notes
+    };
+
+    const receiptHTML = generateReceiptHTML(receiptData);
+    const pdfBuffer = await generatePDF(receiptHTML);
+
+    // Update with new receipt URL - store in receipts subdirectory
+    const receiptFileName = `${receiptData.receiptNumber}.pdf`;
+    const receiptUrl = await uploadToStorage(pdfBuffer, receiptFileName, 'receipts');
+    
+    return {
+      receiptUrl,
+      receiptNumber: receiptData.receiptNumber,
+      pdfBuffer // Return buffer for immediate download if needed
+    };
+  } catch (error) {
+    console.error('Error generating receipt:', error);
+    throw error;
+  }
+}
+
 // @desc    Create payment report (Invoice-based, RENT ONLY)
 // @route   POST /api/payments
 // @access  Private (ADMIN, MANAGER)
@@ -668,6 +721,12 @@ export const createPaymentReport = async (req, res) => {
         console.log(`Applied ${creditUsed} from existing credit, remaining: ${Math.max(0, remainingCredit)}`);
       }
 
+      // Build notes with payment details for proper tracking
+      const paymentNotes = [];
+      if (notes) paymentNotes.push(notes);
+      if (creditUsed > 0) paymentNotes.push(`Applied Ksh ${creditUsed.toFixed(2)} from credit balance`);
+      if (overpaymentAmount > 0) paymentNotes.push(`Overpayment: Ksh ${overpaymentAmount.toFixed(2)}`);
+
       // Create PaymentReport for current payment
       const report = await tx.paymentReport.create({
         data: {
@@ -676,13 +735,14 @@ export const createPaymentReport = async (req, res) => {
           serviceCharge: invoicesToProcess.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
           vat: invoicesToProcess.reduce((sum, inv) => sum + (inv.vat || 0), 0),
           totalDue: invoicesToProcess.reduce((sum, inv) => sum + inv.totalDue, 0),
-          amountPaid: actualPaymentForCurrentPeriod,
+          amountPaid: totalAvailable, // Total cash + credit applied
           arrears: Math.max(0, totalInvoiceBalance - totalAvailable),
           status: totalAvailable >= totalInvoiceBalance ? 'PAID' : 
                   totalAvailable > 0 ? 'PARTIAL' : 'UNPAID',
           paymentPeriod: paymentPeriodDate || new Date(),
           datePaid: new Date(),
-          notes: notes || null
+          notes: paymentNotes.join('. ') || null,
+          receiptUrl: null // Will be updated after transaction
         }
       });
 
@@ -917,12 +977,16 @@ export const createPaymentReport = async (req, res) => {
         remainingPayment -= paymentToApply;
       }
 
-      // Create Income record
+      // Create Income record - FIXED: Using relation connect syntax
       const income = await tx.income.create({
         data: {
-          propertyId: tenant.unit.propertyId,
-          tenantId,
-          amount: actualPaymentForCurrentPeriod,
+          property: {
+            connect: { id: tenant.unit.propertyId }
+          },
+          tenant: {
+            connect: { id: tenantId }
+          },
+          amount: parsedAmountPaid, // Actual cash payment received
           frequency: frequency
         }
       });
@@ -994,12 +1058,12 @@ export const createPaymentReport = async (req, res) => {
             managerId: tenant.unit.property.managerId,
             commissionFee: tenant.unit.property.commissionFee,
             incomeAmount: vatExclusiveCommissionBase,
-            originalIncomeAmount: actualPaymentForCurrentPeriod,
+            originalIncomeAmount: parsedAmountPaid,
             commissionAmount: commissionAmount,
             periodStart: periodStart,
             periodEnd: periodEnd,
             status: 'PENDING',
-            notes: `VAT Type: ${tenantVatType}, VAT Rate: ${tenantVatRate}%, Commission calculated on current period only`
+            notes: `VAT Type: ${tenantVatType}, VAT Rate: ${tenantVatRate}%, Commission calculated on current period only. Credit used: ${creditUsed}`
           }
         });
       }
@@ -1017,6 +1081,7 @@ export const createPaymentReport = async (req, res) => {
         commissionBaseAmount,
         actualPaymentForCurrentPeriod,
         creditUsed,
+        parsedAmountPaid,
         totalInvoiceBalance,
         totalAvailable,
         paymentPeriodStr
@@ -1026,7 +1091,35 @@ export const createPaymentReport = async (req, res) => {
       timeout: 60000,
     });
 
-    // 5. Format response
+    // 5. Generate receipt AFTER successful transaction
+    let receiptResult = null;
+    try {
+      // Fetch fresh invoice data for receipt generation
+      const freshInvoices = await prisma.invoice.findMany({
+        where: { paymentReportId: transactionResult.report.id }
+      });
+
+      receiptResult = await generateAndUploadReceipt(
+        transactionResult.report,
+        transactionResult.tenant,
+        freshInvoices,
+        transactionResult.overpaymentAmount,
+        transactionResult.creditUsed
+      );
+
+      // Update payment report with receipt URL
+      await prisma.paymentReport.update({
+        where: { id: transactionResult.report.id },
+        data: { receiptUrl: receiptResult.receiptUrl }
+      });
+
+      console.log(`Receipt generated successfully: ${receiptResult.receiptNumber}`);
+    } catch (receiptError) {
+      console.error('Failed to generate receipt (non-critical):', receiptError);
+      // Don't fail the payment if receipt generation fails
+    }
+
+    // 6. Format response
     res.status(201).json({
       success: true,
       data: {
@@ -1038,11 +1131,13 @@ export const createPaymentReport = async (req, res) => {
           status: transactionResult.report.status,
           paymentPeriod: transactionResult.report.paymentPeriod,
           datePaid: transactionResult.report.datePaid,
-          notes: transactionResult.report.notes
+          notes: transactionResult.report.notes,
+          receiptUrl: receiptResult?.receiptUrl || null,
+          receiptNumber: receiptResult?.receiptNumber || null
         },
         income: {
           id: transactionResult.income.id,
-          propertyId: transactionResult.income.propertyId,
+          propertyId: tenant.unit.propertyId,
           amount: transactionResult.income.amount,
           frequency: transactionResult.income.frequency
         },
@@ -1085,6 +1180,11 @@ export const createPaymentReport = async (req, res) => {
           originalAmount: transactionResult.commission.originalIncomeAmount,
           status: transactionResult.commission.status,
           note: 'Commission calculated only on current period amount'
+        } : null,
+        receipt: receiptResult ? {
+          receiptNumber: receiptResult.receiptNumber,
+          receiptUrl: receiptResult.receiptUrl,
+          generatedAt: new Date()
         } : null
       },
       message: 'Payment recorded successfully' + 
@@ -1094,7 +1194,8 @@ export const createPaymentReport = async (req, res) => {
         (transactionResult.overpaymentAmount > 0 ? 
           ` (Overpayment of ${transactionResult.overpaymentAmount} allocated using FIFO)` : '') +
         (transactionResult.creditUsed > 0 ? 
-          ` (${transactionResult.creditUsed} credit applied)` : '')
+          ` (${transactionResult.creditUsed} credit applied)` : '') +
+        (receiptResult ? ' (Receipt generated)' : '')
     });
 
   } catch (error) {
@@ -1797,3 +1898,71 @@ export async function getPropertyArrears(req, res) {
     });
   }
 }
+
+// @desc    Download payment receipt PDF
+// @route   GET /api/payments/:id/receipt
+// @access  Private
+export const downloadPaymentReceipt = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const paymentReport = await prisma.paymentReport.findUnique({
+      where: { id },
+      include: {
+        tenant: {
+          include: {
+            unit: {
+              include: {
+                property: true
+              }
+            }
+          }
+        }
+      }
+    });
+
+    if (!paymentReport) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment report not found'
+      });
+    }
+
+    // Check if receipt exists
+    if (!paymentReport.receiptUrl) {
+      return res.status(404).json({
+        success: false,
+        message: 'Receipt not found for this payment. It may still be generating or failed to generate.'
+      });
+    }
+
+    // Construct full file path from receiptUrl
+    // receiptUrl format: /uploads/receipts/RCP-xxx.pdf
+    const fileName = path.basename(paymentReport.receiptUrl);
+    const filePath = path.join(process.cwd(), 'uploads', 'receipts', fileName);
+
+    // Check if file exists
+    try {
+      await fs.access(filePath);
+    } catch (error) {
+      return res.status(404).json({
+        success: false,
+        message: 'Receipt file not found on server. It may have been deleted or moved.'
+      });
+    }
+
+    // Read and send the file
+    const fileBuffer = await fs.readFile(filePath);
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="receipt-${fileName}"`);
+    res.send(fileBuffer);
+
+  } catch (error) {
+    console.error('Error downloading receipt:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to download receipt'
+    });
+  }
+};
