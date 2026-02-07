@@ -6,6 +6,7 @@ import { generateReceiptHTML } from '../utils/receiptTemplate.js';
 import { uploadToStorage } from '../utils/storage.js';
 import path from 'path';  // ADD THIS
 import fs from 'fs/promises';  // ADD THIS
+import { existsSync } from 'fs';           // For synchronous methods like existsSync
 //const prisma = new PrismaClient();
 
 // Helper: Compute expected rent & service charge for a tenant at a given period
@@ -1966,3 +1967,232 @@ export const downloadPaymentReceipt = async (req, res) => {
     });
   }
 };
+
+// @desc    Delete payment report with comprehensive cleanup
+// @route   DELETE /api/payments/:id
+// @access  Private (Admin only)
+export const deletePaymentReport = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      deleteLinkedInvoices = false,
+      deleteBillInvoices = false,
+      deleteIncome = false,
+      force = false 
+    } = req.body;
+    
+    // Find payment report with all related data
+    const paymentReport = await prisma.paymentReport.findUnique({
+      where: { id },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            unit: {
+              select: {
+                property: {
+                  select: { id: true, name: true }
+                }
+              }
+            }
+          }
+        },
+        invoices: true,
+        billInvoices: true
+      }
+    });
+    
+    if (!paymentReport) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Payment report not found' 
+      });
+    }
+    
+    // Safety check: prevent deletion of old records without force flag
+    const reportAge = Date.now() - new Date(paymentReport.createdAt).getTime();
+    const maxAge = 90 * 24 * 60 * 60 * 1000; // 90 days
+    
+    if (!force && reportAge > maxAge) {
+      return res.status(400).json({
+        success: false,
+        message: `Payment report is older than 90 days. Use force=true to delete.`,
+        ageInDays: Math.floor(reportAge / (24 * 60 * 60 * 1000))
+      });
+    }
+    
+    const result = {
+      deletedPaymentReport: {
+        id: paymentReport.id,
+        amountPaid: paymentReport.amountPaid,
+        status: paymentReport.status,
+        paymentPeriod: paymentReport.paymentPeriod
+      },
+      deletedReceipt: false,
+      deletedInvoices: [],
+      deletedBillInvoices: [],
+      deletedIncome: null,
+      unlinkCount: 0
+    };
+    
+    // Start transaction for cleanup
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete receipt PDF from storage if exists
+      if (paymentReport.receiptUrl) {
+        try {
+          await deleteFromStorage(paymentReport.receiptUrl);
+          result.deletedReceipt = true;
+          console.log(`Deleted receipt PDF: ${paymentReport.receiptUrl}`);
+        } catch (error) {
+          console.warn('Failed to delete receipt PDF:', error);
+        }
+      }
+      
+      // 2. Handle linked rent invoices
+      if (paymentReport.invoices.length > 0) {
+        if (deleteLinkedInvoices) {
+          // Delete all linked invoices and their PDFs
+          for (const invoice of paymentReport.invoices) {
+            if (invoice.pdfUrl) {
+              try {
+                await deleteFromStorage(invoice.pdfUrl);
+              } catch (error) {
+                console.warn(`Failed to delete invoice PDF ${invoice.invoiceNumber}:`, error);
+              }
+            }
+            
+            await tx.invoice.delete({
+              where: { id: invoice.id }
+            });
+            
+            result.deletedInvoices.push({
+              id: invoice.id,
+              invoiceNumber: invoice.invoiceNumber,
+              totalDue: invoice.totalDue
+            });
+          }
+        } else {
+          // Just unlink invoices
+          await tx.invoice.updateMany({
+            where: { paymentReportId: paymentReport.id },
+            data: { paymentReportId: null }
+          });
+          result.unlinkCount = paymentReport.invoices.length;
+        }
+      }
+      
+      // 3. Handle linked bill invoices
+      if (paymentReport.billInvoices.length > 0) {
+        if (deleteBillInvoices) {
+          // Delete all linked bill invoices and their PDFs
+          for (const billInvoice of paymentReport.billInvoices) {
+            if (billInvoice.pdfUrl) {
+              try {
+                await deleteFromStorage(billInvoice.pdfUrl);
+              } catch (error) {
+                console.warn(`Failed to delete bill invoice PDF ${billInvoice.invoiceNumber}:`, error);
+              }
+            }
+            
+            await tx.billInvoice.delete({
+              where: { id: billInvoice.id }
+            });
+            
+            result.deletedBillInvoices.push({
+              id: billInvoice.id,
+              invoiceNumber: billInvoice.invoiceNumber,
+              totalAmount: billInvoice.totalAmount
+            });
+          }
+        } else {
+          // Just unlink bill invoices
+          await tx.billInvoice.updateMany({
+            where: { paymentReportId: paymentReport.id },
+            data: { paymentReportId: null }
+          });
+          result.unlinkCount += paymentReport.billInvoices.length;
+        }
+      }
+      
+      // 4. Handle related income record
+      if (deleteIncome) {
+        // Find income records created for this payment
+        const relatedIncome = await tx.income.findFirst({
+          where: {
+            tenantId: paymentReport.tenantId,
+            createdAt: {
+              gte: new Date(paymentReport.datePaid.getTime() - 60000), // Within 1 minute
+              lte: new Date(paymentReport.datePaid.getTime() + 60000)
+            },
+            amount: paymentReport.amountPaid
+          }
+        });
+        
+        if (relatedIncome) {
+          await tx.income.delete({
+            where: { id: relatedIncome.id }
+          });
+          
+          result.deletedIncome = {
+            id: relatedIncome.id,
+            amount: relatedIncome.amount,
+            frequency: relatedIncome.frequency
+          };
+        }
+      }
+      
+      // 5. Delete the payment report
+      await tx.paymentReport.delete({
+        where: { id: paymentReport.id }
+      });
+    });
+    
+    res.json({
+      success: true,
+      data: result,
+      message: 'Payment report deleted successfully' + 
+        (result.deletedReceipt ? ' (Receipt PDF deleted)' : '') +
+        (result.deletedInvoices.length > 0 ? ` (${result.deletedInvoices.length} invoices deleted)` : '') +
+        (result.deletedBillInvoices.length > 0 ? ` (${result.deletedBillInvoices.length} bill invoices deleted)` : '') +
+        (result.deletedIncome ? ' (Income record deleted)' : '') +
+        (result.unlinkCount > 0 ? ` (${result.unlinkCount} records unlinked)` : '')
+    });
+    
+  } catch (error) {
+    console.error('Error deleting payment report:', error);
+    
+    if (error.code === 'P2003') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot delete payment report due to foreign key constraints. Try unlinking related records first.' 
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to delete payment report' 
+    });
+  }
+};
+
+// Helper function to delete file from storage
+async function deleteFromStorage(fileUrl) {
+  if (!fileUrl) return;
+  
+  try {
+    const filename = fileUrl.split('/').pop();
+    const filePath = path.join(process.cwd(), 'uploads', filename);
+    
+    // Use the imported existsSync
+    if (existsSync(filePath)) {
+      await fs.unlink(filePath);
+      console.log(`Deleted file: ${filename}`);
+    }
+    
+  } catch (error) {
+    console.error('Error deleting file from storage:', error);
+    throw error;
+  }
+}
+
