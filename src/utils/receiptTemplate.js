@@ -1,4 +1,499 @@
+import PDFDocument from 'pdfkit';
+import fs from 'fs';
+import path from 'path';
+import sizeOf from 'image-size';
+import { fileURLToPath } from 'url';
+
+// Create __dirname equivalent for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Generate PDF receipt with letterhead and proper footer
+ * @param {Object} data - Receipt data
+ * @returns {Buffer} PDF buffer
+ */
+export async function generateReceiptPDF(data) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ 
+        margin: 50,
+        size: 'A4',
+        bufferPages: true // Enable bufferPages for footer positioning
+      });
+      const chunks = [];
+
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+
+      /* =====================================================
+         LETTERHEAD IMAGE HANDLING
+      ====================================================== */
+
+      const projectRoot = process.cwd();
+      const possiblePaths = [
+        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
+        path.join(projectRoot, 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
+        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
+      ];
+
+      let letterheadPath = null;
+      let imageLoaded = false;
+      let letterheadHeight = 0;
+      
+      for (const possiblePath of possiblePaths) {
+        try {
+          if (fs.existsSync(possiblePath)) {
+            const stats = fs.statSync(possiblePath);
+            if (stats.size > 0) {
+              letterheadPath = possiblePath;
+              console.log(`✓ Letterhead found: ${possiblePath}`);
+              break;
+            }
+          }
+        } catch (err) {
+          console.warn(`Path check failed for ${possiblePath}:`, err.message);
+        }
+      }
+
+      if (letterheadPath) {
+        try {
+          const imageBuffer = fs.readFileSync(letterheadPath);
+          const dimensions = sizeOf(imageBuffer);
+
+          const maxWidth = doc.page.width - 100;
+          const scale = maxWidth / dimensions.width;
+          const scaledHeight = dimensions.height * scale;
+          const finalHeight = Math.min(scaledHeight, 80);
+          const finalWidth = finalHeight !== scaledHeight
+            ? (dimensions.width * finalHeight) / dimensions.height
+            : maxWidth;
+
+          const xPosition = 50 + (maxWidth - finalWidth) / 2;
+
+          doc.image(imageBuffer, xPosition, 30, {
+            width: finalWidth,
+          });
+
+          letterheadHeight = 30 + finalHeight + 20;
+          doc.y = letterheadHeight;
+          imageLoaded = true;
+
+          console.log('✓ Letterhead rendered');
+        } catch (err) {
+          console.warn('✗ Letterhead failed to load:', err.message);
+        }
+      }
+      
+      // Fallback if no image loaded
+      if (!imageLoaded) {
+        console.warn('Using fallback text header');
+        doc.y = 40;
+        doc.fontSize(16)
+          .fillColor('#005478')
+          .font('Helvetica-Bold')
+          .text('INTERPARK ENTERPRISES LIMITED', { 
+            align: 'center'
+          });
+        doc.moveDown(0.5);
+        letterheadHeight = doc.y;
+      }
+
+      // ===========================================
+      // HELPER FUNCTIONS
+      // ===========================================
+      
+      const formatDate = (date) => {
+        if (!date) return 'N/A';
+        const d = new Date(date);
+        return d.toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        });
+      };
+
+      const formatCurrency = (amount) => {
+        if (!amount || amount === 0) return 'Ksh 0.00';
+        return `Ksh ${parseFloat(amount).toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        })}`;
+      };
+
+      const {
+        receiptNumber,
+        paymentDate,
+        tenantName,
+        tenantContact,
+        propertyName,
+        unitType,
+        unitNo,
+        paymentPeriod,
+        paymentMethod = 'Bank Transfer',
+        amountPaid,
+        invoicesPaid = [],
+        overpaymentAmount = 0,
+        creditUsed = 0,
+        totalAllocated = 0,
+        paymentReportId,
+        notes
+      } = data;
+
+      // ===========================================
+      // RECEIPT TITLE
+      // ===========================================
+      
+      doc.fontSize(14)
+         .fillColor('#005478')
+         .font('Helvetica-Bold')
+         .text('PAYMENT RECEIPT', { align: 'center' });
+      
+      doc.moveDown(0.3);
+
+      // Blue line under title
+      const titleY = doc.y;
+      doc.moveTo(50, titleY).lineTo(doc.page.width - 50, titleY).stroke('#005478');
+      doc.moveDown(0.5);
+
+      // ===========================================
+      // RECEIPT META (Receipt Number & Date)
+      // ===========================================
+      
+      const metaY = doc.y;
+      
+      // Left: Receipt Number
+      doc.fontSize(9)
+         .fillColor('#64748b')
+         .font('Helvetica')
+         .text('RECEIPT NUMBER', 50, metaY);
+      
+      doc.fontSize(12)
+         .fillColor('#005478')
+         .font('Helvetica-Bold')
+         .text(receiptNumber, 50, metaY + 12);
+      
+      // Right: Payment Date
+      doc.fontSize(9)
+         .fillColor('#64748b')
+         .font('Helvetica')
+         .text('PAYMENT DATE', doc.page.width - 150, metaY, { align: 'right', width: 100 });
+      
+      doc.fontSize(12)
+         .fillColor('#1e293b')
+         .font('Helvetica-Bold')
+         .text(formatDate(paymentDate), doc.page.width - 150, metaY + 12, { align: 'right', width: 100 });
+      
+      doc.y = metaY + 35;
+      doc.moveDown(0.5);
+
+      // ===========================================
+      // TWO COLUMN LAYOUT: TENANT & PAYMENT INFO
+      // ===========================================
+      
+      const colWidth = (doc.page.width - 120) / 2;
+      const leftCol = 50;
+      const rightCol = 50 + colWidth + 20;
+      let leftY = doc.y;
+      let rightY = doc.y;
+
+      // --- LEFT COLUMN: Tenant Information ---
+      
+      doc.fontSize(11)
+         .fillColor('#1e293b')
+         .font('Helvetica-Bold')
+         .text('Tenant Information', leftCol, leftY);
+      
+      leftY += 18;
+      
+      // Helper for info rows
+      const drawInfoRow = (label, value, x, y, width) => {
+        doc.fontSize(8)
+           .fillColor('#64748b')
+           .font('Helvetica')
+           .text(label, x, y);
+        
+        doc.fontSize(10)
+           .fillColor('#1e293b')
+           .font('Helvetica-Bold')
+           .text(value || 'N/A', x, y + 10, { width: width });
+        
+        return y + 28;
+      };
+
+      leftY = drawInfoRow('Tenant Name', tenantName, leftCol, leftY, colWidth);
+      leftY = drawInfoRow('Contact', tenantContact, leftCol, leftY, colWidth);
+      leftY = drawInfoRow('Property', propertyName, leftCol, leftY, colWidth);
+      leftY = drawInfoRow('Unit', `${unitType}${unitNo ? ' - ' + unitNo : ''}`, leftCol, leftY, colWidth);
+
+      // --- RIGHT COLUMN: Payment Details ---
+      
+      doc.fontSize(11)
+         .fillColor('#1e293b')
+         .font('Helvetica-Bold')
+         .text('Payment Details', rightCol, rightY);
+      
+      rightY += 18;
+      
+      rightY = drawInfoRow('Payment Period', paymentPeriod, rightCol, rightY, colWidth);
+      rightY = drawInfoRow('Payment Method', paymentMethod, rightCol, rightY, colWidth);
+      
+      if (creditUsed > 0) {
+        rightY = drawInfoRow('Credit Applied', `-${formatCurrency(creditUsed)}`, rightCol, rightY, colWidth);
+      }
+      
+      if (overpaymentAmount > 0) {
+        rightY = drawInfoRow('Overpayment', formatCurrency(overpaymentAmount), rightCol, rightY, colWidth);
+      }
+
+      // Update Y to the lower of the two columns
+      doc.y = Math.max(leftY, rightY) + 15;
+
+      // ===========================================
+      // INVOICES PAID TABLE
+      // ===========================================
+      
+      if (invoicesPaid.length > 0) {
+        // Check if we need new page (shouldn't happen on single page receipt, but safety check)
+        if (doc.y > doc.page.height - 250) {
+          doc.addPage();
+          doc.y = 50;
+        }
+
+        doc.fontSize(11)
+           .fillColor('#1e293b')
+           .font('Helvetica-Bold')
+           .text('Invoices Paid', 50, doc.y);
+        
+        doc.moveDown(0.3);
+
+        const tableTop = doc.y;
+        const tableWidth = doc.page.width - 100;
+        const colWidths = [tableWidth * 0.20, tableWidth * 0.20, tableWidth * 0.20, tableWidth * 0.15, tableWidth * 0.15, tableWidth * 0.10];
+        
+        // Table Header
+        doc.fillColor('#ffffff')
+           .fill('#005478');
+        
+        doc.rect(50, tableTop, tableWidth, 20).fill('#005478');
+        
+        let xPos = 50;
+        const headers = ['Invoice #', 'Period', 'Prev. Balance', 'Amount Paid', 'New Balance', 'Status'];
+        
+        doc.fontSize(8)
+           .fillColor('#ffffff')
+           .font('Helvetica-Bold');
+        
+        headers.forEach((header, i) => {
+          doc.text(header, xPos + 3, tableTop + 6, { width: colWidths[i] - 6, align: 'left' });
+          xPos += colWidths[i];
+        });
+
+        // Table Rows
+        let rowY = tableTop + 20;
+        
+        invoicesPaid.forEach((inv, index) => {
+          // Alternate row colors
+          if (index % 2 === 0) {
+            doc.fillColor('#f8fafc').rect(50, rowY, tableWidth, 18).fill();
+          }
+          
+          // Status color coding
+          let statusColor = '#1e293b';
+          if (inv.newStatus === 'PAID') statusColor = '#166534';
+          if (inv.newStatus === 'PARTIAL') statusColor = '#92400e';
+          
+          xPos = 50;
+          
+          doc.fontSize(9)
+             .fillColor('#1e293b')
+             .font('Helvetica')
+             .text(inv.invoiceNumber, xPos + 3, rowY + 4, { width: colWidths[0] - 6 });
+          xPos += colWidths[0];
+          
+          doc.text(inv.paymentPeriod || paymentPeriod, xPos + 3, rowY + 4, { width: colWidths[1] - 6 });
+          xPos += colWidths[1];
+          
+          doc.text(formatCurrency(inv.previousBalance), xPos + 3, rowY + 4, { width: colWidths[2] - 6 });
+          xPos += colWidths[2];
+          
+          doc.fillColor('#10b981').font('Helvetica-Bold');
+          doc.text(formatCurrency(inv.paymentApplied), xPos + 3, rowY + 4, { width: colWidths[3] - 6 });
+          xPos += colWidths[3];
+          doc.fillColor('#1e293b').font('Helvetica');
+          
+          doc.text(formatCurrency(inv.newBalance), xPos + 3, rowY + 4, { width: colWidths[4] - 6 });
+          xPos += colWidths[4];
+          
+          doc.fillColor(statusColor).font('Helvetica-Bold');
+          doc.text(inv.newStatus, xPos + 3, rowY + 4, { width: colWidths[5] - 6 });
+          
+          rowY += 18;
+        });
+
+        // Table border
+        doc.rect(50, tableTop, tableWidth, rowY - tableTop).stroke('#e2e8f0');
+        
+        // Vertical lines
+        xPos = 50;
+        colWidths.forEach((width) => {
+          xPos += width;
+          doc.moveTo(xPos, tableTop).lineTo(xPos, rowY).stroke('#e2e8f0');
+        });
+
+        doc.y = rowY + 15;
+      }
+
+      // ===========================================
+      // SUMMARY BOX
+      // ===========================================
+      
+      const summaryY = doc.y;
+      const summaryWidth = 250;
+      const summaryX = doc.page.width - 50 - summaryWidth;
+      
+      // Background
+      doc.fillColor('#f8fafc').rect(summaryX, summaryY, summaryWidth, creditUsed > 0 ? 70 : 45).fill();
+      doc.rect(summaryX, summaryY, summaryWidth, creditUsed > 0 ? 70 : 45).stroke('#e2e8f0');
+      
+      let lineY = summaryY + 8;
+      
+      if (creditUsed > 0) {
+        doc.fontSize(9)
+           .fillColor('#475569')
+           .font('Helvetica')
+           .text('Cash Payment', summaryX + 10, lineY);
+        
+        doc.fontSize(10)
+           .fillColor('#1e293b')
+           .font('Helvetica-Bold')
+           .text(formatCurrency(amountPaid), summaryX + summaryWidth - 10, lineY, { align: 'right' });
+        
+        lineY += 18;
+        
+        doc.fontSize(9)
+           .fillColor('#475569')
+           .font('Helvetica')
+           .text('Credit Applied', summaryX + 10, lineY);
+        
+        doc.fontSize(10)
+           .fillColor('#10b981')
+           .font('Helvetica-Bold')
+           .text(`-${formatCurrency(creditUsed)}`, summaryX + summaryWidth - 10, lineY, { align: 'right' });
+        
+        lineY += 18;
+      }
+      
+      // Total line with top border
+      doc.moveTo(summaryX + 10, lineY).lineTo(summaryX + summaryWidth - 10, lineY).stroke('#005478');
+      lineY += 6;
+      
+      doc.fontSize(11)
+         .fillColor('#005478')
+         .font('Helvetica-Bold')
+         .text('Total Amount Received', summaryX + 10, lineY);
+      
+      doc.fontSize(12)
+         .fillColor('#005478')
+         .font('Helvetica-Bold')
+         .text(formatCurrency(totalAllocated || amountPaid), summaryX + summaryWidth - 10, lineY, { align: 'right' });
+
+      doc.y = Math.max(doc.y, summaryY + (creditUsed > 0 ? 75 : 50));
+
+      // ===========================================
+      // NOTES SECTION (if provided)
+      // ===========================================
+      
+      if (notes) {
+        doc.moveDown(0.5);
+        
+        doc.fontSize(10)
+           .fillColor('#1e293b')
+           .font('Helvetica-Bold')
+           .text('Notes:', 50, doc.y);
+        
+        doc.moveDown(0.2);
+        
+        doc.fontSize(9)
+           .fillColor('#475569')
+           .font('Helvetica')
+           .text(notes, 50, doc.y, { width: doc.page.width - 100 });
+        
+        doc.moveDown(0.5);
+      }
+
+      // ===========================================
+      // FIXED FOOTER - Positioned absolutely at bottom
+      // ===========================================
+      
+      const footerY = doc.page.height - 80;
+      
+      // Footer line
+      doc.moveTo(50, footerY - 10).lineTo(doc.page.width - 50, footerY - 10).stroke('#e2e8f0');
+      
+      // Thank you text
+      doc.fontSize(12)
+         .fillColor('#005478')
+         .font('Helvetica-Bold')
+         .text('Thank you for your payment!', 50, footerY, { align: 'center' });
+      
+      doc.fontSize(9)
+         .fillColor('#64748b')
+         .font('Helvetica')
+         .text('This is an official receipt for your records.', 50, footerY + 16, { align: 'center' });
+      
+      // Company info
+      doc.fontSize(8)
+         .fillColor('#94a3b8')
+         .font('Helvetica')
+         .text('Interpark Enterprises Limited', 50, footerY + 32, { align: 'center' });
+      
+      doc.fontSize(8)
+         .fillColor('#94a3b8')
+         .font('Helvetica')
+         .text('For any inquiries regarding this receipt, please contact us', 50, footerY + 44, { align: 'center' });
+      
+      doc.fontSize(8)
+         .fillColor('#94a3b8')
+         .font('Helvetica')
+         .text('Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke', 50, footerY + 54, { align: 'center' });
+
+      // QR/Ref box
+      doc.fillColor('#f1f5f9')
+         .rect(doc.page.width - 110, footerY + 20, 60, 40)
+         .stroke('#cbd5e1')
+         .fill('#f1f5f9');
+      
+      doc.fontSize(7)
+         .fillColor('#94a3b8')
+         .font('Helvetica')
+         .text('Ref:', doc.page.width - 105, footerY + 28);
+      
+      doc.fontSize(8)
+         .fillColor('#64748b')
+         .font('Helvetica-Bold')
+         .text(paymentReportId?.substring(0, 8) || 'N/A', doc.page.width - 105, footerY + 40);
+
+      // End document
+      doc.end();
+      
+    } catch (error) {
+      console.error('Receipt PDF Generation Error:', error);
+      reject(error);
+    }
+  });
+}
+
+/**
+ * Legacy HTML template for email/backup purposes
+ * @param {Object} data - Receipt data
+ * @returns {string} HTML content
+ */
 export const generateReceiptHTML = (data) => {
+  // Keep the HTML version for email purposes if needed
   const {
     receiptNumber,
     paymentDate,
@@ -40,551 +535,92 @@ export const generateReceiptHTML = (data) => {
   <meta charset="UTF-8">
   <title>Payment Receipt - ${receiptNumber}</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    
-    body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      font-size: 14px;
-      line-height: 1.5; /* Changed from 1.6 to 1.5 for strict 1.5 line spacing */
-      color: #1e293b;
-      background: #fff;
-      height: 100vh;
-      overflow: hidden;
-    }
-    
-    .page-container {
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    
-    .receipt-container {
-      max-width: 800px;
-      margin: 0 auto;
-      padding: 30px;
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    
-    .content-wrapper {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    
-    .page-break {
-      page-break-before: always;
-      break-before: page;
-      height: 0;
-      visibility: hidden;
-    }
-    
-    .header {
-      text-align: center;
-      margin-bottom: 30px;
-      padding-bottom: 20px;
-      border-bottom: 3px solid #005478;
-    }
-    
-    .company-name {
-      font-size: 28px;
-      font-weight: 700;
-      color: #005478;
-      margin-bottom: 5px; /* Reduced margin */
-      letter-spacing: -0.5px;
-      line-height: 1.3; /* Added for better control */
-    }
-    
-    .receipt-title {
-      font-size: 24px;
-      font-weight: 700;
-      color: #005478;
-      text-transform: uppercase;
-      letter-spacing: 2px;
-      margin-top: 15px; /* Reduced margin */
-      line-height: 1.3; /* Added for better control */
-    }
-    
-    .receipt-badge {
-      display: inline-block;
-      background: #10b981;
-      color: white;
-      padding: 6px 16px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 600;
-      margin-top: 10px; /* Reduced margin */
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .receipt-meta {
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 25px;
-      gap: 40px;
-    }
-    
-    .meta-section {
-      flex: 1;
-    }
-    
-    .meta-label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: #64748b;
-      font-weight: 600;
-      margin-bottom: 6px; /* Reduced margin */
-    }
-    
-    .meta-value {
-      font-size: 14px;
-      color: #1e293b;
-      font-weight: 500;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .meta-value.large {
-      font-size: 16px;
-      font-weight: 600;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .divider {
-      height: 1px;
-      background: #e2e8f0;
-      margin: 25px 0;
-    }
-    
-    .section-title {
-      font-size: 16px;
-      font-weight: 700;
-      color: #1e293b;
-      margin-bottom: 12px; /* Reduced margin */
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .section-title::before {
-      content: '';
-      display: inline-block;
-      width: 4px;
-      height: 18px;
-      background: #005478;
-      border-radius: 2px;
-    }
-    
-    .info-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px; /* Reduced gap */
-      margin-bottom: 20px; /* Reduced margin */
-    }
-    
-    .info-item {
-      display: flex;
-      flex-direction: column;
-    }
-    
-    .info-label {
-      font-size: 12px;
-      color: #64748b;
-      margin-bottom: 3px; /* Reduced margin */
-      font-weight: 500;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .info-value {
-      font-size: 14px;
-      color: #1e293b;
-      font-weight: 600;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .invoices-table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-bottom: 20px; /* Reduced margin */
-    }
-    
-    .invoices-table th {
-      background: #005478;
-      color: white;
-      padding: 10px; /* Reduced padding */
-      text-align: left;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      font-weight: 600;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .invoices-table td {
-      padding: 10px; /* Reduced padding */
-      border-bottom: 1px solid #e2e8f0;
-      font-size: 14px;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .invoices-table tr:nth-child(even) {
-      background: #f8fafc;
-    }
-    
-    .invoices-table tr.paid-in-full {
-      background: #f0fdf4;
-    }
-    
-    .invoices-table tr.partial {
-      background: #fffbeb;
-    }
-    
-    .status-badge {
-      display: inline-block;
-      padding: 4px 8px;
-      border-radius: 12px;
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .status-badge.paid {
-      background: #dcfce7;
-      color: #166534;
-    }
-    
-    .status-badge.partial {
-      background: #fef3c7;
-      color: #92400e;
-    }
-    
-    .summary-section {
-      background: #f8fafc;
-      border-radius: 8px;
-      padding: 20px; /* Reduced padding */
-      margin-bottom: 20px; /* Reduced margin */
-    }
-    
-    .summary-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 6px 0; /* Reduced padding */
-      border-bottom: 1px dashed #e2e8f0;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .summary-row:last-child {
-      border-bottom: none;
-      padding-top: 12px; /* Reduced padding */
-      margin-top: 6px; /* Reduced margin */
-      border-top: 2px solid #005478;
-    }
-    
-    .summary-label {
-      font-size: 14px;
-      color: #475569;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .summary-value {
-      font-size: 14px;
-      font-weight: 600;
-      color: #1e293b;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .summary-row.grand-total .summary-label,
-    .summary-row.grand-total .summary-value {
-      font-size: 18px;
-      font-weight: 700;
-      color: #005478;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .overpayment-box {
-      background: #fef3c7;
-      border: 1px solid #f59e0b;
-      border-radius: 8px;
-      padding: 14px; /* Reduced padding */
-      margin-bottom: 20px; /* Reduced margin */
-    }
-    
-    .overpayment-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: #92400e;
-      margin-bottom: 6px; /* Reduced margin */
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .overpayment-amount {
-      font-size: 20px;
-      font-weight: 700;
-      color: #b45309;
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .footer {
-      margin-top: 30px; /* Reduced margin */
-      padding-top: 20px; /* Reduced padding */
-      border-top: 2px solid #e2e8f0;
-      text-align: center;
-      flex-shrink: 0;
-    }
-    
-    .thank-you {
-      font-size: 18px;
-      font-weight: 600;
-      color: #005478;
-      margin-bottom: 6px; /* Reduced margin */
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .footer-note {
-      font-size: 12px;
-      color: #64748b;
-      margin-bottom: 12px; /* Reduced margin */
-      line-height: 1.5; /* Added line-height */
-    }
-    
-    .contact-info {
-      font-size: 11px;
-      color: #94a3b8;
-      line-height: 1.5; /* Changed from 1.8 to 1.5 */
-    }
-    
-    .qr-placeholder {
-      width: 100px;
-      height: 100px;
-      background: #f1f5f9;
-      border-radius: 8px;
-      margin: 15px auto; /* Reduced margin */
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 10px;
-      color: #94a3b8;
-      border: 2px dashed #cbd5e1;
-    }
-    
-    .watermark {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%) rotate(-45deg);
-      font-size: 80px;
-      font-weight: 700;
-      color: rgba(16, 185, 129, 0.08);
-      pointer-events: none;
-      z-index: 0;
-      text-transform: uppercase;
-      letter-spacing: 10px;
-    }
-    
-    .page1-content {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    
-    .page2-content {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    
-    @media print {
-      body {
-        height: auto;
-        overflow: auto;
-      }
-      
-      .page-container {
-        height: auto;
-      }
-      
-      .receipt-container {
-        padding: 20px;
-      }
-      
-      .watermark {
-        color: rgba(16, 185, 129, 0.05);
-      }
-      
-      .page-break {
-        height: 1px;
-        visibility: visible;
-        margin: 20px 0;
-        border-top: 1px dashed #ccc;
-      }
-    }
+    body { font-family: Arial, sans-serif; margin: 40px; color: #333; }
+    .header { text-align: center; border-bottom: 2px solid #005478; padding-bottom: 20px; margin-bottom: 30px; }
+    .company { font-size: 24px; font-weight: bold; color: #005478; }
+    .title { font-size: 18px; color: #005478; margin-top: 10px; }
+    .meta { display: flex; justify-content: space-between; margin: 20px 0; }
+    .section { margin: 20px 0; }
+    .section-title { font-weight: bold; color: #1e293b; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+    th { background: #005478; color: white; padding: 8px; text-align: left; }
+    td { padding: 8px; border-bottom: 1px solid #ddd; }
+    .total { text-align: right; font-weight: bold; color: #005478; }
+    .footer { margin-top: 40px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px; }
   </style>
 </head>
 <body>
-  <div class="page-container">
-    <div class="receipt-container">
-      <div class="watermark">Paid</div>
-      
-      <div class="content-wrapper">
-        <!-- Page 1 Content -->
-        <div class="page1-content">
-          <div class="header">
-            <div class="company-name">Interpark Enterprises Limited</div>
-            <!-- Removed company details section here -->
-            <div class="receipt-title">Payment Receipt</div>
-            <div class="receipt-badge">Payment Received</div>
-          </div>
-          
-          <div class="receipt-meta">
-            <div class="meta-section">
-              <div class="meta-label">Receipt Number</div>
-              <div class="meta-value large">${receiptNumber}</div>
-            </div>
-            <div class="meta-section" style="text-align: right;">
-              <div class="meta-label">Payment Date</div>
-              <div class="meta-value large">${formatDate(paymentDate)}</div>
-            </div>
-          </div>
-          
-          <div class="divider"></div>
-          
-          <div class="section-title">Tenant Information</div>
-          <div class="info-grid">
-            <div class="info-item">
-              <span class="info-label">Tenant Name</span>
-              <span class="info-value">${tenantName}</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">Contact</span>
-              <span class="info-value">${tenantContact || 'N/A'}</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">Property</span>
-              <span class="info-value">${propertyName}</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">Unit</span>
-              <span class="info-value">${unitType}${unitNo ? ' - ' + unitNo : ''}</span>
-            </div>
-          </div>
-          
-          <div class="section-title">Payment Details</div>
-          <div class="info-grid">
-            <div class="info-item">
-              <span class="info-label">Payment Period</span>
-              <span class="info-value">${paymentPeriod}</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">Payment Method</span>
-              <span class="info-value">${paymentMethod}</span>
-            </div>
-            ${creditUsed > 0 ? `
-            <div class="info-item">
-              <span class="info-label">Credit Applied</span>
-              <span class="info-value" style="color: #10b981;">-${formatCurrency(creditUsed)}</span>
-            </div>
-            ` : ''}
-          </div>
-          
-          ${invoicesPaid.length > 0 ? `
-          <div class="divider"></div>
-          <div class="section-title">Invoices Paid</div>
-          <table class="invoices-table">
-            <thead>
-              <tr>
-                <th>Invoice #</th>
-                <th>Period</th>
-                <th>Previous Balance</th>
-                <th>Amount Paid</th>
-                <th>New Balance</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${invoicesPaid.map(inv => `
-                <tr class="${inv.newStatus === 'PAID' ? 'paid-in-full' : inv.newStatus === 'PARTIAL' ? 'partial' : ''}">
-                  <td><strong>${inv.invoiceNumber}</strong></td>
-                  <td>${inv.paymentPeriod || paymentPeriod}</td>
-                  <td>${formatCurrency(inv.previousBalance)}</td>
-                  <td style="color: #10b981; font-weight: 600;">${formatCurrency(inv.paymentApplied)}</td>
-                  <td>${formatCurrency(inv.newBalance)}</td>
-                  <td><span class="status-badge ${inv.newStatus.toLowerCase()}">${inv.newStatus}</span></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-          ` : ''}
-        </div>
-        
-        <!-- Page Break -->
-        <div class="page-break"></div>
-        
-        <!-- Page 2 Content -->
-        <div class="page2-content">
-          <div class="summary-section">
-            ${creditUsed > 0 ? `
-            <div class="summary-row">
-              <span class="summary-label">Cash Payment</span>
-              <span class="summary-value">${formatCurrency(amountPaid)}</span>
-            </div>
-            <div class="summary-row">
-              <span class="summary-label">Credit Applied</span>
-              <span class="summary-value" style="color: #10b981;">-${formatCurrency(creditUsed)}</span>
-            </div>
-            ` : ''}
-            <div class="summary-row grand-total">
-              <span class="summary-label">Total Amount Received</span>
-              <span class="summary-value">${formatCurrency(totalAllocated || amountPaid)}</span>
-            </div>
-          </div>
-          
-          ${overpaymentAmount > 0 ? `
-          <div class="overpayment-box">
-            <div class="overpayment-title">
-              <span>⚠️</span>
-              <span>Overpayment Recorded</span>
-            </div>
-            <div class="overpayment-amount">${formatCurrency(overpaymentAmount)}</div>
-            <div style="font-size: 12px; color: #92400e; margin-top: 4px; line-height: 1.5;">
-              This amount has been recorded as credit for future payments or allocated to future invoices.
-            </div>
-          </div>
-          ` : ''}
-          
-          ${notes ? `
-          <div class="divider"></div>
-          <div class="section-title">Notes</div>
-          <p style="color: #475569; font-size: 14px; line-height: 1.5;">${notes}</p>
-          ` : ''}
-          
-          <div class="footer">
-            <div class="thank-you">Thank you for your payment!</div>
-            <div class="footer-note">This is an official receipt for your records.</div>
-            <div class="contact-info">
-              <strong>Interpark Enterprises Limited</strong><br>
-              For any inquiries regarding this receipt, please contact us<br>
-              Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke
-            </div>
-            <div class="qr-placeholder">
-              Ref: ${paymentReportId?.substring(0, 8) || 'N/A'}
-            </div>
-          </div>
-        </div>
-      </div>
+  <div class="header">
+    <div class="company">Interpark Enterprises Limited</div>
+    <div class="title">PAYMENT RECEIPT</div>
+  </div>
+  
+  <div class="meta">
+    <div>
+      <small>RECEIPT NUMBER</small><br>
+      <strong>${receiptNumber}</strong>
     </div>
+    <div style="text-align: right;">
+      <small>PAYMENT DATE</small><br>
+      <strong>${formatDate(paymentDate)}</strong>
+    </div>
+  </div>
+
+  <div style="display: flex; gap: 40px;">
+    <div style="flex: 1;">
+      <div class="section-title">Tenant Information</div>
+      <p><strong>${tenantName}</strong><br>
+      ${tenantContact || 'N/A'}<br>
+      ${propertyName}<br>
+      ${unitType}${unitNo ? ' - ' + unitNo : ''}</p>
+    </div>
+    <div style="flex: 1;">
+      <div class="section-title">Payment Details</div>
+      <p>Period: ${paymentPeriod}<br>
+      Method: ${paymentMethod}<br>
+      ${creditUsed > 0 ? `Credit Applied: -${formatCurrency(creditUsed)}<br>` : ''}
+      ${overpaymentAmount > 0 ? `Overpayment: ${formatCurrency(overpaymentAmount)}<br>` : ''}</p>
+    </div>
+  </div>
+
+  ${invoicesPaid.length > 0 ? `
+  <div class="section">
+    <div class="section-title">Invoices Paid</div>
+    <table>
+      <tr>
+        <th>Invoice #</th>
+        <th>Period</th>
+        <th>Previous Balance</th>
+        <th>Amount Paid</th>
+        <th>New Balance</th>
+        <th>Status</th>
+      </tr>
+      ${invoicesPaid.map(inv => `
+        <tr>
+          <td>${inv.invoiceNumber}</td>
+          <td>${inv.paymentPeriod || paymentPeriod}</td>
+          <td>${formatCurrency(inv.previousBalance)}</td>
+          <td style="color: #10b981;">${formatCurrency(inv.paymentApplied)}</td>
+          <td>${formatCurrency(inv.newBalance)}</td>
+          <td>${inv.newStatus}</td>
+        </tr>
+      `).join('')}
+    </table>
+  </div>
+  ` : ''}
+
+  <div class="total">
+    Total Amount Received: ${formatCurrency(totalAllocated || amountPaid)}
+  </div>
+
+  ${notes ? `<div class="section"><div class="section-title">Notes</div><p>${notes}</p></div>` : ''}
+
+  <div class="footer">
+    <h3>Thank you for your payment!</h3>
+    <p>This is an official receipt for your records.</p>
+    <p><small>Interpark Enterprises Limited<br>
+    Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke<br>
+    Ref: ${paymentReportId?.substring(0, 8) || 'N/A'}</small></p>
   </div>
 </body>
 </html>
