@@ -253,7 +253,7 @@ export async function generateReceiptPDF(data) {
       doc.y = Math.max(leftY, rightY) + 15;
 
       // ===========================================
-      // INVOICES PAID TABLE
+      // INVOICES PAID TABLE (SIMPLIFIED)
       // ===========================================
       
       if (invoicesPaid.length > 0) {
@@ -272,7 +272,7 @@ export async function generateReceiptPDF(data) {
 
         const tableTop = doc.y;
         const tableWidth = doc.page.width - 100;
-        const colWidths = [tableWidth * 0.20, tableWidth * 0.20, tableWidth * 0.20, tableWidth * 0.15, tableWidth * 0.15, tableWidth * 0.10];
+        const colWidths = [tableWidth * 0.30, tableWidth * 0.25, tableWidth * 0.25, tableWidth * 0.20];
         
         // Table Header
         doc.fillColor('#ffffff')
@@ -281,7 +281,7 @@ export async function generateReceiptPDF(data) {
         doc.rect(50, tableTop, tableWidth, 20).fill('#005478');
         
         let xPos = 50;
-        const headers = ['Invoice #', 'Period', 'Prev. Balance', 'Amount Paid', 'New Balance', 'Status'];
+        const headers = ['Amount', 'Total Paid', 'Balance', 'Status'];
         
         doc.fontSize(8)
            .fillColor('#ffffff')
@@ -301,35 +301,31 @@ export async function generateReceiptPDF(data) {
             doc.fillColor('#f8fafc').rect(50, rowY, tableWidth, 18).fill();
           }
           
-          // Status color coding
+          // Status color coding - only PARTIAL or PAID
           let statusColor = '#1e293b';
           if (inv.newStatus === 'PAID') statusColor = '#166534';
           if (inv.newStatus === 'PARTIAL') statusColor = '#92400e';
           
           xPos = 50;
           
+          // Amount (original total due)
           doc.fontSize(9)
              .fillColor('#1e293b')
              .font('Helvetica')
-             .text(inv.invoiceNumber, xPos + 3, rowY + 4, { width: colWidths[0] - 6 });
+             .text(formatCurrency(inv.previousBalance + (inv.paymentApplied || 0)), xPos + 3, rowY + 4, { width: colWidths[0] - 6 });
           xPos += colWidths[0];
           
-          doc.text(inv.paymentPeriod || paymentPeriod, xPos + 3, rowY + 4, { width: colWidths[1] - 6 });
+          // Total Paid
+          doc.text(formatCurrency(inv.newAmountPaid || inv.amountPaid || 0), xPos + 3, rowY + 4, { width: colWidths[1] - 6 });
           xPos += colWidths[1];
           
-          doc.text(formatCurrency(inv.previousBalance), xPos + 3, rowY + 4, { width: colWidths[2] - 6 });
+          // Balance
+          doc.text(formatCurrency(inv.newBalance), xPos + 3, rowY + 4, { width: colWidths[2] - 6 });
           xPos += colWidths[2];
           
-          doc.fillColor('#10b981').font('Helvetica-Bold');
-          doc.text(formatCurrency(inv.paymentApplied), xPos + 3, rowY + 4, { width: colWidths[3] - 6 });
-          xPos += colWidths[3];
-          doc.fillColor('#1e293b').font('Helvetica');
-          
-          doc.text(formatCurrency(inv.newBalance), xPos + 3, rowY + 4, { width: colWidths[4] - 6 });
-          xPos += colWidths[4];
-          
+          // Status (only PARTIAL or PAID)
           doc.fillColor(statusColor).font('Helvetica-Bold');
-          doc.text(inv.newStatus, xPos + 3, rowY + 4, { width: colWidths[5] - 6 });
+          doc.text(inv.newStatus, xPos + 3, rowY + 4, { width: colWidths[3] - 6 });
           
           rowY += 18;
         });
@@ -461,22 +457,6 @@ export async function generateReceiptPDF(data) {
          .font('Helvetica')
          .text('Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke', 50, footerY + 54, { align: 'center' });
 
-      // QR/Ref box
-      doc.fillColor('#f1f5f9')
-         .rect(doc.page.width - 110, footerY + 20, 60, 40)
-         .stroke('#cbd5e1')
-         .fill('#f1f5f9');
-      
-      doc.fontSize(7)
-         .fillColor('#94a3b8')
-         .font('Helvetica')
-         .text('Ref:', doc.page.width - 105, footerY + 28);
-      
-      doc.fontSize(8)
-         .fillColor('#64748b')
-         .font('Helvetica-Bold')
-         .text(paymentReportId?.substring(0, 8) || 'N/A', doc.page.width - 105, footerY + 40);
-
       // End document
       doc.end();
       
@@ -547,6 +527,8 @@ export const generateReceiptHTML = (data) => {
     td { padding: 8px; border-bottom: 1px solid #ddd; }
     .total { text-align: right; font-weight: bold; color: #005478; }
     .footer { margin-top: 40px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px; }
+    .status-paid { color: #166534; font-weight: bold; }
+    .status-partial { color: #92400e; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -588,23 +570,22 @@ export const generateReceiptHTML = (data) => {
     <div class="section-title">Invoices Paid</div>
     <table>
       <tr>
-        <th>Invoice #</th>
-        <th>Period</th>
-        <th>Previous Balance</th>
-        <th>Amount Paid</th>
-        <th>New Balance</th>
+        <th>Amount</th>
+        <th>Total Paid</th>
+        <th>Balance</th>
         <th>Status</th>
       </tr>
-      ${invoicesPaid.map(inv => `
+      ${invoicesPaid.map(inv => {
+        const originalAmount = inv.previousBalance + (inv.paymentApplied || 0);
+        const statusClass = inv.newStatus === 'PAID' ? 'status-paid' : 'status-partial';
+        return `
         <tr>
-          <td>${inv.invoiceNumber}</td>
-          <td>${inv.paymentPeriod || paymentPeriod}</td>
-          <td>${formatCurrency(inv.previousBalance)}</td>
-          <td style="color: #10b981;">${formatCurrency(inv.paymentApplied)}</td>
+          <td>${formatCurrency(originalAmount)}</td>
+          <td>${formatCurrency(inv.newAmountPaid || inv.amountPaid || 0)}</td>
           <td>${formatCurrency(inv.newBalance)}</td>
-          <td>${inv.newStatus}</td>
+          <td class="${statusClass}">${inv.newStatus}</td>
         </tr>
-      `).join('')}
+      `}).join('')}
     </table>
   </div>
   ` : ''}
@@ -619,8 +600,7 @@ export const generateReceiptHTML = (data) => {
     <h3>Thank you for your payment!</h3>
     <p>This is an official receipt for your records.</p>
     <p><small>Interpark Enterprises Limited<br>
-    Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke<br>
-    Ref: ${paymentReportId?.substring(0, 8) || 'N/A'}</small></p>
+    Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke</small></p>
   </div>
 </body>
 </html>

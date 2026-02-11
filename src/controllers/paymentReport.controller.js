@@ -486,7 +486,6 @@ export const createPaymentReport = async (req, res) => {
       invoiceIds = [], // Array of invoice IDs being paid
       notes,
       paymentPeriod,
-      autoGenerateBalanceInvoice = false,
       createMissingInvoices = false,
       updateExistingInvoices = true,
       handleOverpayment = true
@@ -992,37 +991,6 @@ export const createPaymentReport = async (req, res) => {
         }
       });
 
-      // Auto-generate balance invoice for partial payments
-      let balanceInvoice = null;
-      const finalRemainingBalance = totalInvoiceBalance - totalAvailable;
-      
-      if (autoGenerateBalanceInvoice && finalRemainingBalance > 0) {
-        const balanceInvoiceNumber = await generateInvoiceNumber();
-        const templateInvoice = invoicesToProcess.length > 0 ? invoicesToProcess[0] : null;
-        
-        if (templateInvoice) {
-          balanceInvoice = await tx.invoice.create({
-            data: {
-              invoiceNumber: balanceInvoiceNumber,
-              tenantId,
-              paymentReportId: report.id,
-              issueDate: new Date(),
-              dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-              paymentPeriod: templateInvoice.paymentPeriod,
-              rent: templateInvoice.rent,
-              serviceCharge: templateInvoice.serviceCharge,
-              vat: templateInvoice.vat,
-              totalDue: finalRemainingBalance,
-              amountPaid: 0,
-              balance: finalRemainingBalance,
-              status: 'UNPAID',
-              paymentPolicy: paymentPolicy,
-              notes: `Balance invoice for partial payment of ${templateInvoice.paymentPeriod}`
-            }
-          });
-        }
-      }
-
       // Process commission
       let commission = null;
       if (tenant.unit?.property?.commissionFee && tenant.unit?.property?.commissionFee > 0 && commissionBaseAmount > 0) {
@@ -1074,7 +1042,6 @@ export const createPaymentReport = async (req, res) => {
         income,
         commission,
         updatedInvoices,
-        balanceInvoice,
         invoiceUpdateResult,
         tenant,
         overpaymentRecords,
@@ -1155,12 +1122,6 @@ export const createPaymentReport = async (req, res) => {
           selectionType: inv.selectionType || 'UNKNOWN',
           paymentPolicy: inv.paymentPolicy
         })),
-        balanceInvoice: transactionResult.balanceInvoice ? {
-          id: transactionResult.balanceInvoice.id,
-          invoiceNumber: transactionResult.balanceInvoice.invoiceNumber,
-          amountDue: transactionResult.balanceInvoice.totalDue,
-          paymentPolicy: transactionResult.balanceInvoice.paymentPolicy
-        } : null,
         existingInvoicesUpdated: transactionResult.invoiceUpdateResult ? {
           count: transactionResult.invoiceUpdateResult.updatedInvoices.length,
           totalApplied: transactionResult.invoiceUpdateResult.totalApplied,
