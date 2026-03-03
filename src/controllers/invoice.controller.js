@@ -13,6 +13,12 @@ import sizeOf from 'image-size';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Helper function to convert enum to title case
+function toTitleCase(enumValue) {
+  if (!enumValue) return '';
+  return enumValue.charAt(0).toUpperCase() + enumValue.slice(1).toLowerCase();
+}
+
 // @desc    Generate invoice for tenant
 // @route   POST /api/invoices/generate
 // @access  Private
@@ -589,7 +595,7 @@ async function generateInvoicePDF(invoice, tenant) {
         .fontSize(10)
         .text('Rent', itemX + 10, currentY + 8)
         .text(
-          `${invoice.paymentPolicy} rent for ${invoice.paymentPeriod}`,
+          `${toTitleCase(invoice.paymentPolicy)} rent for ${invoice.paymentPeriod}`,
           descX,
           currentY + 8
         )
