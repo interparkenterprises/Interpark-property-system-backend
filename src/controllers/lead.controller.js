@@ -6,18 +6,45 @@ import prisma from "../lib/prisma.js";
 // @access  Private
 export const getLeads = async (req, res) => {
   try {
+    const { role, id: userId } = req.user;
+    
+    // Build where clause based on user role
+    let whereClause = {};
+    
+    // If user is MANAGER, only show leads they created
+    // Also show leads with null createdById (existing data) to avoid hiding old leads
+    if (role === 'MANAGER') {
+      whereClause = {
+        OR: [
+          { createdById: userId },
+          { createdById: null } // Include existing leads without creator
+        ]
+      };
+    }
+    // ADMIN sees all leads (no where clause)
+    
     const leads = await prisma.lead.findMany({
+      where: whereClause,
       include: {
         property: true,
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true
+          }
+        },
         offerLetters: {
           orderBy: { createdAt: 'desc' },
-          take: 1 // Get most recent offer letter
+          take: 1
         }
       },
       orderBy: { createdAt: 'desc' }
     });
+    
     res.json(leads);
   } catch (error) {
+    console.error('Get leads error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -27,10 +54,19 @@ export const getLeads = async (req, res) => {
 // @access  Private
 export const getLead = async (req, res) => {
   try {
+    const { role, id: userId } = req.user;
+    
     const lead = await prisma.lead.findUnique({
       where: { id: req.params.id },
       include: {
         property: true,
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true
+          }
+        },
         offerLetters: {
           orderBy: { createdAt: 'desc' }
         }
@@ -39,6 +75,11 @@ export const getLead = async (req, res) => {
 
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    // Check permissions: MANAGER can only view their own leads or unassigned leads
+    if (role === 'MANAGER' && lead.createdById && lead.createdById !== userId) {
+      return res.status(403).json({ message: 'Access denied. You can only view leads you created.' });
     }
 
     res.json(lead);
@@ -57,8 +98,8 @@ export const createLead = async (req, res) => {
       email, 
       phone, 
       address, 
-      idNumber,      // ADD THIS
-      companyName,   // ADD THIS
+      idNumber,
+      companyName,
       natureOfLead, 
       notes, 
       propertyId 
@@ -77,14 +118,22 @@ export const createLead = async (req, res) => {
         email: email || null,
         phone,
         address: address || null,
-        idNumber: idNumber || null,        // ADD THIS
-        companyName: companyName || null,  // ADD THIS
+        idNumber: idNumber || null,
+        companyName: companyName || null,
         natureOfLead: natureOfLead || null,
         notes: notes || null,
-        propertyId: propertyId || null
+        propertyId: propertyId || null,
+        createdById: req.user.id // Set the creator
       },
       include: {
-        property: true
+        property: true,
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true
+          }
+        }
       }
     });
 
@@ -94,49 +143,38 @@ export const createLead = async (req, res) => {
   }
 };
 
-// Update the createLeadWithOffer function similarly
-
-
 // @desc    Create lead with offer letter
 // @route   POST /api/leads/with-offer
 // @access  Private (Admin/Manager)
 export const createLeadWithOffer = async (req, res) => {
   try {
     const {
-      // Lead data
       name,
       email,
       phone,
       address,
-      idNumber,      // ADDED
-      companyName,   // ADDED
+      idNumber,
+      companyName,
       natureOfLead,
       notes,
-      
-      // Property and Unit
       propertyId,
       unitId,
-      
-      // Offer letter data
       rentAmount,
       deposit,
       leaseTerm,
       serviceCharge,
       escalationRate,
-      
       expiryDate,
       additionalTerms,
-      letterType // For mixed-use properties
+      letterType
     } = req.body;
 
-    // Validate required fields
     if (!name || !phone || !propertyId) {
       return res.status(400).json({ 
         message: 'Name, phone, and property are required' 
       });
     }
 
-    // Fetch property to determine letter type
     const property = await prisma.property.findUnique({
       where: { id: propertyId },
       include: { landlord: true }
@@ -146,7 +184,6 @@ export const createLeadWithOffer = async (req, res) => {
       return res.status(404).json({ message: 'Property not found' });
     }
 
-    // For mixed-use properties, require explicit letter type
     if (property.usage === 'MIXED_USE' && !letterType) {
       return res.status(400).json({
         message: 'Letter type is required for mixed-use properties',
@@ -155,7 +192,6 @@ export const createLeadWithOffer = async (req, res) => {
       });
     }
 
-    // Determine letter type
     let determinedLetterType;
     if (property.usage === 'MIXED_USE') {
       determinedLetterType = letterType;
@@ -165,49 +201,36 @@ export const createLeadWithOffer = async (req, res) => {
       determinedLetterType = 'RESIDENTIAL';
     }
 
-    // Fetch unit if provided
     let unit = null;
     if (unitId) {
-      unit = await prisma.unit.findUnique({
-        where: { id: unitId }
-      });
-      
-      if (!unit) {
-        return res.status(404).json({ message: 'Unit not found' });
-      }
+      unit = await prisma.unit.findUnique({ where: { id: unitId } });
+      if (!unit) return res.status(404).json({ message: 'Unit not found' });
     }
 
-    // Generate unique offer number
     const now = new Date();
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
     const count = await prisma.offerLetter.count({
-      where: {
-        offerNumber: {
-          startsWith: `OFL-${year}-${month}`
-        }
-      }
+      where: { offerNumber: { startsWith: `OFL-${year}-${month}` } }
     });
     const offerNumber = `OFL-${year}-${month}-${String(count + 1).padStart(6, '0')}`;
 
-    // Create lead and offer letter in a transaction
     const result = await prisma.$transaction(async (tx) => {
-      // Create lead
       const newLead = await tx.lead.create({
         data: {
           name,
           email: email || null,
           phone,
           address: address || null,
-          idNumber: idNumber || null,        // ADDED
-          companyName: companyName || null,  // ADDED
+          idNumber: idNumber || null,
+          companyName: companyName || null,
           natureOfLead: natureOfLead || null,
           notes: notes || null,
-          propertyId
+          propertyId,
+          createdById: req.user.id // Set the creator
         }
       });
 
-      // Create offer letter
       const newOfferLetter = await tx.offerLetter.create({
         data: {
           offerNumber,
@@ -222,7 +245,6 @@ export const createLeadWithOffer = async (req, res) => {
           leaseTerm: leaseTerm || '',
           serviceCharge: serviceCharge || null,
           escalationRate: escalationRate || null,
-          
           expiryDate: expiryDate ? new Date(expiryDate) : null,
           additionalTerms: additionalTerms || null,
           status: 'DRAFT',
@@ -233,20 +255,12 @@ export const createLeadWithOffer = async (req, res) => {
       return { lead: newLead, offerLetter: newOfferLetter };
     });
 
-    // Fetch complete data with relations
     const leadWithOffer = await prisma.lead.findUnique({
       where: { id: result.lead.id },
       include: {
-        property: {
-          include: {
-            landlord: true
-          }
-        },
-        offerLetters: {
-          include: {
-            unit: true
-          }
-        }
+        property: { include: { landlord: true } },
+        createdBy: { select: { id: true, name: true, email: true } },
+        offerLetters: { include: { unit: true } }
       }
     });
 
@@ -262,13 +276,28 @@ export const createLeadWithOffer = async (req, res) => {
 // @access  Private
 export const updateLead = async (req, res) => {
   try {
+    const { role, id: userId } = req.user;
+    
+    const existingLead = await prisma.lead.findUnique({
+      where: { id: req.params.id }
+    });
+
+    if (!existingLead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    // MANAGER can only update their own leads or unassigned leads
+    if (role === 'MANAGER' && existingLead.createdById && existingLead.createdById !== userId) {
+      return res.status(403).json({ message: 'Access denied. You can only update leads you created.' });
+    }
+
     const { 
       name, 
       email, 
       phone, 
       address, 
-      idNumber,      // ADDED
-      companyName,   // ADDED
+      idNumber,
+      companyName,
       natureOfLead, 
       notes, 
       propertyId 
@@ -281,17 +310,16 @@ export const updateLead = async (req, res) => {
         ...(email !== undefined && { email }),
         ...(phone && { phone }),
         ...(address !== undefined && { address }),
-        ...(idNumber !== undefined && { idNumber }),        // ADDED
-        ...(companyName !== undefined && { companyName }),  // ADDED
+        ...(idNumber !== undefined && { idNumber }),
+        ...(companyName !== undefined && { companyName }),
         ...(natureOfLead !== undefined && { natureOfLead }),
         ...(notes !== undefined && { notes }),
         ...(propertyId !== undefined && { propertyId })
       },
       include: {
         property: true,
-        offerLetters: {
-          orderBy: { createdAt: 'desc' }
-        }
+        createdBy: { select: { id: true, name: true, email: true } },
+        offerLetters: { orderBy: { createdAt: 'desc' } }
       }
     });
 
@@ -306,9 +334,23 @@ export const updateLead = async (req, res) => {
 // @access  Private
 export const deleteLead = async (req, res) => {
   try {
-    await prisma.lead.delete({
+    const { role, id: userId } = req.user;
+    
+    const existingLead = await prisma.lead.findUnique({
       where: { id: req.params.id }
     });
+
+    if (!existingLead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    // Only ADMIN can delete any lead
+    // MANAGER can delete their own leads or unassigned leads
+    if (role === 'MANAGER' && existingLead.createdById && existingLead.createdById !== userId) {
+      return res.status(403).json({ message: 'Access denied. You can only delete leads you created.' });
+    }
+
+    await prisma.lead.delete({ where: { id: req.params.id } });
 
     res.json({ message: 'Lead deleted successfully' });
   } catch (error) {

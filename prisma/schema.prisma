@@ -23,6 +23,7 @@ model User {
   dailyReports       DailyReport[]
   activationRequests ActivationRequest[]
   demandLetters      DemandLetter[]
+  createdLeads       Lead[]              @relation(name: "CreatedLeads") // ADD THIS
 }
 
 model Landlord {
@@ -358,9 +359,12 @@ model Lead {
   updatedAt    DateTime      @updatedAt
   companyName  String?
   idNumber     String?
+  createdById  String?       // ADD THIS FIELD
   property     Property?     @relation(fields: [propertyId], references: [id])
+  createdBy    User?         @relation(fields: [createdById], references: [id], name: "CreatedLeads") // ADD THIS RELATION
   offerLetters OfferLetter[]
 }
+
 
 model OfferLetter {
   id              String      @id @default(uuid())
