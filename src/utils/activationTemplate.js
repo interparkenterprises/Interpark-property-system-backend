@@ -242,10 +242,14 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // VAT CALCULATION LOGIC
       // ===========================================
-      
+        
       const calculateCosts = () => {
         const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
         const numberOfDays = activation.numberOfDays || 0;
+        
+        // CRITICAL FIX: 0 days = same-day activation = 1 day billing (minimum billing day)
+        const actualBillingDays = numberOfDays === 0 ? 1 : numberOfDays;
+        
         const vatType = activation.vatType || 'EXCLUSIVE'; // Default to EXCLUSIVE
         const vatRate = 0.16;
         
@@ -257,35 +261,36 @@ export async function generateActivationPDF(activation) {
         switch (vatType) {
           case 'INCLUSIVE':
             // License fee already includes VAT
-            totalAmount = licenseFeePerDay * numberOfDays;
+            totalAmount = licenseFeePerDay * actualBillingDays;
             subTotal = totalAmount / (1 + vatRate);
             vatAmount = totalAmount - subTotal;
             break;
             
           case 'EXCLUSIVE':
             // VAT needs to be added
-            subTotal = licenseFeePerDay * numberOfDays;
+            subTotal = licenseFeePerDay * actualBillingDays;
             vatAmount = subTotal * vatRate;
             totalAmount = subTotal + vatAmount;
             break;
             
           case 'NOT_APPLICABLE':
             // No VAT
-            subTotal = licenseFeePerDay * numberOfDays;
+            subTotal = licenseFeePerDay * actualBillingDays;
             vatAmount = 0;
             totalAmount = subTotal;
             break;
             
           default:
             // Fallback to EXCLUSIVE
-            subTotal = licenseFeePerDay * numberOfDays;
+            subTotal = licenseFeePerDay * actualBillingDays;
             vatAmount = subTotal * vatRate;
             totalAmount = subTotal + vatAmount;
         }
         
         return {
           licenseFeePerDay: displayLicenseFee,
-          numberOfDays,
+          numberOfDays: actualBillingDays, // Return actual billing days (1 if 0)
+          originalDays: numberOfDays, // Keep original for reference if needed
           subTotal,
           vatAmount,
           totalAmount,
@@ -800,6 +805,10 @@ export const generateActivationHTML = (activation) => {
   const calculateCosts = () => {
     const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
     const numberOfDays = activation.numberOfDays || 0;
+    
+    // CRITICAL FIX: 0 days = same-day activation = 1 day billing
+    const actualBillingDays = numberOfDays === 0 ? 1 : numberOfDays;
+    
     const vatType = activation.vatType || 'EXCLUSIVE';
     const vatRate = 0.16;
     
@@ -809,32 +818,32 @@ export const generateActivationHTML = (activation) => {
     
     switch (vatType) {
       case 'INCLUSIVE':
-        totalAmount = licenseFeePerDay * numberOfDays;
+        totalAmount = licenseFeePerDay * actualBillingDays;
         subTotal = totalAmount / (1 + vatRate);
         vatAmount = totalAmount - subTotal;
         break;
         
       case 'EXCLUSIVE':
-        subTotal = licenseFeePerDay * numberOfDays;
+        subTotal = licenseFeePerDay * actualBillingDays;
         vatAmount = subTotal * vatRate;
         totalAmount = subTotal + vatAmount;
         break;
         
       case 'NOT_APPLICABLE':
-        subTotal = licenseFeePerDay * numberOfDays;
+        subTotal = licenseFeePerDay * actualBillingDays;
         vatAmount = 0;
         totalAmount = subTotal;
         break;
         
       default:
-        subTotal = licenseFeePerDay * numberOfDays;
+        subTotal = licenseFeePerDay * actualBillingDays;
         vatAmount = subTotal * vatRate;
         totalAmount = subTotal + vatAmount;
     }
     
     return {
       licenseFeePerDay,
-      numberOfDays,
+      numberOfDays: actualBillingDays, // Show 1 instead of 0
       subTotal,
       vatAmount,
       totalAmount,

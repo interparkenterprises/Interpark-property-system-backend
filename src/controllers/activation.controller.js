@@ -62,11 +62,15 @@ const sanitizeActivationData = (data) => {
     }
   });
 
-  // Convert integer fields
+  // Convert integer fields - PRESERVE 0 as valid value
   const integerFields = ['expectedVisitors', 'numberOfDays'];
   integerFields.forEach(field => {
-    if (sanitizedData[field] !== undefined && sanitizedData[field] !== null) {
-      sanitizedData[field] = parseInt(sanitizedData[field]);
+    if (sanitizedData[field] !== undefined && sanitizedData[field] !== null && sanitizedData[field] !== '') {
+      const parsed = parseInt(sanitizedData[field]);
+      // Only assign if it's a valid number (including 0)
+      if (!isNaN(parsed)) {
+        sanitizedData[field] = parsed;
+      }
     }
   });
 
@@ -94,14 +98,63 @@ const sanitizeActivationData = (data) => {
     }
   }
 
-  // Remove undefined values to let Prisma use defaults
+  // Remove undefined values and empty strings to let Prisma use defaults
+  // BUT preserve 0 for numberOfDays
   Object.keys(sanitizedData).forEach(key => {
-    if (sanitizedData[key] === undefined || sanitizedData[key] === '') {
-      delete sanitizedData[key];
+    if (key === 'numberOfDays') {
+      // Keep 0 as valid value, only remove if truly undefined/null/empty
+      if (sanitizedData[key] === undefined || sanitizedData[key] === null || sanitizedData[key] === '') {
+        delete sanitizedData[key];
+      }
+    } else {
+      if (sanitizedData[key] === undefined || sanitizedData[key] === '') {
+        delete sanitizedData[key];
+      }
     }
   });
 
   return sanitizedData;
+};
+
+/**
+ * Validate same-day activation dates
+ */
+const validateSameDayActivation = (startDate, endDate, numberOfDays) => {
+  if (numberOfDays === 0) {
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    
+    // Reset time components for date-only comparison
+    const startDateOnly = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+    const endDateOnly = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+    
+    if (startDateOnly.getTime() !== endDateOnly.getTime()) {
+      return {
+        valid: false,
+        message: 'For same-day activations (0 days), start date and end date must be the same'
+      };
+    }
+  }
+  
+  return { valid: true };
+};
+
+/**
+ * Calculate total license fee based on fee per day and number of days
+ * 0 days = same day activation = 1 day fee (minimum billing day)
+ */
+const calculateTotalLicenseFee = (licenseFeePerDay, numberOfDays) => {
+  if (!licenseFeePerDay || licenseFeePerDay <= 0) {
+    return 0;
+  }
+  
+  // If numberOfDays is 0 or null/undefined, it's a same-day activation (1 day billing)
+  // If numberOfDays is > 0, use that value + 1 (since days are intervals)
+  const actualBillingDays = (numberOfDays === 0 || numberOfDays === null || numberOfDays === undefined) 
+    ? 1 
+    : numberOfDays + 1;
+    
+  return licenseFeePerDay * actualBillingDays;
 };
 
 /**
@@ -169,11 +222,27 @@ export const createActivationRequest = async (req, res) => {
       });
     }
 
-    // Generate unique request number
-    const requestNumber = await generateRequestNumber();
-
     // Sanitize data
     const sanitizedData = sanitizeActivationData(activationData);
+
+    // Validate same-day activation if numberOfDays is 0
+    if (sanitizedData.numberOfDays === 0) {
+      const validation = validateSameDayActivation(
+        sanitizedData.startDate,
+        sanitizedData.endDate,
+        sanitizedData.numberOfDays
+      );
+      
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          message: validation.message
+        });
+      }
+    }
+
+    // Generate unique request number
+    //const requestNumber = await generateRequestNumber();
 
     // Calculate VAT details if applicable
     let vat = sanitizedData.vat !== undefined ? sanitizedData.vat : 16; // Default to 16%
@@ -183,6 +252,18 @@ export const createActivationRequest = async (req, res) => {
     if (typeof vat !== 'number' || isNaN(vat)) {
       vat = 16;
     }
+
+    // Calculate total license fee for billing
+    const totalLicenseFee = calculateTotalLicenseFee(
+      sanitizedData.licenseFeePerDay,
+      sanitizedData.numberOfDays
+    );
+
+    // Helper function to handle null/undefined with 0 preservation
+    const getValueOrNull = (value) => {
+      if (value === undefined || value === null || value === '') return null;
+      return value;
+    };
 
     // Create activation request with all fields from your model
     const activation = await prisma.activationRequest.create({
@@ -207,23 +288,26 @@ export const createActivationRequest = async (req, res) => {
         tearDownTime: sanitizedData.tearDownTime || '',
         activationType: sanitizedData.activationType || '',
         soundSystem: sanitizedData.soundSystem || false,
-        // Set optional fields
-        description: sanitizedData.description || null,
-        expectedVisitors: sanitizedData.expectedVisitors || null,
-        licenseFeePerDay: sanitizedData.licenseFeePerDay || null,
-        numberOfDays: sanitizedData.numberOfDays || null,
-        proposedBudget: sanitizedData.proposedBudget || null,
+        // Set optional fields - PRESERVE 0 for numberOfDays
+        description: getValueOrNull(sanitizedData.description),
+        expectedVisitors: getValueOrNull(sanitizedData.expectedVisitors),
+        licenseFeePerDay: getValueOrNull(sanitizedData.licenseFeePerDay),
+        // CRITICAL: Use nullish coalescing to preserve 0
+        numberOfDays: sanitizedData.numberOfDays !== undefined && sanitizedData.numberOfDays !== null 
+          ? sanitizedData.numberOfDays 
+          : null,
+        proposedBudget: getValueOrNull(sanitizedData.proposedBudget),
         // Payment details
-        bankName: sanitizedData.bankName || null,
-        bankBranch: sanitizedData.bankBranch || null,
-        accountName: sanitizedData.accountName || null,
-        accountNumber: sanitizedData.accountNumber || null,
-        swiftCode: sanitizedData.swiftCode || null,
-        paybillNumber: sanitizedData.paybillNumber || null,
-        mpesaAccount: sanitizedData.mpesaAccount || null,
+        bankName: getValueOrNull(sanitizedData.bankName),
+        bankBranch: getValueOrNull(sanitizedData.bankBranch),
+        accountName: getValueOrNull(sanitizedData.accountName),
+        accountNumber: getValueOrNull(sanitizedData.accountNumber),
+        swiftCode: getValueOrNull(sanitizedData.swiftCode),
+        paybillNumber: getValueOrNull(sanitizedData.paybillNumber),
+        mpesaAccount: getValueOrNull(sanitizedData.mpesaAccount),
         // Manager signature info
-        managerName: sanitizedData.managerName || null,
-        managerDesignation: sanitizedData.managerDesignation || null
+        managerName: getValueOrNull(sanitizedData.managerName),
+        managerDesignation: getValueOrNull(sanitizedData.managerDesignation)
       },
       include: {
         property: {
@@ -241,10 +325,19 @@ export const createActivationRequest = async (req, res) => {
       }
     });
 
+    // Calculate VAT details using total license fee if available, otherwise proposedBudget
+    const vatBaseAmount = totalLicenseFee > 0 ? totalLicenseFee : (activation.proposedBudget || 0);
+    const vatDetails = calculateVATDetails(vatBaseAmount, activation.vat, activation.vatType);
+
     res.status(201).json({
       success: true,
       message: 'Activation request created successfully',
-      data: activation
+      data: {
+        ...activation,
+        calculatedTotalLicenseFee: totalLicenseFee,
+        billingDays: sanitizedData.numberOfDays === 0 ? 1 : (sanitizedData.numberOfDays || 0) + 1,
+        vatDetails
+      }
     });
 
   } catch (error) {
@@ -473,15 +566,39 @@ export const updateActivationRequest = async (req, res) => {
     // Sanitize data
     const sanitizedData = sanitizeActivationData(updateData);
 
+    // Validate same-day activation if numberOfDays is being updated to 0
+    if (sanitizedData.numberOfDays === 0) {
+      const startDate = sanitizedData.startDate || existing.startDate;
+      const endDate = sanitizedData.endDate || existing.endDate;
+      
+      const validation = validateSameDayActivation(
+        startDate,
+        endDate,
+        sanitizedData.numberOfDays
+      );
+      
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          message: validation.message
+        });
+      }
+    }
+
     // Handle vat and vatType defaults if not provided
     if (sanitizedData.vat === undefined && sanitizedData.vatType === undefined) {
       // Keep existing values
     } else if (sanitizedData.vatType === 'NOT_APPLICABLE') {
       // If vatType is NOT_APPLICABLE, vat should be null
       sanitizedData.vat = null;
-    } else if (sanitizedData.vat === undefined) {
+    } else if (sanitizedData.vatType !== undefined && sanitizedData.vat === undefined) {
       // If vatType is set but vat is not, use default
       sanitizedData.vat = 16;
+    }
+
+    // Ensure numberOfDays 0 is preserved and not treated as falsy
+    if (updateData.numberOfDays !== undefined) {
+      sanitizedData.numberOfDays = parseInt(updateData.numberOfDays);
     }
 
     const activation = await prisma.activationRequest.update({
@@ -503,18 +620,23 @@ export const updateActivationRequest = async (req, res) => {
       }
     });
 
-    // Calculate VAT details for response
-    const vatDetails = calculateVATDetails(
-      activation.proposedBudget || activation.licenseFeePerDay || 0,
-      activation.vat,
-      activation.vatType
+    // Calculate total license fee for response
+    const totalLicenseFee = calculateTotalLicenseFee(
+      activation.licenseFeePerDay,
+      activation.numberOfDays
     );
+
+    // Calculate VAT details for response using total license fee
+    const vatBaseAmount = totalLicenseFee > 0 ? totalLicenseFee : (activation.proposedBudget || 0);
+    const vatDetails = calculateVATDetails(vatBaseAmount, activation.vat, activation.vatType);
 
     res.json({
       success: true,
       message: 'Activation request updated successfully',
       data: {
         ...activation,
+        calculatedTotalLicenseFee: totalLicenseFee,
+        billingDays: activation.numberOfDays === 0 ? 1 : (activation.numberOfDays || 0) + 1,
         vatDetails
       }
     });
