@@ -4,6 +4,7 @@ import { processCommissionForIncome } from '../services/commissionService.js';
 import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 import { generateReceiptHTML } from '../utils/receiptTemplate.js';
 import { uploadToStorage } from '../utils/storage.js';
+import { getPolicyMonths, addBillingPeriod } from '../services/rentCalculation.js';
 import path from 'path';  // ADD THIS
 import fs from 'fs/promises';  // ADD THIS
 import { existsSync } from 'fs';           // For synchronous methods like existsSync
@@ -108,6 +109,77 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     periodStart: periodStartOfMonth,
     periodEnd: periodEndOfMonth
   };
+}
+
+function formatMonthYear(date) {
+  return new Date(date).toLocaleDateString('en-US', {
+    month: 'long',
+    year: 'numeric'
+  });
+}
+
+function formatPaymentPeriodLabel(periodStart, periodEnd, paymentPolicy) {
+  if (paymentPolicy === 'MONTHLY') {
+    return formatMonthYear(periodStart);
+  }
+
+  return `${formatMonthYear(periodStart)} - ${formatMonthYear(periodEnd)}`;
+}
+
+// Helper: Compute expected charges for the tenant's billing policy
+async function computeExpectedChargesForPolicy(tenantId, periodStart = null, paymentPolicy = 'MONTHLY') {
+  const start = periodStart ? new Date(periodStart) : new Date();
+  const normalizedStart = new Date(start.getFullYear(), start.getMonth(), 1);
+  const periodMonths = getPolicyMonths(paymentPolicy);
+
+  let rent = 0;
+  let serviceCharge = 0;
+  let vat = 0;
+  let totalDue = 0;
+  const monthlyBreakdown = [];
+
+  for (let i = 0; i < periodMonths; i++) {
+    const monthDate = new Date(normalizedStart.getFullYear(), normalizedStart.getMonth() + i, 1);
+    const monthly = await computeExpectedCharges(tenantId, monthDate);
+
+    rent += monthly.rent;
+    serviceCharge += monthly.serviceCharge;
+    vat += monthly.vat;
+    totalDue += monthly.totalDue;
+
+    monthlyBreakdown.push({
+      month: formatMonthYear(monthDate),
+      rent: monthly.rent,
+      serviceCharge: monthly.serviceCharge,
+      vat: monthly.vat,
+      totalDue: monthly.totalDue
+    });
+  }
+
+  const periodEnd = new Date(normalizedStart.getFullYear(), normalizedStart.getMonth() + periodMonths, 0);
+
+  return {
+    paymentPolicy,
+    periodMonths,
+    periodStart: normalizedStart,
+    periodEnd,
+    paymentPeriodLabel: formatPaymentPeriodLabel(normalizedStart, periodEnd, paymentPolicy),
+    monthlyEquivalent: parseFloat((totalDue / periodMonths).toFixed(2)),
+    rent: parseFloat(rent.toFixed(2)),
+    serviceCharge: parseFloat(serviceCharge.toFixed(2)),
+    vat: parseFloat(vat.toFixed(2)),
+    totalDue: parseFloat(totalDue.toFixed(2)),
+    monthlyBreakdown
+  };
+}
+
+// Helper: Infer period month span from invoice/payment policy data
+function getInvoicePeriodMonths(invoice, tenantPaymentPolicy = 'MONTHLY') {
+  if (invoice?.paymentPolicy) {
+    return getPolicyMonths(invoice.paymentPolicy);
+  }
+
+  return getPolicyMonths(tenantPaymentPolicy);
 }
 
 // Utility: Parse & validate pagination params
@@ -393,40 +465,31 @@ async function updateTenantCreditBalance(tx, tenantId, amount) {
   }
 }
 
-// Helper: Calculate how many periods are covered by overpayment
-function calculateCoveredPeriods(overpaymentAmount, monthlyRent, paymentPolicy) {
-  if (monthlyRent <= 0) return { months: 0, remainder: 0 };
-  
-  let monthsCovered = 0;
-  let remaining = overpaymentAmount;
-  
-  // Calculate based on payment policy
-  switch (paymentPolicy) {
-    case 'MONTHLY':
-      monthsCovered = Math.floor(remaining / monthlyRent);
-      remaining = remaining % monthlyRent;
-      break;
-    case 'QUARTERLY':
-      const quarterlyRent = monthlyRent * 3;
-      monthsCovered = Math.floor(remaining / quarterlyRent) * 3;
-      remaining = remaining % quarterlyRent;
-      break;
-    case 'ANNUAL':
-      const annualRent = monthlyRent * 12;
-      monthsCovered = Math.floor(remaining / annualRent) * 12;
-      remaining = remaining % annualRent;
-      break;
-    default:
-      monthsCovered = Math.floor(remaining / monthlyRent);
-      remaining = remaining % monthlyRent;
+// Helper: Calculate how many billing periods are covered by overpayment
+function calculateCoveredBillingPeriods(overpaymentAmount, billingPeriodTotal) {
+  if (billingPeriodTotal <= 0) {
+    return { periods: 0, remainder: 0 };
   }
-  
-  return { months: monthsCovered, remainder: parseFloat(remaining.toFixed(2)) };
+
+  const periods = Math.floor(overpaymentAmount / billingPeriodTotal);
+  const remainder = overpaymentAmount % billingPeriodTotal;
+
+  return {
+    periods,
+    remainder: parseFloat(remainder.toFixed(2))
+  };
 }
 
 // Helper: Generate and upload receipt PDF
 async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpaymentAmount = 0, creditUsed = 0) {
   try {
+    const totalRent = invoices.reduce((sum, inv) => sum + (inv.rent || 0), 0);
+    const totalServiceCharge = invoices.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0);
+    const totalVat = invoices.reduce((sum, inv) => sum + (inv.vat || 0), 0);
+    const totalDue = invoices.reduce((sum, inv) => sum + (inv.totalDue || 0), 0);
+    const paymentPolicy = invoices[0]?.paymentPolicy || tenant.paymentPolicy || 'MONTHLY';
+    const policyMonths = getPolicyMonths(paymentPolicy);
+
     const receiptData = {
       receiptNumber: `RCP-${Date.now()}-${paymentReport.id.slice(-6).toUpperCase()}`,
       paymentDate: paymentReport.datePaid,
@@ -435,10 +498,16 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
       propertyName: tenant.unit?.property?.name || 'N/A',
       unitType: tenant.unit?.type || 'Unit',
       unitNo: tenant.unit?.unitNo || '',
-      paymentPeriod: new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', { 
-        month: 'long', 
-        year: 'numeric' 
+      paymentPeriod: invoices[0]?.paymentPeriod || new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', {
+        month: 'long',
+        year: 'numeric'
       }),
+      paymentPolicy,
+      monthlyEquivalent: parseFloat((totalDue / policyMonths).toFixed(2)),
+      billedRent: parseFloat(totalRent.toFixed(2)),
+      billedServiceCharge: parseFloat(totalServiceCharge.toFixed(2)),
+      billedVat: parseFloat(totalVat.toFixed(2)),
+      billedTotalDue: parseFloat(totalDue.toFixed(2)),
       amountPaid: paymentReport.amountPaid,
       invoicesPaid: invoices.map(inv => ({
         invoiceNumber: inv.invoiceNumber,
@@ -446,10 +515,11 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
         previousBalance: inv.totalDue,
         paymentApplied: inv.amountPaid,
         newBalance: inv.balance,
-        newStatus: inv.status
+        newStatus: inv.status,
+        paymentPolicy: inv.paymentPolicy || paymentPolicy
       })),
-      overpaymentAmount: overpaymentAmount,
-      creditUsed: creditUsed,
+      overpaymentAmount,
+      creditUsed,
       totalAllocated: paymentReport.amountPaid,
       paymentReportId: paymentReport.id,
       notes: paymentReport.notes
@@ -609,7 +679,11 @@ export const createPaymentReport = async (req, res) => {
       if (invoicesToProcess.length === 0) {
         // If createMissingInvoices is true, create one
         if (createMissingInvoices) {
-          const expected = await computeExpectedCharges(tenantId, paymentPeriodDate);
+          const expected = await computeExpectedChargesForPolicy(
+            tenantId,
+            paymentPeriodDate,
+            tenant.paymentPolicy || 'MONTHLY'
+          );
           
           const invoiceNumber = await generateInvoiceNumber();
           const newInvoice = await prisma.invoice.create({
@@ -617,11 +691,8 @@ export const createPaymentReport = async (req, res) => {
               invoiceNumber,
               tenantId,
               issueDate: new Date(),
-              dueDate: paymentPeriodDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-              paymentPeriod: expected.periodStart.toLocaleDateString('en-US', { 
-                month: 'long', 
-                year: 'numeric' 
-              }),
+              dueDate: expected.periodEnd,
+              paymentPeriod: expected.paymentPeriodLabel,
               rent: expected.rent,
               serviceCharge: expected.serviceCharge,
               vat: expected.vat,
@@ -629,15 +700,15 @@ export const createPaymentReport = async (req, res) => {
               amountPaid: 0,
               balance: expected.totalDue,
               status: 'UNPAID',
-              paymentPolicy: tenant.paymentPolicy,
-              notes: `Auto-generated for payment recording`
+              paymentPolicy: tenant.paymentPolicy || 'MONTHLY',
+              notes: `Auto-generated ${(tenant.paymentPolicy || 'MONTHLY')} invoice for payment recording. Monthly equivalent: Ksh ${expected.monthlyEquivalent.toFixed(2)}`
             }
           });
           
           invoicesToProcess = [newInvoice];
           totalInvoiceBalance = expected.totalDue;
           paymentPeriodStr = newInvoice.paymentPeriod;
-          console.log(`Created new invoice for payment: ${newInvoice.invoiceNumber}`);
+          console.log(`Created new ${tenant.paymentPolicy || 'MONTHLY'} invoice for payment: ${newInvoice.invoiceNumber}`);
         } else {
           // createMissingInvoices is false AND no invoices exist - ERROR
           return res.status(400).json({
@@ -860,29 +931,28 @@ export const createPaymentReport = async (req, res) => {
           }
         }
 
-        // If still have overpayment, create prepaid future periods
+        // If still have overpayment, create prepaid future billing periods
         if (remainingOverpayment > 0) {
-          const monthlyRent = tenant.rent;
-          const { months, remainder } = calculateCoveredPeriods(remainingOverpayment, monthlyRent, paymentPolicy);
+          const currentPolicyCharges = await computeExpectedChargesForPolicy(
+            tenantId,
+            paymentPeriodDate || new Date(),
+            paymentPolicy
+          );
+
+          const { periods, remainder } = calculateCoveredBillingPeriods(
+            remainingOverpayment,
+            currentPolicyCharges.totalDue
+          );
           
-          let futureDate = new Date(paymentPeriodDate || new Date());
-          const coveredMonths = months > 0 ? months : 0;
+          let futureDate = new Date(
+            currentPolicyCharges.periodStart.getFullYear(),
+            currentPolicyCharges.periodStart.getMonth(),
+            1
+          );
           
-          for (let i = 1; i <= coveredMonths; i++) {
-            switch (paymentPolicy) {
-              case 'QUARTERLY':
-                futureDate.setMonth(futureDate.getMonth() + 3);
-                break;
-              case 'ANNUAL':
-                futureDate.setFullYear(futureDate.getFullYear() + 1);
-                break;
-              case 'MONTHLY':
-              default:
-                futureDate.setMonth(futureDate.getMonth() + 1);
-                break;
-            }
-            
-            const expected = await computeExpectedCharges(tenantId, futureDate);
+          for (let i = 1; i <= periods; i++) {
+            futureDate = addBillingPeriod(futureDate, paymentPolicy);
+            const expected = await computeExpectedChargesForPolicy(tenantId, futureDate, paymentPolicy);
             
             const futureReport = await tx.paymentReport.create({
               data: {
@@ -894,15 +964,15 @@ export const createPaymentReport = async (req, res) => {
                 amountPaid: 0,
                 arrears: 0,
                 status: 'PREPAID',
-                paymentPeriod: futureDate,
+                paymentPeriod: expected.periodStart,
                 datePaid: new Date(),
-                notes: `Covered by overpayment from ${paymentPeriodStr}. Original payment: ${parsedAmountPaid}`
+                notes: `Covered by overpayment from ${paymentPeriodStr}. Prepaid ${paymentPolicy} period: ${expected.paymentPeriodLabel}. Original payment: ${parsedAmountPaid}`
               }
             });
             
             overpaymentRecords.push({
               type: 'PREPAID_PERIOD',
-              period: futureDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+              period: expected.paymentPeriodLabel,
               reportId: futureReport.id,
               amountCovered: expected.totalDue,
               commissionApplicable: false
@@ -919,7 +989,7 @@ export const createPaymentReport = async (req, res) => {
             });
           }
           
-          console.log(`Created ${coveredMonths} prepaid records, credit balance: ${remainder}`);
+          console.log(`Created ${periods} prepaid ${paymentPolicy} records, credit balance: ${remainder}`);
         }
       }
 
@@ -1434,9 +1504,22 @@ export const createIncome = async (req, res) => {
 export const previewPayment = async (req, res) => {
   try {
     const { tenantId } = req.params;
-    const { includeCredit = true } = req.query;
-    
-    const preview = await computeExpectedCharges(tenantId);
+    const { includeCredit = true, paymentPeriod } = req.query;
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { paymentPolicy: true }
+    });
+
+    if (!tenant) {
+      return res.status(404).json({ success: false, message: 'Tenant not found' });
+    }
+
+    const preview = await computeExpectedChargesForPolicy(
+      tenantId,
+      paymentPeriod ? new Date(paymentPeriod) : null,
+      tenant.paymentPolicy || 'MONTHLY'
+    );
     
     // Check for existing credit balance
     let creditBalance = 0;
@@ -1449,7 +1532,8 @@ export const previewPayment = async (req, res) => {
       data: {
         ...preview,
         existingCredit: creditBalance,
-        totalAvailable: preview.totalDue + creditBalance
+        netDueAfterCredit: Math.max(0, parseFloat((preview.totalDue - creditBalance).toFixed(2))),
+        totalAvailable: parseFloat((preview.totalDue + creditBalance).toFixed(2))
       }
     });
   } catch (error) {
@@ -1500,6 +1584,10 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       }
 
       // Recalculate expected charges if payment period changes
+      const existingPolicyMonths = existingReport.invoices?.length > 0
+        ? Math.max(...existingReport.invoices.map(inv => getInvoicePeriodMonths(inv, existingReport.tenant.paymentPolicy || 'MONTHLY')))
+        : getPolicyMonths(existingReport.tenant.paymentPolicy || 'MONTHLY');
+
       let expected = {
         rent: existingReport.rent,
         serviceCharge: existingReport.serviceCharge,
@@ -1508,13 +1596,18 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         vatRate: existingReport.tenant.vatRate,
         totalDue: existingReport.totalDue,
         periodStart: existingReport.paymentPeriod,
-        periodEnd: new Date(new Date(existingReport.paymentPeriod).getFullYear(), new Date(existingReport.paymentPeriod).getMonth() + 1, 0)
+        periodEnd: new Date(
+          new Date(existingReport.paymentPeriod).getFullYear(),
+          new Date(existingReport.paymentPeriod).getMonth() + existingPolicyMonths,
+          0
+        )
       };
 
       if (paymentPeriod) {
-        expected = await computeExpectedCharges(
-          existingReport.tenant,
-          paymentPeriod
+        expected = await computeExpectedChargesForPolicy(
+          existingReport.tenantId,
+          paymentPeriod,
+          existingReport.tenant.paymentPolicy || 'MONTHLY'
         );
       }
 

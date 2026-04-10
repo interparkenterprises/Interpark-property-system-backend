@@ -1,4 +1,33 @@
 /**
+ * Get number of months in a billing policy
+ * @param {string} [paymentPolicy='MONTHLY']
+ * @returns {number}
+ */
+export const getPolicyMonths = (paymentPolicy = 'MONTHLY') => {
+  switch (paymentPolicy) {
+    case 'QUARTERLY':
+      return 3;
+    case 'ANNUAL':
+      return 12;
+    case 'MONTHLY':
+    default:
+      return 1;
+  }
+};
+
+/**
+ * Add one billing period to a date based on payment policy
+ * @param {Date} date
+ * @param {string} [paymentPolicy='MONTHLY']
+ * @returns {Date}
+ */
+export const addBillingPeriod = (date, paymentPolicy = 'MONTHLY') => {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + getPolicyMonths(paymentPolicy));
+  return next;
+};
+
+/**
  * Calculate escalated rent based on tenant's escalation settings
  * @param {Object} tenant - Tenant object with escalationRate & escalationFrequency
  * @param {Date} [asOfDate=new Date()] - Date to calculate rent as of (defaults to today)
@@ -91,4 +120,44 @@ export const getRentSchedule = (tenant, numPeriods = 5) => {
   }
 
   return schedule;
+};
+
+/**
+ * Calculate payment amount based on monthly rent and payment policy
+ * @param {number} monthlyRent - Monthly rent amount
+ * @param {string} paymentPolicy - MONTHLY, QUARTERLY, or ANNUAL
+ * @returns {number} - Payment amount for the selected policy
+ */
+export const calculatePaymentByPolicy = (monthlyRent, paymentPolicy) => {
+  return monthlyRent * getPolicyMonths(paymentPolicy);
+};
+
+/**
+ * Calculate a generic charge by payment policy
+ * Useful when the amount represents a monthly full charge
+ * (rent + service charge + VAT) rather than rent only.
+ * @param {number} monthlyAmount
+ * @param {string} paymentPolicy
+ * @returns {number}
+ */
+export const calculateChargeByPolicy = (monthlyAmount, paymentPolicy = 'MONTHLY') => {
+  return parseFloat((monthlyAmount * getPolicyMonths(paymentPolicy)).toFixed(2));
+};
+
+/**
+ * Get rent schedule with payment policy applied
+ * @param {Object} tenant - Tenant object
+ * @param {number} [numPeriods=5] - Number of future escalations to project
+ * @returns {Array<{ period: number, date: Date, monthlyRent: number, paymentAmount: number, paymentPolicy: string }>}
+ */
+export const getRentScheduleWithPayments = (tenant, numPeriods = 5) => {
+  const schedule = getRentSchedule(tenant, numPeriods);
+  
+  return schedule.map(item => ({
+    period: item.period,
+    date: item.date,
+    monthlyRent: item.rent,
+    paymentAmount: calculatePaymentByPolicy(item.rent, tenant.paymentPolicy),
+    paymentPolicy: tenant.paymentPolicy
+  }));
 };

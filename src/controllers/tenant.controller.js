@@ -1,6 +1,10 @@
 import prisma from "../lib/prisma.js";
 
-import { calculateEscalatedRent, getRentSchedule } from '../services/rentCalculation.js';
+import { 
+  calculateEscalatedRent,  
+  calculatePaymentByPolicy,
+  getRentScheduleWithPayments 
+} from '../services/rentCalculation.js';
 
 //const prisma = new PrismaClient();
 
@@ -81,7 +85,24 @@ export const getTenants = async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    res.json(tenants);
+    // Enhance each tenant with payment information
+    const enhancedTenants = tenants.map(tenant => {
+      const rentInfo = calculateEscalatedRent(tenant);
+      const monthlyRent = rentInfo.currentRent;
+      const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+      
+      return {
+        ...tenant,
+        rentInfo: {
+          ...rentInfo,
+          monthlyRent: monthlyRent,
+          paymentAmount: paymentAmount,
+          paymentPolicy: tenant.paymentPolicy
+        }
+      };
+    });
+
+    res.json(enhancedTenants);
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -120,11 +141,18 @@ export const getTenant = async (req, res) => {
 
     // Calculate escalated rent and schedule
     const rentInfo = calculateEscalatedRent(tenant);
-    const rentSchedule = getRentSchedule(tenant, 3);
+    const monthlyRent = rentInfo.currentRent;
+    const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+    const rentSchedule = getRentScheduleWithPayments(tenant, 3);
 
     res.json({
       ...tenant,
-      rentInfo,
+      rentInfo: {
+        ...rentInfo,
+        monthlyRent: monthlyRent,
+        paymentAmount: paymentAmount,
+        paymentPolicy: tenant.paymentPolicy
+      },
       rentSchedule
     });
   } catch (error) {

@@ -7,6 +7,7 @@ import path from 'path';
 import { existsSync } from 'fs';  // For synchronous existsSync
 import { fileURLToPath } from 'url';
 import sizeOf from 'image-size';
+import { addBillingPeriod, calculateChargeByPolicy, calculateEscalatedRent } from '../services/rentCalculation.js';
 
 
 // Create __dirname equivalent for ES modules
@@ -19,14 +20,112 @@ function toTitleCase(enumValue) {
   return enumValue.charAt(0).toUpperCase() + enumValue.slice(1).toLowerCase();
 }
 
+const VALID_PAYMENT_POLICIES = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
+
+function normalizePaymentPolicy(paymentPolicy = 'MONTHLY') {
+  const normalized = String(paymentPolicy || 'MONTHLY').toUpperCase();
+  return VALID_PAYMENT_POLICIES.includes(normalized) ? normalized : 'MONTHLY';
+}
+
+function roundMoney(value) {
+  return parseFloat(Number(value || 0).toFixed(2));
+}
+
+function toValidDate(dateLike, fallback = new Date()) {
+  const date = new Date(dateLike);
+  return Number.isNaN(date.getTime()) ? new Date(fallback) : date;
+}
+
+function calculateMonthlyServiceCharge(tenant, monthlyRent) {
+  if (!tenant?.serviceCharge) return 0;
+
+  switch (tenant.serviceCharge.type) {
+    case 'FIXED':
+      return roundMoney(tenant.serviceCharge.fixedAmount || 0);
+
+    case 'PERCENTAGE':
+      return roundMoney((monthlyRent * (tenant.serviceCharge.percentage || 0)) / 100);
+
+    case 'PER_SQ_FT':
+      return roundMoney((tenant.serviceCharge.perSqFtRate || 0) * (tenant.unit?.sizeSqFt || 0));
+
+    default:
+      return 0;
+  }
+}
+
+function buildPaymentPeriodLabel(startDate, paymentPolicy = 'MONTHLY') {
+  const policy = normalizePaymentPolicy(paymentPolicy);
+  const start = toValidDate(startDate);
+  const endExclusive = addBillingPeriod(start, policy);
+  const end = new Date(endExclusive);
+  end.setDate(end.getDate() - 1);
+
+  const shortDate = (date) =>
+    date.toLocaleDateString('en-US', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric'
+    });
+
+  switch (policy) {
+    case 'QUARTERLY':
+    case 'ANNUAL':
+      return `${shortDate(start)} - ${shortDate(end)}`;
+
+    case 'MONTHLY':
+    default:
+      return start.toLocaleDateString('en-US', {
+        month: 'long',
+        year: 'numeric'
+      });
+  }
+}
+
+function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
+  const paymentPolicy = normalizePaymentPolicy(tenant.paymentPolicy);
+  const { currentRent } = calculateEscalatedRent(tenant, billingDate);
+  const monthlyRent = roundMoney(currentRent || tenant.rent || 0);
+  const monthlyServiceCharge = calculateMonthlyServiceCharge(tenant, monthlyRent);
+
+  const rent = roundMoney(calculateChargeByPolicy(monthlyRent, paymentPolicy));
+  const serviceCharge = roundMoney(calculateChargeByPolicy(monthlyServiceCharge, paymentPolicy));
+  const subtotal = roundMoney(rent + serviceCharge);
+
+  const vatRate = Number(tenant.vatRate ?? 16);
+  let vat = 0;
+
+  if (tenant.vatType === 'INCLUSIVE') {
+    vat = subtotal - subtotal / (1 + vatRate / 100);
+  } else if (tenant.vatType === 'EXCLUSIVE') {
+    vat = (subtotal * vatRate) / 100;
+  }
+
+  vat = roundMoney(vat);
+
+  const totalDue = tenant.vatType === 'INCLUSIVE'
+    ? subtotal
+    : roundMoney(subtotal + vat);
+
+  return {
+    paymentPolicy,
+    monthlyRent,
+    monthlyServiceCharge,
+    rent,
+    serviceCharge,
+    vat,
+    subtotal,
+    totalDue
+  };
+}
+
 // @desc    Generate invoice for tenant
 // @route   POST /api/invoices/generate
 // @access  Private
 export const generateInvoice = async (req, res) => {
   try {
-    const { tenantId, paymentReportId, dueDate, notes } = req.body;
+    const { tenantId, paymentReportId, dueDate, notes, billingStartDate } = req.body;
 
-    // Fetch tenant with unit and property details
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
@@ -43,7 +142,6 @@ export const generateInvoice = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Tenant not found' });
     }
 
-    // Fetch payment report if provided
     let paymentReport = null;
     if (paymentReportId) {
       paymentReport = await prisma.paymentReport.findUnique({
@@ -51,78 +149,37 @@ export const generateInvoice = async (req, res) => {
       });
     }
 
-    // Calculate invoice details
-    const rent = paymentReport?.rent || tenant.rent;
-    let serviceCharge = 0;
-    
-    if (tenant.serviceCharge) {
-      if (tenant.serviceCharge.type === 'FIXED') {
-        serviceCharge = tenant.serviceCharge.fixedAmount || 0;
-      } else if (tenant.serviceCharge.type === 'PERCENTAGE') {
-        serviceCharge = (rent * (tenant.serviceCharge.percentage || 0)) / 100;
-      } else if (tenant.serviceCharge.type === 'PER_SQ_FT') {
-        serviceCharge = (tenant.serviceCharge.perSqFtRate || 0) * (tenant.unit?.sizeSqFt || 0);
-      }
-    }
+    const paymentPolicy = normalizePaymentPolicy(tenant.paymentPolicy);
 
-    const subtotal = rent + serviceCharge;
-    
-    // Calculate VAT based on tenant's VAT configuration
-    let vat = 0;
-    let vatRate = 16; // Changed from tenant.vatRate || 0 to fixed 16%
-        
-    if (tenant.vatType !== 'NOT_APPLICABLE') {
-      if (tenant.vatType === 'INCLUSIVE') {
-        // VAT is already included in the rent amount
-        // Extract VAT from the subtotal: VAT = subtotal - (subtotal / (1 + vatRate/100))
-        vat = subtotal - (subtotal / (1 + vatRate / 100));
-      } else if (tenant.vatType === 'EXCLUSIVE') {
-        // VAT is added on top of the subtotal
-        vat = (subtotal * vatRate) / 100;
-      }
-    }
+    const billingDate = billingStartDate
+      ? toValidDate(billingStartDate)
+      : paymentReport?.paymentPeriod
+        ? toValidDate(paymentReport.paymentPeriod, new Date())
+        : new Date();
 
-    // Use payment report VAT if provided, otherwise use calculated VAT
-    vat = paymentReport?.vat !== undefined ? paymentReport.vat : vat;
-
-    // Calculate total based on VAT type
-    let totalDue;
-    if (tenant.vatType === 'INCLUSIVE') {
-      // VAT is already included in the subtotal
-      totalDue = subtotal;
-    } else {
-      // VAT is exclusive or not applicable
-      totalDue = subtotal + vat;
-    }
-
-    const amountPaid = paymentReport?.amountPaid || 0;
-    const balance = totalDue - amountPaid;
-
-    // Generate unique invoice number
+    const calculated = calculateInvoiceAmountsFromTenant(tenant, billingDate);
+    const amountPaid = roundMoney(paymentReport?.amountPaid || 0);
+    const balance = roundMoney(calculated.totalDue - amountPaid);
     const invoiceNumber = await generateInvoiceNumber();
+    const paymentPeriod = buildPaymentPeriodLabel(billingDate, paymentPolicy);
 
-    // Determine payment period based on tenant's payment policy
-    const paymentPeriod = paymentReport?.paymentPeriod || 
-      getPaymentPeriod(new Date(), tenant.paymentPolicy);
-
-    // Create invoice record with paymentPolicy
     const invoice = await prisma.invoice.create({
       data: {
         invoiceNumber,
         tenantId,
         paymentReportId: paymentReportId || null,
         issueDate: new Date(),
-        dueDate: new Date(dueDate),
+        dueDate: dueDate ? new Date(dueDate) : new Date(),
         paymentPeriod,
-        rent,
-        serviceCharge,
-        vat,
-        totalDue,
+        rent: calculated.rent,
+        serviceCharge: calculated.serviceCharge,
+        vat: calculated.vat,
+        totalDue: calculated.totalDue,
         amountPaid,
         balance,
-        status: amountPaid >= totalDue ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UNPAID',
+        status: amountPaid >= calculated.totalDue ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UNPAID',
         notes,
-        paymentPolicy: tenant.paymentPolicy // Add payment policy from tenant
+        paymentPolicy
       },
       include: {
         tenant: {
@@ -137,13 +194,9 @@ export const generateInvoice = async (req, res) => {
       }
     });
 
-    // Generate PDF
     const pdfBuffer = await generateInvoicePDF(invoice, tenant);
-    
-    // Upload PDF to storage (implement your storage solution)
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
 
-    // Update invoice with PDF URL
     const updatedInvoice = await prisma.invoice.update({
       where: { id: invoice.id },
       data: { pdfUrl }
@@ -557,7 +610,7 @@ async function generateInvoicePDF(invoice, tenant) {
           topY + 30
         )
         .text(`Payment Period: ${invoice.paymentPeriod}`, invoiceDetailsX, topY + 45)
-        .text(`Payment Policy: ${invoice.paymentPolicy}`, invoiceDetailsX, topY + 60);
+        .text(`Payment Policy: ${toTitleCase(invoice.paymentPolicy)}`, invoiceDetailsX, topY + 60);
 
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
         doc.text(
@@ -612,7 +665,11 @@ async function generateInvoicePDF(invoice, tenant) {
 
       if (invoice.serviceCharge > 0) {
         doc.text('Service Charge', itemX + 10, currentY + 8)
-          .text('Property service charge', descX, currentY + 8)
+          .text(
+            `${toTitleCase(invoice.paymentPolicy)} service charge for ${invoice.paymentPeriod}`,
+            descX,
+            currentY + 8
+          )
           .text(
             invoice.serviceCharge.toLocaleString('en-US', {
               minimumFractionDigits: 2,
@@ -761,10 +818,7 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     const invoiceNumber = await generateInvoiceNumber();
 
     // Determine payment period
-    const paymentPeriod = new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', { 
-      month: 'long', 
-      year: 'numeric' 
-    });
+    const paymentPeriod = paymentReport.paymentPeriod || buildPaymentPeriodLabel(new Date(), tenant.paymentPolicy);
 
     // Create invoice record for the balance with paymentPolicy
     const invoice = await prisma.invoice.create({
@@ -1045,7 +1099,7 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
           topY + 30
         )
         .text(`Original Payment Period: ${invoice.paymentPeriod}`, invoiceDetailsX, topY + 45)
-        .text(`Payment Policy: ${invoice.paymentPolicy}`, invoiceDetailsX, topY + 60);
+        .text(`Payment Policy: ${toTitleCase(invoice.paymentPolicy)}`, invoiceDetailsX, topY + 60);
 
       if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
         doc.text(
@@ -1213,24 +1267,7 @@ async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) 
 
 // Helper function to get payment period based on payment policy
 function getPaymentPeriod(date, paymentPolicy) {
-  const currentDate = new Date(date);
-  
-  switch (paymentPolicy) {
-    case 'QUARTERLY':
-      const quarter = Math.floor(currentDate.getMonth() / 3) + 1;
-      const quarterNames = ['Q1', 'Q2', 'Q3', 'Q4'];
-      return `${quarterNames[quarter - 1]} ${currentDate.getFullYear()}`;
-    
-    case 'ANNUAL':
-      return `Annual ${currentDate.getFullYear()}`;
-    
-    case 'MONTHLY':
-    default:
-      return currentDate.toLocaleDateString('en-US', { 
-        month: 'long', 
-        year: 'numeric' 
-      });
-  }
+  return buildPaymentPeriodLabel(date, paymentPolicy);
 }
 
 // @desc    Update invoice with payment policy (for existing invoices)
@@ -1239,21 +1276,20 @@ function getPaymentPeriod(date, paymentPolicy) {
 export const updateInvoicePaymentPolicy = async (req, res) => {
   try {
     const { id } = req.params;
-    const { paymentPolicy } = req.body;
+    const { paymentPolicy, billingStartDate } = req.body;
 
-    // Validate payment policy
-    const validPolicies = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
-    if (!validPolicies.includes(paymentPolicy)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Invalid payment policy. Must be MONTHLY, QUARTERLY, or ANNUAL' 
-      });
-    }
+    const normalizedPolicy = normalizePaymentPolicy(paymentPolicy);
 
     const invoice = await prisma.invoice.findUnique({
       where: { id },
       include: {
-        tenant: true
+        tenant: {
+          include: {
+            unit: true,
+            serviceCharge: true
+          }
+        },
+        paymentReport: true
       }
     });
 
@@ -1261,9 +1297,34 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Invoice not found' });
     }
 
+    const billingDate = billingStartDate
+      ? toValidDate(billingStartDate)
+      : invoice.paymentReport?.paymentPeriod
+        ? toValidDate(invoice.paymentReport.paymentPeriod, invoice.issueDate)
+        : toValidDate(invoice.issueDate);
+
+    const tenantForCalculation = {
+      ...invoice.tenant,
+      paymentPolicy: normalizedPolicy
+    };
+
+    const calculated = calculateInvoiceAmountsFromTenant(tenantForCalculation, billingDate);
+    const amountPaid = roundMoney(invoice.amountPaid || 0);
+    const balance = roundMoney(calculated.totalDue - amountPaid);
+    const status = amountPaid >= calculated.totalDue ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UNPAID';
+
     const updatedInvoice = await prisma.invoice.update({
       where: { id },
-      data: { paymentPolicy }
+      data: {
+        paymentPolicy: normalizedPolicy,
+        paymentPeriod: buildPaymentPeriodLabel(billingDate, normalizedPolicy),
+        rent: calculated.rent,
+        serviceCharge: calculated.serviceCharge,
+        vat: calculated.vat,
+        totalDue: calculated.totalDue,
+        balance,
+        status
+      }
     });
 
     res.json({
@@ -1276,6 +1337,7 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
+
 // Helper function to delete file from storage (matching paymentReport.controller.js)
 async function deleteFromStorage(fileUrl) {
   if (!fileUrl) return;
@@ -1286,7 +1348,7 @@ async function deleteFromStorage(fileUrl) {
     
     // Use the imported existsSync
     if (existsSync(filePath)) {
-      await fs.unlink(filePath);
+      await fs.promises.unlink(filePath);
       console.log(`Deleted file: ${filename}`);
     }
     
@@ -1410,7 +1472,7 @@ export const deleteInvoice = async (req, res) => {
           const filePath = path.join(process.cwd(), 'uploads', 'invoices', fileName);
           
           if (existsSync(filePath)) {
-            await fs.unlink(filePath);
+            await fs.promises.unlink(filePath);
             result.deletedPdfs++;
             console.log(`Deleted invoice PDF: ${filePath}`);
           } else {
@@ -1537,7 +1599,7 @@ export const deleteInvoice = async (req, res) => {
                 const filePath = path.join(process.cwd(), 'uploads', fileName);
                 
                 if (existsSync(filePath)) {
-                  await fs.unlink(filePath);
+                  await fs.promises.unlink(filePath);
                   result.deletedPdfs++;
                   console.log(`Deleted bill invoice PDF: ${filePath}`);
                 }
@@ -1571,7 +1633,7 @@ export const deleteInvoice = async (req, res) => {
                   const filePath = path.join(process.cwd(), 'uploads', 'invoices', fileName);
                   
                   if (existsSync(filePath)) {
-                    await fs.unlink(filePath);
+                    await fs.promises.unlink(filePath);
                     result.deletedPdfs++;
                     console.log(`Deleted related invoice PDF: ${filePath}`);
                   }
@@ -1806,6 +1868,7 @@ export const deleteInvoice = async (req, res) => {
     });
   }
 };
+
 // @desc    Delete invoice PDF only (keep database record)
 // @route   DELETE /api/invoices/:id/pdf
 // @access  Private (Admin only)
