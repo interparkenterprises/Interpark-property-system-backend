@@ -5,6 +5,7 @@ import {
   calculatePaymentByPolicy,
   getRentScheduleWithPayments 
 } from '../services/rentCalculation.js';
+import { getPaymentSummary } from '../services/paymentScheduling.js'; 
 
 //const prisma = new PrismaClient();
 
@@ -45,7 +46,6 @@ export const getTenants = async (req, res) => {
     let tenants;
 
     if (userRole === 'ADMIN') {
-      // Admin sees all tenants
       tenants = await prisma.tenant.findMany({
         include: {
           unit: {
@@ -60,7 +60,6 @@ export const getTenants = async (req, res) => {
         orderBy: { fullName: 'asc' }
       });
     } else if (userRole === 'MANAGER') {
-      // Manager sees only tenants in properties they manage
       tenants = await prisma.tenant.findMany({
         where: {
           unit: {
@@ -90,6 +89,7 @@ export const getTenants = async (req, res) => {
       const rentInfo = calculateEscalatedRent(tenant);
       const monthlyRent = rentInfo.currentRent;
       const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+      const paymentSummary = getPaymentSummary(tenant); // Add payment summary
       
       return {
         ...tenant,
@@ -98,7 +98,8 @@ export const getTenants = async (req, res) => {
           monthlyRent: monthlyRent,
           paymentAmount: paymentAmount,
           paymentPolicy: tenant.paymentPolicy
-        }
+        },
+        paymentSummary // Include basic payment summary
       };
     });
 
@@ -144,6 +145,9 @@ export const getTenant = async (req, res) => {
     const monthlyRent = rentInfo.currentRent;
     const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
     const rentSchedule = getRentScheduleWithPayments(tenant, 3);
+    
+    // Calculate payment summary with due dates
+    const paymentSummary = getPaymentSummary(tenant);
 
     res.json({
       ...tenant,
@@ -153,7 +157,8 @@ export const getTenant = async (req, res) => {
         paymentAmount: paymentAmount,
         paymentPolicy: tenant.paymentPolicy
       },
-      rentSchedule
+      rentSchedule,
+      paymentSummary // Add this to response
     });
   } catch (error) {
     console.error('Get tenant error:', error);
