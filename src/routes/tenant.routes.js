@@ -2,6 +2,7 @@ import express from 'express';
 import {
   getTenants,
   getTenant,
+  getOverdueTenants,
   createTenant,
   updateTenant,
   deleteTenant,
@@ -18,6 +19,9 @@ router.use(protect);
 router.route('/')
   .get(getTenants)
   .post(authorize('ADMIN', 'MANAGER'), createTenant);
+
+router.route('/overdue')
+  .get(authorize('ADMIN', 'MANAGER'), getOverdueTenants);
 
 router.route('/:id')
   .get(getTenant)

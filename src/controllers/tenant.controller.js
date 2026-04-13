@@ -166,6 +166,127 @@ export const getTenant = async (req, res) => {
   }
 };
 
+// @desc    Get all tenants with overdue payments (optionally filtered by property)
+// @route   GET /api/tenants/overdue?propertyId=xxx
+// @access  Private
+export const getOverdueTenants = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { propertyId } = req.query; // Extract propertyId from query params
+
+    let tenants;
+
+    // Build base where conditions
+    const baseWhere = {};
+
+    // If propertyId is provided, validate access and apply filter
+    if (propertyId) {
+      if (userRole === 'MANAGER') {
+        // Verify manager has access to this specific property
+        const property = await prisma.property.findFirst({
+          where: {
+            id: propertyId,
+            managerId: userId
+          }
+        });
+
+        if (!property) {
+          return res.status(403).json({ 
+            message: 'Access denied to this property or property not found' 
+          });
+        }
+      }
+
+      // Add property filter to base where clause
+      baseWhere.unit = {
+        propertyId: propertyId
+      };
+    } else {
+      // No propertyId provided - apply existing role-based filtering
+      if (userRole === 'MANAGER') {
+        baseWhere.unit = {
+          property: {
+            managerId: userId
+          }
+        };
+      }
+    }
+
+    // Role-based access control
+    if (userRole === 'ADMIN' || userRole === 'MANAGER') {
+      tenants = await prisma.tenant.findMany({
+        where: baseWhere,
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          },
+          paymentReports: true,
+          serviceCharge: true,
+          incomes: true
+        },
+        orderBy: { fullName: 'asc' }
+      });
+    } else {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Filter tenants with overdue payments and enhance their data
+    const overdueTenants = tenants
+      .map(tenant => {
+        const rentInfo = calculateEscalatedRent(tenant);
+        const monthlyRent = rentInfo.currentRent;
+        const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+        const paymentSummary = getPaymentSummary(tenant);
+        
+        return {
+          ...tenant,
+          rentInfo: {
+            ...rentInfo,
+            monthlyRent: monthlyRent,
+            paymentAmount: paymentAmount,
+            paymentPolicy: tenant.paymentPolicy
+          },
+          paymentSummary
+        };
+      })
+      .filter(tenant => {
+        // Only include tenants that are overdue
+        return tenant.paymentSummary.nextPayment?.isOverdue === true;
+      });
+
+    // Calculate summary statistics
+    const totalOverdueAmount = overdueTenants.reduce((sum, tenant) => {
+      const overdueBalance = tenant.paymentSummary.paymentHistory?.outstandingBalance || 0;
+      return sum + (overdueBalance > 0 ? overdueBalance : 0);
+    }, 0);
+
+    const totalOverdueTenants = overdueTenants.length;
+
+    res.json({
+      success: true,
+      count: totalOverdueTenants,
+      totalOverdueAmount,
+      tenants: overdueTenants,
+      summary: {
+        totalOverdueTenants,
+        totalOverdueAmount,
+        averageOverdueAmount: totalOverdueTenants > 0 ? totalOverdueAmount / totalOverdueTenants : 0
+      },
+      // Add metadata about the filter applied
+      filter: {
+        propertyId: propertyId || null,
+        scope: propertyId ? 'specific_property' : (userRole === 'MANAGER' ? 'managed_properties' : 'all_properties')
+      }
+    });
+  } catch (error) {
+    console.error('Get overdue tenants error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
 // @desc    Create tenant
 // @route   POST /api/tenants
 // @access  Private
