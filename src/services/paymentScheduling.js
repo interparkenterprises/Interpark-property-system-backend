@@ -341,16 +341,38 @@ export const getPaymentSummary = (tenant) => {
   const totalPaid = paymentReports.reduce((sum, payment) => sum + payment.amount, 0);
   const policyMonths = getPolicyMonths(tenant.paymentPolicy);
   
-  // FIX: Only calculate expected payments if rent start date is in the past
+  // FIX: Calculate expected payments including current period if rent has started
   const rentStartDate = new Date(tenant.rentStart);
   const today = new Date();
+  
+  // Set both dates to start of day for accurate comparison
+  const rentStartStart = setToStartOfDay(rentStartDate);
+  const todayStart = setToStartOfDay(today);
+  
   let expectedPaymentsCount = 0;
   let expectedTotal = 0;
   
-  if (rentStartDate <= today) {
-    // Rent has started, calculate normally
-    const monthsSinceStart = calculateMonthsDifference(rentStartDate, today);
-    expectedPaymentsCount = Math.floor(monthsSinceStart / policyMonths);
+  if (rentStartStart <= todayStart) {
+    // Rent has started (including today)
+    // Calculate full months difference
+    let monthsDiff = 0;
+    const years = todayStart.getFullYear() - rentStartStart.getFullYear();
+    const months = todayStart.getMonth() - rentStartStart.getMonth();
+    monthsDiff = (years * 12) + months;
+    
+    // If rent started today or in the past but monthsDiff is 0, 
+    // we should still count the current period
+    if (monthsDiff === 0) {
+      // First billing period, rent has started
+      expectedPaymentsCount = 1;
+    } else {
+      // Calculate number of complete billing periods
+      const completedPeriods = Math.floor(monthsDiff / policyMonths);
+      // Check if there's a current partial period
+      const hasCurrentPeriod = (monthsDiff % policyMonths) >= 0;
+      expectedPaymentsCount = completedPeriods + (hasCurrentPeriod ? 1 : 0);
+    }
+    
     expectedTotal = expectedPaymentsCount * paymentAmount;
   } else {
     // Rent hasn't started yet, no payments expected
@@ -362,7 +384,7 @@ export const getPaymentSummary = (tenant) => {
   
   // Determine status with proper logic
   let status = 'UP_TO_DATE';
-  if (rentStartDate > today) {
+  if (rentStartStart > todayStart) {
     // Rent hasn't started yet
     status = 'NOT_STARTED';
   } else if (totalPaid === 0 && expectedTotal === 0) {
@@ -415,7 +437,7 @@ export const getPaymentSummary = (tenant) => {
     paymentHistory: {
       totalPaid,
       expectedTotal: Math.max(0, expectedTotal),
-      outstandingBalance: rentStartDate > today ? 0 : outstandingBalance,
+      outstandingBalance: rentStartStart > todayStart ? 0 : outstandingBalance,
       paymentsMade: paymentReports.length,
       expectedPaymentsCount: Math.max(0, expectedPaymentsCount),
       lastPaymentDate: nextPaymentInfo.lastPaymentDate,
@@ -425,7 +447,7 @@ export const getPaymentSummary = (tenant) => {
         nextPaymentInfo.lastPaymentDate.toLocaleString() : null
     },
     status,
-    isRentStarted: rentStartDate <= today,
-    rentStartDate: rentStartDate
+    isRentStarted: rentStartStart <= todayStart,
+    rentStartDate: rentStartStart
   };
 };
