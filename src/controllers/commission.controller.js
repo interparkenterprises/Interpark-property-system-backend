@@ -6,6 +6,7 @@ import { commissionInvoiceHTML } from "../utils/commissionInvoiceTemplate.js";
 import fs from 'fs';
 import fsPromises from 'fs/promises';
 import path from 'path';
+import permissionService from "../services/permissionService.js";
 
 /**
  * Calculate VAT-exclusive amount from a payment for commission purposes
@@ -32,6 +33,7 @@ function calculateVatExclusiveAmount(amount, vatType, vatRate) {
 
 /**
  * Get all commissions for a specific manager
+ * Required Permission: VIEW_COMMISSIONS
  */
 export const getManagerCommissions = async (req, res) => {
   try {
@@ -46,12 +48,36 @@ export const getManagerCommissions = async (req, res) => {
       });
     }
 
-    // Check if manager is accessing their own data or if admin
-    if (req.user.role !== 'ADMIN' && req.user.id !== managerId) {
+    // Permission check: Users can only view their own commissions unless they have VIEW_COMMISSIONS permission
+    const hasViewPermission = await permissionService.hasPermission(
+      req.user.id, 
+      'VIEW_COMMISSIONS'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommissions = req.user.id === managerId;
+    
+    if (!isAdmin && !isOwnCommissions && !hasViewPermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only view your own commissions.'
+        message: 'Access denied. You do not have permission to view commissions.'
       });
+    }
+    
+    // If not admin and not viewing own commissions, check if they have permission to view other managers' commissions
+    if (!isAdmin && !isOwnCommissions) {
+      // Additional check: does the user have permission to view all commissions?
+      const canViewAll = await permissionService.hasPermission(
+        req.user.id,
+        'VIEW_COMMISSIONS',
+        null
+      );
+      if (!canViewAll) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. You can only view your own commissions.'
+        });
+      }
     }
 
     // Build filter conditions
@@ -133,6 +159,7 @@ export const getManagerCommissions = async (req, res) => {
 
 /**
  * Get commission statistics for a manager
+ * Required Permission: VIEW_COMMISSIONS
  */
 export const getCommissionStats = async (req, res) => {
   try {
@@ -145,12 +172,34 @@ export const getCommissionStats = async (req, res) => {
       });
     }
 
-    // Check if manager is accessing their own data or if admin
-    if (req.user.role !== 'ADMIN' && req.user.id !== managerId) {
+    // Permission check
+    const hasViewPermission = await permissionService.hasPermission(
+      req.user.id, 
+      'VIEW_COMMISSIONS'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommissions = req.user.id === managerId;
+    
+    if (!isAdmin && !isOwnCommissions && !hasViewPermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only view your own commission statistics.'
+        message: 'Access denied. You do not have permission to view commission statistics.'
       });
+    }
+    
+    if (!isAdmin && !isOwnCommissions) {
+      const canViewAll = await permissionService.hasPermission(
+        req.user.id,
+        'VIEW_COMMISSIONS',
+        null
+      );
+      if (!canViewAll) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. You can only view your own commission statistics.'
+        });
+      }
     }
 
     // Get all commissions for the manager
@@ -238,6 +287,7 @@ export const getCommissionStats = async (req, res) => {
 
 /**
  * Get a single commission by ID
+ * Required Permission: VIEW_COMMISSIONS
  */
 export const getCommissionById = async (req, res) => {
   try {
@@ -276,11 +326,19 @@ export const getCommissionById = async (req, res) => {
       });
     }
 
-    // Check if user has access to this commission
-    if (req.user.role !== 'ADMIN' && req.user.id !== commission.managerId) {
+    // Permission check
+    const hasViewPermission = await permissionService.hasPermission(
+      req.user.id, 
+      'VIEW_COMMISSIONS'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommission = req.user.id === commission.managerId;
+    
+    if (!isAdmin && !isOwnCommission && !hasViewPermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only view your own commissions.'
+        message: 'Access denied. You do not have permission to view this commission.'
       });
     }
 
@@ -301,6 +359,7 @@ export const getCommissionById = async (req, res) => {
 
 /**
  * Update commission status (for admin use only)
+ * Required Permissions: APPROVE_COMMISSIONS (for APPROVE action) or PROCESS_COMMISSIONS (for PROCESS action)
  */
 export const updateCommissionStatus = async (req, res) => {
   try {
@@ -328,29 +387,56 @@ export const updateCommissionStatus = async (req, res) => {
       });
     }
 
-    // Check if user is admin or the manager who owns the commission
-    if (req.user.role !== 'ADMIN' && req.user.id !== existingCommission.managerId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied. You can only update your own commissions.'
-      });
-    }
-
-    // Managers can only update to PROCESSING or PAID, and only for their own commissions
-    if (req.user.role !== 'ADMIN') {
-      if (status && !['PROCESSING', 'PAID'].includes(status)) {
+    // Permission check based on the status change
+    const isAdmin = req.user.role === 'ADMIN';
+    
+    if (!isAdmin) {
+      // Check for specific permissions based on target status
+      let hasPermission = false;
+      
+      if (status === 'PROCESSING') {
+        hasPermission = await permissionService.hasPermission(
+          req.user.id,
+          'PROCESS_COMMISSIONS'
+        );
+      } else if (status === 'PAID') {
+        hasPermission = await permissionService.hasPermission(
+          req.user.id,
+          'APPROVE_COMMISSIONS'
+        );
+      } else if (status === 'CANCELLED') {
+        hasPermission = await permissionService.hasPermission(
+          req.user.id,
+          'APPROVE_COMMISSIONS'
+        );
+      }
+      
+      // Also check if user owns this commission and has appropriate permission
+      const isOwnCommission = req.user.id === existingCommission.managerId;
+      
+      if (!hasPermission && !isOwnCommission) {
         return res.status(403).json({
           success: false,
-          message: 'Managers can only mark commissions as PROCESSING or PAID'
+          message: 'Access denied. You do not have permission to update commission status.'
         });
       }
       
-      // Managers cannot update notes or paidDate
-      if (notes !== undefined || paidDate !== undefined) {
-        return res.status(403).json({
-          success: false,
-          message: 'Managers cannot update notes or paid date'
-        });
+      // Managers can only update to PROCESSING or PAID, and only for their own commissions
+      if (!isAdmin && !isOwnCommission) {
+        if (status && !['PROCESSING', 'PAID'].includes(status)) {
+          return res.status(403).json({
+            success: false,
+            message: 'Managers can only mark commissions as PROCESSING or PAID'
+          });
+        }
+        
+        // Managers cannot update notes or paidDate
+        if (notes !== undefined || paidDate !== undefined) {
+          return res.status(403).json({
+            success: false,
+            message: 'Managers cannot update notes or paid date'
+          });
+        }
       }
     }
 
@@ -405,6 +491,7 @@ export const updateCommissionStatus = async (req, res) => {
 
 /**
  * Get commissions by property for a manager
+ * Required Permission: VIEW_COMMISSIONS
  */
 export const getCommissionsByProperty = async (req, res) => {
   try {
@@ -418,11 +505,47 @@ export const getCommissionsByProperty = async (req, res) => {
       });
     }
 
-    // Check if manager is accessing their own data or if admin
-    if (req.user.role !== 'ADMIN' && req.user.id !== managerId) {
+    // Permission check
+    const hasViewPermission = await permissionService.hasPermission(
+      req.user.id, 
+      'VIEW_COMMISSIONS'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommissions = req.user.id === managerId;
+    
+    if (!isAdmin && !isOwnCommissions && !hasViewPermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only view your own commissions.'
+        message: 'Access denied. You do not have permission to view commissions.'
+      });
+    }
+    
+    if (!isAdmin && !isOwnCommissions) {
+      const canViewAll = await permissionService.hasPermission(
+        req.user.id,
+        'VIEW_COMMISSIONS',
+        null
+      );
+      if (!canViewAll) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. You can only view your own commissions.'
+        });
+      }
+    }
+
+    // Additional property-based permission check
+    const hasPropertyAccess = await permissionService.checkPropertyAccess(
+      req.user.id,
+      propertyId,
+      'canView'
+    );
+    
+    if (!isAdmin && !hasPropertyAccess) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You do not have access to this property.'
       });
     }
 
@@ -483,6 +606,7 @@ export const getCommissionsByProperty = async (req, res) => {
 
 /**
  * Mark commission as processing (manager action)
+ * Required Permission: PROCESS_COMMISSIONS
  */
 export const markAsProcessing = async (req, res) => {
   try {
@@ -499,12 +623,34 @@ export const markAsProcessing = async (req, res) => {
       });
     }
 
-    // Check if manager owns this commission
-    if (req.user.role !== 'ADMIN' && req.user.id !== existingCommission.managerId) {
+    // Permission check
+    const hasProcessPermission = await permissionService.hasPermission(
+      req.user.id,
+      'PROCESS_COMMISSIONS'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommission = req.user.id === existingCommission.managerId;
+    
+    if (!isAdmin && !isOwnCommission && !hasProcessPermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only update your own commissions.'
+        message: 'Access denied. You do not have permission to process commissions.'
       });
+    }
+
+    // If it's not admin and not their own commission, check if they have the permission
+    if (!isAdmin && !isOwnCommission) {
+      const canProcess = await permissionService.hasPermission(
+        req.user.id,
+        'PROCESS_COMMISSIONS'
+      );
+      if (!canProcess) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. You can only process your own commissions.'
+        });
+      }
     }
 
     // Check if commission can be marked as processing
@@ -519,7 +665,7 @@ export const markAsProcessing = async (req, res) => {
       where: { id },
       data: {
         status: 'PROCESSING',
-        notes: existingCommission.notes ? `${existingCommission.notes}\nMarked as processing by manager on ${new Date().toLocaleDateString()}` : `Marked as processing by manager on ${new Date().toLocaleDateString()}`
+        notes: existingCommission.notes ? `${existingCommission.notes}\nMarked as processing by ${req.user.name || req.user.email} on ${new Date().toLocaleDateString()}` : `Marked as processing by ${req.user.name || req.user.email} on ${new Date().toLocaleDateString()}`
       },
       include: {
         property: {
@@ -560,6 +706,7 @@ export const markAsProcessing = async (req, res) => {
 
 /**
  * Mark commission as paid (manager action)
+ * Required Permission: APPROVE_COMMISSIONS
  */
 export const markAsPaid = async (req, res) => {
   try {
@@ -576,12 +723,34 @@ export const markAsPaid = async (req, res) => {
       });
     }
 
-    // Check if manager owns this commission
-    if (req.user.role !== 'ADMIN' && req.user.id !== existingCommission.managerId) {
+    // Permission check
+    const hasApprovePermission = await permissionService.hasPermission(
+      req.user.id,
+      'APPROVE_COMMISSIONS'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommission = req.user.id === existingCommission.managerId;
+    
+    if (!isAdmin && !isOwnCommission && !hasApprovePermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only update your own commissions.'
+        message: 'Access denied. You do not have permission to approve commissions.'
       });
+    }
+
+    // If it's not admin and not their own commission, check if they have the permission
+    if (!isAdmin && !isOwnCommission) {
+      const canApprove = await permissionService.hasPermission(
+        req.user.id,
+        'APPROVE_COMMISSIONS'
+      );
+      if (!canApprove) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. You can only approve your own commissions.'
+        });
+      }
     }
 
     // Check if commission can be marked as paid
@@ -597,7 +766,7 @@ export const markAsPaid = async (req, res) => {
       data: {
         status: 'PAID',
         paidDate: new Date(),
-        notes: existingCommission.notes ? `${existingCommission.notes}\nMarked as paid by manager on ${new Date().toLocaleDateString()}` : `Marked as paid by manager on ${new Date().toLocaleDateString()}`
+        notes: existingCommission.notes ? `${existingCommission.notes}\nMarked as paid by ${req.user.name || req.user.email} on ${new Date().toLocaleDateString()}` : `Marked as paid by ${req.user.name || req.user.email} on ${new Date().toLocaleDateString()}`
       },
       include: {
         property: {
@@ -638,12 +807,7 @@ export const markAsPaid = async (req, res) => {
 
 /**
  * Generate commission invoice PDF and mark commission PROCESSING
- * Manager/Admin
- *
- * Auto-populates:
- * - lrNumber from Property.lrNumber
- * - landlordAddress from Landlord.address
- * - refText auto-generated from period + property
+ * Required Permission: GENERATE_COMMISSION_INVOICES
  */
 export const generateCommissionInvoice = async (req, res) => {
   try {
@@ -658,7 +822,6 @@ export const generateCommissionInvoice = async (req, res) => {
       bankCode,
       swiftCode,
       currency = "KES"
-      // REMOVED vatRate from request body since commission has no VAT
     } = req.body;
 
     if (!description) {
@@ -707,16 +870,51 @@ export const generateCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Check permissions
-    if (req.user.role !== "ADMIN" && req.user.id !== commission.managerId) {
+    // Permission check for generating invoices
+    const hasGeneratePermission = await permissionService.hasPermission(
+      req.user.id,
+      'GENERATE_COMMISSION_INVOICES'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommission = req.user.id === commission.managerId;
+    
+    if (!isAdmin && !isOwnCommission && !hasGeneratePermission) {
       return res.status(403).json({
         success: false,
-        message: "Access denied. You can only generate invoices for your own commissions."
+        message: "Access denied. You do not have permission to generate commission invoices."
+      });
+    }
+
+    // If it's not admin and not their own commission, check if they have the permission
+    if (!isAdmin && !isOwnCommission) {
+      const canGenerate = await permissionService.hasPermission(
+        req.user.id,
+        'GENERATE_COMMISSION_INVOICES'
+      );
+      if (!canGenerate) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. You can only generate invoices for your own commissions."
+        });
+      }
+    }
+
+    // Additional property access check
+    const hasPropertyAccess = await permissionService.checkPropertyAccess(
+      req.user.id,
+      commission.propertyId,
+      'canView'
+    );
+    
+    if (!isAdmin && !hasPropertyAccess) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. You do not have access to this property."
       });
     }
 
     // ----- CHECK FOR EXISTING INVOICE -----
-    // If invoice exists, delete it to prevent duplicates
     let existingInvoice = await prisma.commissionInvoice.findFirst({
       where: { commissionId: id }
     });
@@ -764,7 +962,6 @@ export const generateCommissionInvoice = async (req, res) => {
     const refText = `COM-${monthShort}-${year}-${commission.property?.name || "PROPERTY"}`;
 
     // ----- COMMISSION CALCULATION -----
-    // Use the VAT-exclusive incomeAmount stored in commission
     const collectionAmount = Number(commission.incomeAmount || 0);
     const originalIncomeAmount = Number(commission.originalIncomeAmount || collectionAmount);
     
@@ -791,9 +988,9 @@ export const generateCommissionInvoice = async (req, res) => {
     const commissionAmount = Number((collectionAmount * commissionRateDecimal).toFixed(2));
 
     // COMMISSION TO LANDLORD HAS NO VAT
-    const vatRateNum = 0; // Always 0 for commission
-    const vatAmount = 0; // Always 0 for commission
-    const totalAmount = commissionAmount; // Total equals commission amount only
+    const vatRateNum = 0;
+    const vatAmount = 0;
+    const totalAmount = commissionAmount;
 
     // Generate invoice number
     const invoiceNumber = await generateCommissionInvoiceNumber();
@@ -811,14 +1008,14 @@ export const generateCommissionInvoice = async (req, res) => {
       landlordName: commission.property?.landlord?.name || "",
       landlordAddress,
       description,
-      collectionAmount,  // VAT-exclusive base amount from tenant
-      originalIncomeAmount, // Original payment amount from tenant (for reference)
-      vatType: vatTypeFromNotes, // Tenant's VAT type (for reference only)
-      vatRate: vatRateFromNotes, // Tenant's VAT rate (for reference only)
+      collectionAmount,
+      originalIncomeAmount,
+      vatType: vatTypeFromNotes,
+      vatRate: vatRateFromNotes,
       commissionRate: commissionRateDecimal,
       commissionAmount,
-      vatAmount: 0,  // ALWAYS 0 for commission invoice
-      totalAmount: commissionAmount, // Total equals commission amount
+      vatAmount: 0,
+      totalAmount: commissionAmount,
       bankName,
       accountName,
       accountNumber,
@@ -852,9 +1049,9 @@ export const generateCommissionInvoice = async (req, res) => {
           collectionAmount,
           commissionRate: commissionRateDecimal,
           commissionAmount,
-          vatRate: 0, // Always 0 for commission
-          vatAmount: 0, // Always 0 for commission
-          totalAmount: commissionAmount, // Total equals commission amount
+          vatRate: 0,
+          vatAmount: 0,
+          totalAmount: commissionAmount,
           bankName,
           accountName,
           accountNumber,
@@ -877,6 +1074,9 @@ export const generateCommissionInvoice = async (req, res) => {
       maxWait: 15000,
       timeout: 30000,
     });
+
+    // Invalidate permission cache for this user
+    await permissionService.invalidateUserCache(req.user.id);
 
     return res.status(201).json({
       success: true,
@@ -926,9 +1126,10 @@ export const generateCommissionInvoice = async (req, res) => {
     });
   }
 };
+
 /**
  * Download commission invoice PDF by invoice number
- * Manager/Admin
+ * Required Permissions: VIEW_COMMISSIONS or GENERATE_COMMISSION_INVOICES
  */
 export const downloadCommissionInvoice = async (req, res) => {
   try {
@@ -952,11 +1153,23 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Check if user has access
-    if (req.user.role !== 'ADMIN' && req.user.id !== invoice.commission.managerId) {
+    // Permission check for downloading invoice
+    const hasViewPermission = await permissionService.hasPermission(
+      req.user.id,
+      'VIEW_COMMISSIONS'
+    );
+    const hasGeneratePermission = await permissionService.hasPermission(
+      req.user.id,
+      'GENERATE_COMMISSION_INVOICES'
+    );
+    
+    const isAdmin = req.user.role === 'ADMIN';
+    const isOwnCommission = req.user.id === invoice.commission.managerId;
+    
+    if (!isAdmin && !isOwnCommission && !hasViewPermission && !hasGeneratePermission) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied.'
+        message: 'Access denied. You do not have permission to download this invoice.'
       });
     }
 
@@ -968,7 +1181,7 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Extract the filename from the URL - handle both forward and backslashes
+    // Extract the filename from the URL
     const fileName = pdfUrl.split(/[/\\]/).pop();
     
     if (!fileName) {
@@ -978,7 +1191,7 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
 
-    // Determine the file path - use consistent path resolution
+    // Determine the file path
     const filePath = path.resolve(
       process.cwd(),
       'uploads',
@@ -991,7 +1204,6 @@ export const downloadCommissionInvoice = async (req, res) => {
       await fsPromises.access(filePath, fs.constants.R_OK);
       console.log('File exists and is readable at path:', filePath);
       
-      // Get file stats for additional debugging
       const stats = await fsPromises.stat(filePath);
       console.log('File stats:', {
         size: stats.size,
@@ -1002,7 +1214,6 @@ export const downloadCommissionInvoice = async (req, res) => {
       console.error('File not found or not accessible at path:', filePath);
       console.error('Error details:', error.message);
       
-      // Try to list files in the directory to see what's there
       try {
         const dirPath = path.join(process.cwd(), 'uploads', 'commission-invoice');
         console.log('Attempting to list directory:', dirPath);
@@ -1010,7 +1221,6 @@ export const downloadCommissionInvoice = async (req, res) => {
         const files = await fsPromises.readdir(dirPath);
         console.log('Files in directory:', files);
         
-        // Check if file exists with different case (Windows is case-insensitive)
         const fileExists = files.some(file => 
           file.toLowerCase() === fileName.toLowerCase()
         );
@@ -1067,7 +1277,6 @@ export const downloadCommissionInvoice = async (req, res) => {
       });
     }
     
-    // Check if headers were already sent
     if (!res.headersSent) {
       res.status(500).json({
         success: false,

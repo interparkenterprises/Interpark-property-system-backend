@@ -1,8 +1,12 @@
 import prisma from "../lib/prisma.js";
 import { hashPassword, comparePassword } from '../utils/hashPassword.js';
 import generateToken from '../utils/generateToken.js';
+import permissionService from "../services/permissionService.js";
 
-//const prisma = new PrismaClient();
+// Helper function to get user's accessible properties
+async function getUserAccessibleProperties(userId, userRole) {
+  return await permissionService.getAccessiblePropertyIds(userId, userRole);
+}
 
 // @desc    Register new user (Manager only)
 // @route   POST /api/auth/register
@@ -11,7 +15,6 @@ export const registerUser = async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    // Check if user exists
     const userExists = await prisma.user.findUnique({
       where: { email }
     });
@@ -20,14 +23,13 @@ export const registerUser = async (req, res) => {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    // Create user - always as MANAGER, pending approval
     const user = await prisma.user.create({
       data: {
         name,
         email,
         password: await hashPassword(password),
         role: 'MANAGER',
-        isApproved: false // Default to false, needs admin approval
+        isApproved: false
       }
     });
 
@@ -39,7 +41,6 @@ export const registerUser = async (req, res) => {
         email: user.email,
         role: user.role,
         isApproved: user.isApproved
-        // No token generated yet - user cannot login until approved
       });
     }
   } catch (error) {
@@ -54,19 +55,16 @@ export const registerAdmin = async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    // Check if any admin exists
     const adminExists = await prisma.user.findFirst({
       where: { role: 'ADMIN' }
     });
 
-    // If admin exists but request has NO authorized admin → block it
     if (adminExists) {
       if (!req.user || req.user.role !== 'ADMIN') {
         return res.status(403).json({ message: 'Not authorized to create admin users' });
       }
     }
 
-    // Check if user already exists
     const userExists = await prisma.user.findUnique({
       where: { email }
     });
@@ -75,7 +73,6 @@ export const registerAdmin = async (req, res) => {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    // Create admin user
     const user = await prisma.user.create({
       data: {
         name,
@@ -103,45 +100,113 @@ export const registerAdmin = async (req, res) => {
   }
 };
 
-
-// @desc    Authenticate user
+// @desc    Authenticate user (supports regular and managed users)
 // @route   POST /api/auth/login
 // @access  Public
 export const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // Check for user email
     const user = await prisma.user.findUnique({
-      where: { email }
+      where: { email },
+      include: {
+        userAssignments: {
+          where: { 
+            isActive: true,
+            OR: [
+              { expiresAt: null },
+              { expiresAt: { gt: new Date() } }
+            ]
+          },
+          include: {
+            role: {
+              include: {
+                propertyAccess: { include: { property: true } },
+                permissions: { include: { permission: true } }
+              }
+            }
+          }
+        },
+        userPropertyAccess: {
+          where: { isActive: true },
+          include: { property: true }
+        },
+        createdByManager: {
+          select: { id: true, name: true, email: true }
+        }
+      }
     });
 
-    // Check if user exists and password is correct
     if (user && (await comparePassword(password, user.password))) {
+      
+      // Check if managed user's creator manager still exists
+      if (user.isManagedUser && user.createdByManagerId) {
+        const manager = await prisma.user.findUnique({
+          where: { id: user.createdByManagerId }
+        });
+        
+        if (!manager || manager.role !== 'MANAGER') {
+          return res.status(401).json({ 
+            error: "Account access revoked - manager no longer active" 
+          });
+        }
+      }
+      
+      // Check if user can login
+      if (!user.canManagerLogin) {
+        return res.status(401).json({ 
+          message: 'Your account has been disabled. Please contact your manager.' 
+        });
+      }
+      
       // Check if user is approved (for MANAGERS only)
       if (user.role === 'MANAGER' && !user.isApproved) {
         return res.status(403).json({ 
-          message: 'Your account is pending admin approval. Please wait for approval before logging in.' 
+          message: 'Your account is pending admin approval.' 
         });
       }
-
+      
+      // Check if this is first login for managed users
+      const isFirstLogin = user.isManagedUser && !user.lastLoginAt;
+      
+      // Update last login
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { lastLoginAt: new Date() }
+      });
+      
+      // Get accessible properties and permissions
+      const accessibleProperties = await getUserAccessibleProperties(user.id, user.role);
+      const permissions = await permissionService.getUserPermissions(user.id);
+      
+      const token = generateToken(user.id, user.role);
+      
       res.json({
         id: user.id,
         name: user.name,
         email: user.email,
         role: user.role,
         isApproved: user.isApproved,
-        token: generateToken(user.id, user.role)
+        isManagedUser: user.isManagedUser,
+        managedBy: user.createdByManager ? {
+          id: user.createdByManager.id,
+          name: user.createdByManager.name
+        } : null,
+        accessibleProperties,
+        permissions,
+        requiresPasswordChange: isFirstLogin,
+        token
       });
     } else {
       res.status(401).json({ message: 'Invalid email or password' });
     }
   } catch (error) {
+    console.error('Login error:', error);
     res.status(400).json({ message: error.message });
   }
 };
 
-// @desc    Get current user profile
+// @desc    Get current user profile with RBAC info
 // @route   GET /api/auth/profile
 // @access  Private
 export const getProfile = async (req, res) => {
@@ -154,11 +219,59 @@ export const getProfile = async (req, res) => {
         email: true, 
         role: true, 
         isApproved: true,
+        isManagedUser: true,
+        createdByManagerId: true,
+        canManagerLogin: true,
+        lastLoginAt: true,
         createdAt: true 
       }
     });
+    
+    const accessibleProperties = await getUserAccessibleProperties(req.user.id, user.role);
+    const permissions = await permissionService.getUserPermissions(req.user.id);
+    
+    res.json({
+      ...user,
+      accessibleProperties,
+      permissions
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
 
-    res.json(user);
+// @desc    Change password
+// @route   POST /api/auth/change-password
+// @access  Private
+export const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const userId = req.user.id;
+    
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    const isValid = await comparePassword(currentPassword, user.password);
+    if (!isValid) {
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+    
+    const hashedPassword = await hashPassword(newPassword);
+    
+    await prisma.user.update({
+      where: { id: userId },
+      data: { 
+        password: hashedPassword,
+        passwordChangedAt: new Date()
+      }
+    });
+    
+    res.json({ message: 'Password changed successfully' });
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -169,7 +282,6 @@ export const getProfile = async (req, res) => {
 // @access  Private/Admin
 export const updateUserRole = async (req, res) => {
   try {
-    // Check if current user is admin
     if (req.user.role !== 'ADMIN') {
       return res.status(403).json({ message: 'Not authorized to update user roles' });
     }
@@ -177,12 +289,10 @@ export const updateUserRole = async (req, res) => {
     const { id } = req.params;
     const { role } = req.body;
 
-    // Validate role
-    if (!['ADMIN', 'MANAGER'].includes(role)) {
+    if (!['ADMIN', 'MANAGER', 'USER'].includes(role)) {
       return res.status(400).json({ message: 'Invalid role' });
     }
 
-    // Prevent admin from demoting themselves
     if (id === req.user.id && role !== 'ADMIN') {
       return res.status(400).json({ message: 'Cannot demote yourself' });
     }
@@ -191,7 +301,6 @@ export const updateUserRole = async (req, res) => {
       where: { id },
       data: { 
         role,
-        // Auto-approve if role is changed to ADMIN
         ...(role === 'ADMIN' && { isApproved: true })
       },
       select: { 
@@ -200,6 +309,7 @@ export const updateUserRole = async (req, res) => {
         email: true, 
         role: true, 
         isApproved: true,
+        isManagedUser: true,
         createdAt: true 
       }
     });
@@ -218,7 +328,6 @@ export const updateUserRole = async (req, res) => {
 // @access  Private/Admin
 export const approveUser = async (req, res) => {
   try {
-    // Check if current user is admin
     if (req.user.role !== 'ADMIN') {
       return res.status(403).json({ message: 'Not authorized to approve users' });
     }
@@ -226,7 +335,6 @@ export const approveUser = async (req, res) => {
     const { id } = req.params;
     const { isApproved } = req.body;
 
-    // Validate input
     if (typeof isApproved !== 'boolean') {
       return res.status(400).json({ message: 'isApproved must be a boolean' });
     }
@@ -239,7 +347,6 @@ export const approveUser = async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Admins are always approved, no need to change
     if (user.role === 'ADMIN') {
       return res.status(400).json({ message: 'Admin users are automatically approved' });
     }
@@ -276,7 +383,6 @@ export const approveUser = async (req, res) => {
 // @access  Private/Admin
 export const getPendingUsers = async (req, res) => {
   try {
-    // Check if current user is admin
     if (req.user.role !== 'ADMIN') {
       return res.status(403).json({ message: 'Not authorized to view pending users' });
     }
@@ -310,7 +416,6 @@ export const getPendingUsers = async (req, res) => {
 // @access  Private/Admin
 export const getAllUsers = async (req, res) => {
   try {
-    // Check if current user is admin
     if (req.user.role !== 'ADMIN') {
       return res.status(403).json({ message: 'Not authorized to view all users' });
     }
@@ -322,6 +427,9 @@ export const getAllUsers = async (req, res) => {
         email: true,
         role: true,
         isApproved: true,
+        isManagedUser: true,
+        createdByManagerId: true,
+        lastLoginAt: true,
         createdAt: true
       },
       orderBy: {

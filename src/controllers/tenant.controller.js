@@ -1,18 +1,35 @@
 import prisma from "../lib/prisma.js";
+import permissionService from "../services/permissionService.js";
 
 import { 
   calculateEscalatedRent,  
   calculatePaymentByPolicy,
   getRentScheduleWithPayments 
 } from '../services/rentCalculation.js';
-import { getPaymentSummary } from '../services/paymentScheduling.js'; 
+import { getPaymentSummary } from '../services/paymentScheduling.js';
 
-//const prisma = new PrismaClient();
+// Helper function to check tenant-specific permissions
+const checkTenantPermission = async (userId, userRole, propertyId, operation) => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    return await permissionService.checkTenantPermission(userId, propertyId, operation);
+  }
+  
+  return false;
+};
 
-
-
-// Helper function to check if manager has access to tenant
-const checkManagerTenantAccess = async (userId, tenantId) => {
+// Helper function to check if user has access to tenant
+const checkUserTenantAccess = async (userId, userRole, tenantId, requiredOperation = 'view') => {
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantId },
     include: {
@@ -28,11 +45,57 @@ const checkManagerTenantAccess = async (userId, tenantId) => {
     return { hasAccess: false, tenant: null };
   }
 
-  if (tenant.unit.property.managerId !== userId) {
-    return { hasAccess: false, tenant };
+  if (userRole === 'ADMIN') {
+    return { hasAccess: true, tenant };
   }
+  
+  if (userRole === 'MANAGER') {
+    const hasAccess = tenant.unit.property.managerId === userId;
+    return { hasAccess, tenant };
+  }
+  
+  if (userRole === 'USER') {
+    const hasAccess = await checkTenantPermission(
+      userId, 
+      userRole, 
+      tenant.unit.propertyId, 
+      requiredOperation
+    );
+    return { hasAccess, tenant };
+  }
+  
+  return { hasAccess: false, tenant };
+};
 
-  return { hasAccess: true, tenant };
+// Helper function to check if user has write access for tenant operations
+const checkUserWriteAccess = async (userId, userRole, tenantId = null, operation = 'edit') => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    if (tenantId) {
+      const { hasAccess } = await checkUserTenantAccess(userId, userRole, tenantId, operation);
+      return hasAccess;
+    }
+    return true; // Managers can create tenants
+  }
+  
+  if (userRole === 'USER') {
+    if (tenantId) {
+      const tenant = await prisma.tenant.findUnique({
+        where: { id: tenantId },
+        include: { unit: true }
+      });
+      if (tenant) {
+        return await checkTenantPermission(userId, userRole, tenant.unit.propertyId, operation);
+      }
+      return false;
+    }
+    return false; // Will be validated at the property level in createTenant
+  }
+  
+  return false;
 };
 
 // @desc    Get all tenants
@@ -80,6 +143,47 @@ export const getTenants = async (req, res) => {
         },
         orderBy: { fullName: 'asc' }
       });
+    } else if (userRole === 'USER') {
+      // Get accessible property IDs for this user
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.json([]);
+      }
+      
+      // Filter properties where user has VIEW_TENANTS permission
+      const propertiesWithPermission = [];
+      for (const propertyId of accessiblePropertyIds) {
+        const hasViewPermission = await checkTenantPermission(userId, userRole, propertyId, 'view');
+        if (hasViewPermission) {
+          propertiesWithPermission.push(propertyId);
+        }
+      }
+      
+      if (propertiesWithPermission.length === 0) {
+        return res.json([]);
+      }
+      
+      tenants = await prisma.tenant.findMany({
+        where: {
+          unit: {
+            property: {
+              id: { in: propertiesWithPermission }
+            }
+          }
+        },
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          },
+          paymentReports: true,
+          serviceCharge: true,
+          incomes: true
+        },
+        orderBy: { fullName: 'asc' }
+      });
     } else {
       return res.status(403).json({ message: 'Access denied' });
     }
@@ -89,7 +193,7 @@ export const getTenants = async (req, res) => {
       const rentInfo = calculateEscalatedRent(tenant);
       const monthlyRent = rentInfo.currentRent;
       const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
-      const paymentSummary = getPaymentSummary(tenant); // Add payment summary
+      const paymentSummary = getPaymentSummary(tenant);
       
       return {
         ...tenant,
@@ -99,12 +203,13 @@ export const getTenants = async (req, res) => {
           paymentAmount: paymentAmount,
           paymentPolicy: tenant.paymentPolicy
         },
-        paymentSummary // Include basic payment summary
+        paymentSummary
       };
     });
 
     res.json(enhancedTenants);
   } catch (error) {
+    console.error('Get tenants error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -117,7 +222,22 @@ export const getTenant = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    const tenant = await prisma.tenant.findUnique({
+    // Check access with VIEW_TENANTS permission
+    const { hasAccess, tenant } = await checkUserTenantAccess(userId, userRole, req.params.id, 'view');
+    
+    if (!hasAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied to this tenant',
+        requiredPermission: 'VIEW_TENANTS'
+      });
+    }
+
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
+    }
+
+    // Fetch full tenant details with all includes
+    const fullTenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: {
         unit: {
@@ -131,37 +251,111 @@ export const getTenant = async (req, res) => {
       }
     });
 
-    if (!tenant) {
-      return res.status(404).json({ message: 'Tenant not found' });
-    }
-
-    // Check access for managers
-    if (userRole === 'MANAGER' && tenant.unit.property.managerId !== userId) {
-      return res.status(403).json({ message: 'Access denied to this tenant' });
-    }
-
     // Calculate escalated rent and schedule
-    const rentInfo = calculateEscalatedRent(tenant);
+    const rentInfo = calculateEscalatedRent(fullTenant);
     const monthlyRent = rentInfo.currentRent;
-    const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
-    const rentSchedule = getRentScheduleWithPayments(tenant, 3);
+    const paymentAmount = calculatePaymentByPolicy(monthlyRent, fullTenant.paymentPolicy);
+    const rentSchedule = getRentScheduleWithPayments(fullTenant, 3);
     
     // Calculate payment summary with due dates
-    const paymentSummary = getPaymentSummary(tenant);
+    const paymentSummary = getPaymentSummary(fullTenant);
 
     res.json({
-      ...tenant,
+      ...fullTenant,
       rentInfo: {
         ...rentInfo,
         monthlyRent: monthlyRent,
         paymentAmount: paymentAmount,
-        paymentPolicy: tenant.paymentPolicy
+        paymentPolicy: fullTenant.paymentPolicy
       },
       rentSchedule,
-      paymentSummary // Add this to response
+      paymentSummary
     });
   } catch (error) {
     console.error('Get tenant error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Get tenants by property ID
+// @route   GET /api/tenants/property/:propertyId
+// @access  Private
+export const getTenantsByProperty = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { propertyId } = req.params;
+
+    // Check if user has access to this property
+    let hasAccess = false;
+
+    if (userRole === 'ADMIN') {
+      hasAccess = true;
+    } else if (userRole === 'MANAGER') {
+      const property = await prisma.property.findFirst({
+        where: { id: propertyId, managerId: userId }
+      });
+      hasAccess = !!property;
+    } else if (userRole === 'USER') {
+      // Check if user has VIEW_TENANTS permission for this property
+      hasAccess = await checkTenantPermission(userId, userRole, propertyId, 'view');
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied to this property',
+        requiredPermission: 'VIEW_TENANTS'
+      });
+    }
+
+    // Fetch tenants for this property
+    const tenants = await prisma.tenant.findMany({
+      where: {
+        unit: {
+          propertyId: propertyId
+        }
+      },
+      include: {
+        unit: {
+          include: {
+            property: true
+          }
+        },
+        paymentReports: {
+          orderBy: { datePaid: 'desc' },
+          take: 5
+        },
+        serviceCharge: true,
+        incomes: {
+          orderBy: { createdAt: 'desc' },
+          take: 5
+        }
+      },
+      orderBy: { fullName: 'asc' }
+    });
+
+    // Enhance each tenant with payment information
+    const enhancedTenants = tenants.map(tenant => {
+      const rentInfo = calculateEscalatedRent(tenant);
+      const monthlyRent = rentInfo.currentRent;
+      const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+      const paymentSummary = getPaymentSummary(tenant);
+      
+      return {
+        ...tenant,
+        rentInfo: {
+          ...rentInfo,
+          monthlyRent: monthlyRent,
+          paymentAmount: paymentAmount,
+          paymentPolicy: tenant.paymentPolicy
+        },
+        paymentSummary
+      };
+    });
+
+    res.json(enhancedTenants);
+  } catch (error) {
+    console.error('Get tenants by property error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -173,14 +367,12 @@ export const getOverdueTenants = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
-    const { propertyId } = req.query; // Extract propertyId from query params
+    const { propertyId } = req.query;
 
     let tenants;
+    let baseWhere = {};
 
-    // Build base where conditions
-    const baseWhere = {};
-
-    // If propertyId is provided, validate access and apply filter
+    // Handle property-specific access for USER role
     if (propertyId) {
       if (userRole === 'MANAGER') {
         // Verify manager has access to this specific property
@@ -196,25 +388,94 @@ export const getOverdueTenants = async (req, res) => {
             message: 'Access denied to this property or property not found' 
           });
         }
+        
+        // Check if manager has VIEW_TENANTS permission
+        const hasViewPermission = await checkTenantPermission(userId, userRole, propertyId, 'view');
+        if (!hasViewPermission) {
+          return res.status(403).json({ 
+            message: 'Access denied. You do not have permission to view tenants for this property.',
+            requiredPermission: 'VIEW_TENANTS'
+          });
+        }
+      } else if (userRole === 'USER') {
+        // Check if USER has VIEW_TENANTS permission for this property
+        const hasAccess = await checkTenantPermission(userId, userRole, propertyId, 'view');
+        if (!hasAccess) {
+          return res.status(403).json({ 
+            message: 'Access denied to this property',
+            requiredPermission: 'VIEW_TENANTS'
+          });
+        }
       }
 
-      // Add property filter to base where clause
       baseWhere.unit = {
         propertyId: propertyId
       };
     } else {
-      // No propertyId provided - apply existing role-based filtering
+      // No propertyId provided - apply role-based filtering
       if (userRole === 'MANAGER') {
         baseWhere.unit = {
           property: {
             managerId: userId
           }
         };
+      } else if (userRole === 'USER') {
+        const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+        if (accessiblePropertyIds.length === 0) {
+          return res.json({
+            success: true,
+            count: 0,
+            totalOverdueAmount: 0,
+            tenants: [],
+            summary: {
+              totalOverdueTenants: 0,
+              totalOverdueAmount: 0,
+              averageOverdueAmount: 0
+            },
+            filter: {
+              propertyId: propertyId || null,
+              scope: propertyId ? 'specific_property' : 'accessible_properties'
+            }
+          });
+        }
+        
+        // Filter properties where user has VIEW_TENANTS permission
+        const propertiesWithPermission = [];
+        for (const propId of accessiblePropertyIds) {
+          const hasViewPermission = await checkTenantPermission(userId, userRole, propId, 'view');
+          if (hasViewPermission) {
+            propertiesWithPermission.push(propId);
+          }
+        }
+        
+        if (propertiesWithPermission.length === 0) {
+          return res.json({
+            success: true,
+            count: 0,
+            totalOverdueAmount: 0,
+            tenants: [],
+            summary: {
+              totalOverdueTenants: 0,
+              totalOverdueAmount: 0,
+              averageOverdueAmount: 0
+            },
+            filter: {
+              propertyId: propertyId || null,
+              scope: 'no_permission'
+            }
+          });
+        }
+        
+        baseWhere.unit = {
+          property: {
+            id: { in: propertiesWithPermission }
+          }
+        };
       }
     }
 
     // Role-based access control
-    if (userRole === 'ADMIN' || userRole === 'MANAGER') {
+    if (userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'USER') {
       tenants = await prisma.tenant.findMany({
         where: baseWhere,
         include: {
@@ -275,10 +536,9 @@ export const getOverdueTenants = async (req, res) => {
         totalOverdueAmount,
         averageOverdueAmount: totalOverdueTenants > 0 ? totalOverdueAmount / totalOverdueTenants : 0
       },
-      // Add metadata about the filter applied
       filter: {
         propertyId: propertyId || null,
-        scope: propertyId ? 'specific_property' : (userRole === 'MANAGER' ? 'managed_properties' : 'all_properties')
+        scope: propertyId ? 'specific_property' : (userRole === 'MANAGER' ? 'managed_properties' : (userRole === 'USER' ? 'accessible_properties' : 'all_properties'))
       }
     });
   } catch (error) {
@@ -289,11 +549,44 @@ export const getOverdueTenants = async (req, res) => {
 
 // @desc    Create tenant
 // @route   POST /api/tenants
-// @access  Private
+// @access  Private (ADMIN, MANAGER, and USER with CREATE_TENANT permission)
 export const createTenant = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
+    const { unitId } = req.body;
+
+    // Check if unit exists first
+    const unit = await prisma.unit.findUnique({
+      where: { id: unitId },
+      include: { property: true }
+    });
+    
+    if (!unit) {
+      return res.status(404).json({ message: 'Unit not found' });
+    }
+
+    // Check if user has CREATE_TENANT permission
+    if (userRole === 'USER') {
+      const hasCreatePermission = await checkTenantPermission(
+        userId, 
+        userRole, 
+        unit.propertyId, 
+        'create'
+      );
+      
+      if (!hasCreatePermission) {
+        return res.status(403).json({ 
+          message: 'Access denied. You do not have permission to create tenants on this property.',
+          requiredPermission: 'CREATE_TENANT'
+        });
+      }
+    } else if (userRole === 'MANAGER') {
+      // Verify manager owns this property
+      if (unit.property.managerId !== userId) {
+        return res.status(403).json({ message: 'Access denied to this unit' });
+      }
+    }
 
     const {
       fullName,
@@ -301,7 +594,6 @@ export const createTenant = async (req, res) => {
       contact,
       KRAPin,
       POBox,
-      unitId,
       leaseTerm,
       rent,
       escalationRate,
@@ -330,8 +622,7 @@ export const createTenant = async (req, res) => {
       !paymentPolicy
     ) {
       return res.status(400).json({
-        message:
-          "All fields except POBox, escalationRate, escalationFrequency, vatRate, vatType, and serviceCharge are required.",
+        message: "All fields except POBox, escalationRate, escalationFrequency, vatRate, vatType, and serviceCharge are required.",
       });
     }
 
@@ -355,21 +646,6 @@ export const createTenant = async (req, res) => {
       return res.status(400).json({ message: "KRA Pin already exists" });
     }
 
-    // Check if unit exists
-    const unit = await prisma.unit.findUnique({
-      where: { id: unitId },
-      include: { property: true },
-    });
-
-    if (!unit) {
-      return res.status(404).json({ message: "Unit not found" });
-    }
-
-    // Manager access control
-    if (userRole === "MANAGER" && unit.property.managerId !== userId) {
-      return res.status(403).json({ message: "Access denied to this unit" });
-    }
-
     if (unit.status === "OCCUPIED") {
       return res.status(400).json({ message: "Unit is already occupied" });
     }
@@ -379,9 +655,7 @@ export const createTenant = async (req, res) => {
     const normalizedPaymentPolicy = paymentPolicy.toUpperCase();
     if (!validPaymentPolicies.includes(normalizedPaymentPolicy)) {
       return res.status(400).json({
-        message: `Invalid payment policy. Must be one of: ${validPaymentPolicies.join(
-          ", "
-        )}`,
+        message: `Invalid payment policy. Must be one of: ${validPaymentPolicies.join(", ")}`,
       });
     }
 
@@ -392,9 +666,7 @@ export const createTenant = async (req, res) => {
       normalizedEscalationFrequency = escalationFrequency.toUpperCase();
       if (!validEscalations.includes(normalizedEscalationFrequency)) {
         return res.status(400).json({
-          message: `Invalid escalation frequency. Must be one of: ${validEscalations.join(
-            ", "
-          )}, or null`,
+          message: `Invalid escalation frequency. Must be one of: ${validEscalations.join(", ")}, or null`,
         });
       }
     }
@@ -406,9 +678,7 @@ export const createTenant = async (req, res) => {
       normalizedVatType = vatType.toUpperCase();
       if (!validVatTypes.includes(normalizedVatType)) {
         return res.status(400).json({
-          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(
-            ", "
-          )}`,
+          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(", ")}`,
         });
       }
     }
@@ -441,8 +711,7 @@ export const createTenant = async (req, res) => {
       unitId,
       leaseTerm,
       rent: parsedRent,
-      escalationRate:
-        escalationRate != null ? parseFloat(escalationRate) : null,
+      escalationRate: escalationRate != null ? parseFloat(escalationRate) : null,
       escalationFrequency: normalizedEscalationFrequency,
       termStart: new Date(termStart),
       rentStart: new Date(rentStart),
@@ -479,9 +748,7 @@ export const createTenant = async (req, res) => {
 
       if (!normalizedType || !validTypes.includes(normalizedType)) {
         return res.status(400).json({
-          message: `Invalid service charge type. Must be: ${validTypes.join(
-            ", "
-          )}`,
+          message: `Invalid service charge type. Must be: ${validTypes.join(", ")}`,
         });
       }
 
@@ -507,29 +774,25 @@ export const createTenant = async (req, res) => {
     );
   } catch (error) {
     console.error("Create tenant error:", error);
-    res
-      .status(500)
-      .json({ message: "Server error", error: error.message });
+    res.status(500).json({ message: "Server error", error: error.message });
   }
 };
 
-
 // @desc    Update tenant
 // @route   PUT /api/tenants/:id
-// @access  Private
+// @access  Private (ADMIN, MANAGER, and USER with EDIT_TENANT permission)
 export const updateTenant = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    if (userRole === "MANAGER") {
-      const { hasAccess } = await checkManagerTenantAccess(
-        userId,
-        req.params.id
-      );
-      if (!hasAccess) {
-        return res.status(403).json({ message: "Access denied to this tenant" });
-      }
+    // Check if user has edit permission
+    const hasWriteAccess = await checkUserWriteAccess(userId, userRole, req.params.id, 'edit');
+    if (!hasWriteAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to update this tenant.',
+        requiredPermission: 'EDIT_TENANT'
+      });
     }
 
     const {
@@ -587,9 +850,7 @@ export const updateTenant = async (req, res) => {
       normalizedPaymentPolicy = paymentPolicy.toUpperCase();
       if (!validPolicies.includes(normalizedPaymentPolicy)) {
         return res.status(400).json({
-          message: `Invalid payment policy. Must be one of: ${validPolicies.join(
-            ", "
-          )}`,
+          message: `Invalid payment policy. Must be one of: ${validPolicies.join(", ")}`,
         });
       }
     }
@@ -604,9 +865,7 @@ export const updateTenant = async (req, res) => {
         normalizedEscalationFrequency = escalationFrequency.toUpperCase();
         if (!validEscalations.includes(normalizedEscalationFrequency)) {
           return res.status(400).json({
-            message: `Invalid escalation frequency. Must be: ${validEscalations.join(
-              ", "
-            )}, or null`,
+            message: `Invalid escalation frequency. Must be: ${validEscalations.join(", ")}, or null`,
           });
         }
       }
@@ -663,12 +922,11 @@ export const updateTenant = async (req, res) => {
       POBox,
       leaseTerm,
       rent: parsedRent,
-      escalationRate:
-        escalationRate != null
-          ? escalationRate === null
-            ? null
-            : parseFloat(escalationRate)
-          : undefined,
+      escalationRate: escalationRate != null
+        ? escalationRate === null
+          ? null
+          : parseFloat(escalationRate)
+        : undefined,
       escalationFrequency: normalizedEscalationFrequency,
       termStart: termStart ? new Date(termStart) : undefined,
       rentStart: rentStart ? new Date(rentStart) : undefined,
@@ -711,33 +969,28 @@ export const updateTenant = async (req, res) => {
         normalizedType = type.toUpperCase();
         if (!validTypes.includes(normalizedType)) {
           return res.status(400).json({
-            message: `Invalid service charge type. Must be: ${validTypes.join(
-              ", "
-            )}`,
+            message: `Invalid service charge type. Must be: ${validTypes.join(", ")}`,
           });
         }
       }
 
       const serviceChargeData = {
         type: normalizedType,
-        fixedAmount:
-          fixedAmount != null
-            ? fixedAmount === null
-              ? null
-              : parseFloat(fixedAmount)
-            : undefined,
-        percentage:
-          percentage != null
-            ? percentage === null
-              ? null
-              : parseFloat(percentage)
-            : undefined,
-        perSqFtRate:
-          perSqFtRate != null
-            ? perSqFtRate === null
-              ? null
-              : parseFloat(perSqFtRate)
-            : undefined,
+        fixedAmount: fixedAmount != null
+          ? fixedAmount === null
+            ? null
+            : parseFloat(fixedAmount)
+          : undefined,
+        percentage: percentage != null
+          ? percentage === null
+            ? null
+            : parseFloat(percentage)
+          : undefined,
+        perSqFtRate: perSqFtRate != null
+          ? perSqFtRate === null
+            ? null
+            : parseFloat(perSqFtRate)
+          : undefined,
       };
 
       Object.keys(serviceChargeData).forEach((k) => {
@@ -775,27 +1028,25 @@ export const updateTenant = async (req, res) => {
     res.json(finalTenant);
   } catch (error) {
     console.error("Update tenant error:", error);
-    res
-      .status(500)
-      .json({ message: "Server error", error: error.message });
+    res.status(500).json({ message: "Server error", error: error.message });
   }
 };
 
-
 // @desc    Delete tenant
 // @route   DELETE /api/tenants/:id
-// @access  Private
+// @access  Private (ADMIN, MANAGER, and USER with DELETE_TENANT permission)
 export const deleteTenant = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Check access for managers
-    if (userRole === 'MANAGER') {
-      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
-      if (!hasAccess) {
-        return res.status(403).json({ message: 'Access denied to this tenant' });
-      }
+    // Check if user has delete permission
+    const hasWriteAccess = await checkUserWriteAccess(userId, userRole, req.params.id, 'delete');
+    if (!hasWriteAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to delete this tenant.',
+        requiredPermission: 'DELETE_TENANT'
+      });
     }
 
     const tenant = await prisma.tenant.findUnique({
@@ -835,24 +1086,26 @@ export const deleteTenant = async (req, res) => {
 
     res.json({ message: 'Tenant deleted successfully' });
   } catch (error) {
+    console.error('Delete tenant error:', error);
     res.status(400).json({ message: error.message });
   }
 };
 
 // @desc    Update tenant service charge
 // @route   PATCH /api/tenants/:id/service-charge
-// @access  Private
+// @access  Private (ADMIN, MANAGER, and USER with EDIT_TENANT permission)
 export const updateServiceCharge = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Check access for managers
-    if (userRole === 'MANAGER') {
-      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
-      if (!hasAccess) {
-        return res.status(403).json({ message: 'Access denied to this tenant' });
-      }
+    // Check if user has edit permission
+    const hasWriteAccess = await checkUserWriteAccess(userId, userRole, req.params.id, 'edit');
+    if (!hasWriteAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to update service charges for this tenant.',
+        requiredPermission: 'EDIT_TENANT'
+      });
     }
 
     const { type, fixedAmount, percentage, perSqFtRate } = req.body;
@@ -910,18 +1163,19 @@ export const updateServiceCharge = async (req, res) => {
 
 // @desc    Remove tenant service charge
 // @route   DELETE /api/tenants/:id/service-charge
-// @access  Private
+// @access  Private (ADMIN, MANAGER, and USER with EDIT_TENANT permission)
 export const removeServiceCharge = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Check access for managers
-    if (userRole === 'MANAGER') {
-      const { hasAccess } = await checkManagerTenantAccess(userId, req.params.id);
-      if (!hasAccess) {
-        return res.status(403).json({ message: 'Access denied to this tenant' });
-      }
+    // Check if user has edit permission
+    const hasWriteAccess = await checkUserWriteAccess(userId, userRole, req.params.id, 'edit');
+    if (!hasWriteAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to remove service charges for this tenant.',
+        requiredPermission: 'EDIT_TENANT'
+      });
     }
 
     const existingTenant = await prisma.tenant.findUnique({
@@ -943,6 +1197,73 @@ export const removeServiceCharge = async (req, res) => {
 
     res.json({ message: 'Service charge removed successfully' });
   } catch (error) {
+    console.error('Remove service charge error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Get tenant financials (requires VIEW_TENANT_FINANCIALS permission)
+// @route   GET /api/tenants/:id/financials
+// @access  Private
+export const getTenantFinancials = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check if user has view financials permission
+    const { hasAccess, tenant } = await checkUserTenantAccess(userId, userRole, req.params.id, 'viewFinancials');
+    
+    if (!hasAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to view financials for this tenant.',
+        requiredPermission: 'VIEW_TENANT_FINANCIALS'
+      });
+    }
+
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
+    }
+
+    // Fetch financial data
+    const financials = await prisma.tenant.findUnique({
+      where: { id: req.params.id },
+      include: {
+        paymentReports: {
+          orderBy: { datePaid: 'desc' }
+        },
+        incomes: {
+          orderBy: { createdAt: 'desc' }
+        },
+        invoices: {
+          orderBy: { createdAt: 'desc' }
+        }
+      }
+    });
+
+    // Calculate summary
+    const totalPaid = financials.paymentReports.reduce((sum, p) => sum + p.amountPaid, 0);
+    const totalInvoiced = financials.invoices.reduce((sum, inv) => sum + inv.amount, 0);
+    const outstandingBalance = totalInvoiced - totalPaid;
+
+    res.json({
+      tenant: {
+        id: financials.id,
+        fullName: financials.fullName,
+        email: financials.email
+      },
+      summary: {
+        totalPaid,
+        totalInvoiced,
+        outstandingBalance,
+        paymentCount: financials.paymentReports.length,
+        invoiceCount: financials.invoices.length
+      },
+      paymentHistory: financials.paymentReports,
+      invoiceHistory: financials.invoices,
+      incomeHistory: financials.incomes
+    });
+  } catch (error) {
+    console.error('Get tenant financials error:', error);
     res.status(400).json({ message: error.message });
   }
 };

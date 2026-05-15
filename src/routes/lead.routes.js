@@ -12,16 +12,47 @@ import { authorize } from '../middleware/roleMiddleware.js';
 
 const router = express.Router();
 
+// All routes require authentication
 router.use(protect);
 
-router.route('/')
-  .get(getLeads)
-  .post(authorize('ADMIN', 'MANAGER'), createLead);
-router.post('/with-offer', authorize('ADMIN', 'MANAGER'), createLeadWithOffer);
+// ======================================================
+// LEAD ROUTES WITH PERMISSION CHECKS
+// ======================================================
 
+// GET /api/leads - View all leads
+// POST /api/leads - Create new lead
+router.route('/')
+  .get(
+    authorize('ADMIN', 'MANAGER', 'USER'),
+    getLeads
+  )
+  .post(
+    authorize('ADMIN', 'MANAGER', 'USER'),
+    createLead
+  );
+
+// POST /api/leads/with-offer - Create lead with offer letter
+router.post(
+  '/with-offer',
+  authorize('ADMIN', 'MANAGER', 'USER'),
+  createLeadWithOffer
+);
+
+// GET /api/leads/:id - Get single lead
+// PUT /api/leads/:id - Update lead
+// DELETE /api/leads/:id - Delete lead
 router.route('/:id')
-  .get(getLead)
-  .put(authorize('ADMIN', 'MANAGER'), updateLead)
-  .delete(authorize('ADMIN', 'MANAGER'), deleteLead);
+  .get(
+    authorize('ADMIN', 'MANAGER', 'USER'),
+    getLead
+  )
+  .put(
+    authorize('ADMIN', 'MANAGER', 'USER'),
+    updateLead
+  )
+  .delete(
+    authorize('ADMIN', 'MANAGER', 'USER'),
+    deleteLead
+  );
 
 export default router;

@@ -1,29 +1,30 @@
 import prisma from "../lib/prisma.js";
+import permissionService from "../services/permissionService.js";
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 
-//const prisma = new PrismaClient();
+// Helper function to get accessible property IDs
+async function getAccessiblePropertyIds(userId, userRole) {
+  return await permissionService.getAccessiblePropertyIds(userId, userRole);
+}
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = 'uploads/properties/';
-    // Create directory if it doesn't exist
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    // Generate unique filename: property-{timestamp}-{randomString}.{extension}
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     const extension = path.extname(file.originalname);
     cb(null, `property-${uniqueSuffix}${extension}`);
   }
 });
 
-// File filter for images only
 const fileFilter = (req, file, cb) => {
   if (file.mimetype.startsWith('image/')) {
     cb(null, true);
@@ -36,7 +37,7 @@ export const upload = multer({
   storage: storage,
   fileFilter: fileFilter,
   limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
+    fileSize: 5 * 1024 * 1024
   }
 });
 
@@ -51,28 +52,7 @@ export const getProperties = async (req, res) => {
     let properties;
 
     if (userRole === 'ADMIN') {
-      // Admin sees all properties
       properties = await prisma.property.findMany({
-        include: {
-          landlord: true,
-          manager: { select: { id: true, name: true, email: true } },
-          units: true,
-          serviceProviders: true,
-          _count: {
-            select: {
-              units: true,
-              leads: true
-            }
-          }
-        },
-        orderBy: { createdAt: 'desc' }
-      });
-    } else if (userRole === 'MANAGER') {
-      // Manager sees only properties they manage
-      properties = await prisma.property.findMany({
-        where: {
-          managerId: userId
-        },
         include: {
           landlord: true,
           manager: { select: { id: true, name: true, email: true } },
@@ -88,7 +68,26 @@ export const getProperties = async (req, res) => {
         orderBy: { createdAt: 'desc' }
       });
     } else {
-      return res.status(403).json({ message: 'Access denied' });
+      const accessiblePropertyIds = await getAccessiblePropertyIds(userId, userRole);
+      
+      properties = await prisma.property.findMany({
+        where: {
+          id: { in: accessiblePropertyIds }
+        },
+        include: {
+          landlord: true,
+          manager: { select: { id: true, name: true, email: true } },
+          units: true,
+          serviceProviders: true,
+          _count: {
+            select: {
+              units: true,
+              leads: true
+            }
+          }
+        },
+        orderBy: { createdAt: 'desc' }
+      });
     }
 
     res.json(properties);
@@ -103,10 +102,10 @@ export const getProperties = async (req, res) => {
 export const getProperty = async (req, res) => {
   try {
     const userId = req.user.id;
-    const userRole = req.user.role;
+    const propertyId = req.params.id;
 
     const property = await prisma.property.findUnique({
-      where: { id: req.params.id },
+      where: { id: propertyId },
       include: {
         landlord: true,
         manager: { select: { id: true, name: true, email: true } },
@@ -130,8 +129,10 @@ export const getProperty = async (req, res) => {
       return res.status(404).json({ message: 'Property not found' });
     }
 
-    // Check access for managers
-    if (userRole === 'MANAGER' && property.managerId !== userId) {
+    // Use permission service for access check
+    const hasAccess = await permissionService.checkPropertyAccess(userId, propertyId, 'canView');
+    
+    if (!hasAccess) {
       return res.status(403).json({ message: 'Access denied to this property' });
     }
 
@@ -141,7 +142,7 @@ export const getProperty = async (req, res) => {
   }
 };
 
-// @desc    Create property (with optional inline landlord creation)
+// @desc    Create property
 // @route   POST /api/properties
 // @access  Private
 export const createProperty = async (req, res) => {
@@ -165,18 +166,28 @@ export const createProperty = async (req, res) => {
     
     const currentUser = req.user;
 
-    // Convert enum values to uppercase
+    // Check CREATE_PROPERTY permission
+    const canCreate = await permissionService.checkPermission(
+      currentUser.id, 
+      'property', 
+      'create'
+    );
+    
+    if (!canCreate) {
+      return res.status(403).json({ 
+        message: 'You do not have permission to create properties' 
+      });
+    }
+
     const formattedForm = form ? form.toUpperCase() : null;
     const formattedUsage = usage ? usage.toUpperCase() : null;
 
-    // Validate required fields
     if (!name || !address || !formattedForm || !formattedUsage) {
       return res.status(400).json({
         message: 'Name, address, form, and usage are required fields.'
       });
     }
 
-    // Validate form and usage enums
     const validForms = ['APARTMENT', 'BUNGALOW', 'VILLA', 'OFFICE', 'SHOP', 'DUPLEX', 'TOWNHOUSE', 'MAISONETTE', 'WAREHOUSE', 'INDUSTRIAL_BUILDING', 'RETAIL_CENTER'];
     const validUsages = ['RESIDENTIAL', 'COMMERCIAL', 'INDUSTRIAL', 'INSTITUTIONAL', 'MIXED_USE'];
 
@@ -192,21 +203,18 @@ export const createProperty = async (req, res) => {
       });
     }
 
-    // Validate commission fee if provided
     if (commissionFee && (commissionFee < 0 || commissionFee > 100)) {
       return res.status(400).json({
         message: 'Commission fee must be between 0 and 100 percent.'
       });
     }
 
-    // Enforce: MANAGER must associate property with a landlord (existing or new)
     if (currentUser.role === 'MANAGER' && !landlordId && !landlord) {
       return res.status(400).json({
         message: 'A landlord (ID or details) is required when creating a property.'
       });
     }
 
-    // Prepare data object for Prisma
     const propertyData = {
       name,
       address,
@@ -214,7 +222,6 @@ export const createProperty = async (req, res) => {
       form: formattedForm,
       usage: formattedUsage,
       commissionFee: commissionFee ? parseFloat(commissionFee) : null,
-      // Bank details
       accountNo: accountNo || null,
       accountName: accountName || null,
       bank: bank || null,
@@ -222,18 +229,14 @@ export const createProperty = async (req, res) => {
       branchCode: branchCode || null
     };
 
-    // Handle image file
     if (req.file) {
       propertyData.image = req.file.path;
     }
 
-    // Handle landlord relation
     if (landlord) {
-      // Case 1: Create new landlord inline
       const landlordData = typeof landlord === 'string' ? JSON.parse(landlord) : landlord;
       const { name: landlordName, email, phone, address: landlordAddress, idNumber } = landlordData;
 
-      // Validate required landlord fields
       if (!landlordName) {
         return res.status(400).json({ message: 'Landlord name is required.' });
       }
@@ -248,8 +251,6 @@ export const createProperty = async (req, res) => {
         }
       };
     } else if (landlordId) {
-      // Case 2: Connect to existing landlord
-      // Verify landlord exists
       const existingLandlord = await prisma.landlord.findUnique({
         where: { id: landlordId }
       });
@@ -260,27 +261,22 @@ export const createProperty = async (req, res) => {
       propertyData.landlord = {
         connect: { id: landlordId }
       };
-    }
-    // Case 3: No landlord - only allowed for ADMIN
-    else if (currentUser.role !== 'ADMIN') {
+    } else if (currentUser.role !== 'ADMIN') {
       return res.status(400).json({
         message: 'Only ADMIN can create a property without a landlord.'
       });
     }
 
-    // Handle manager assignment
     if (currentUser.role === 'MANAGER') {
       propertyData.manager = {
         connect: { id: currentUser.id }
       };
     } else if (currentUser.role === 'ADMIN' && managerId) {
-      // Admin can assign to a specific manager
       propertyData.manager = {
         connect: { id: managerId }
       };
     }
 
-    // Create the property
     const property = await prisma.property.create({
       data: propertyData,
       include: {
@@ -291,6 +287,9 @@ export const createProperty = async (req, res) => {
       }
     });
 
+    // Invalidate cache for the new property
+    await permissionService.invalidatePropertyAccessCache(property.id);
+
     res.status(201).json({
       success: true,
       message: 'Property created successfully',
@@ -299,7 +298,6 @@ export const createProperty = async (req, res) => {
   } catch (error) {
     console.error('Create property error:', error);
     
-    // Clean up uploaded file if creation fails
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -316,6 +314,9 @@ export const createProperty = async (req, res) => {
 // @access  Private
 export const updateProperty = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const propertyId = req.params.id;
+    
     const { 
       name, 
       address, 
@@ -332,31 +333,40 @@ export const updateProperty = async (req, res) => {
       branchCode
     } = req.body;
 
-    // Check if property exists
+    // Check EDIT_PROPERTY permission
+    const canEdit = await permissionService.checkPermission(
+      userId, 
+      'property', 
+      'edit', 
+      propertyId
+    );
+    
+    if (!canEdit) {
+      return res.status(403).json({ 
+        message: 'You do not have permission to edit this property' 
+      });
+    }
+
     const existingProperty = await prisma.property.findUnique({
-      where: { id: req.params.id },
+      where: { id: propertyId },
       include: {
         units: true
       }
     });
 
     if (!existingProperty) {
-      // Clean up uploaded file if property doesn't exist
       if (req.file && fs.existsSync(req.file.path)) {
         fs.unlinkSync(req.file.path);
       }
       return res.status(404).json({ message: 'Property not found' });
     }
 
-    // Convert enum values to uppercase if provided
     const formattedForm = form ? form.toUpperCase() : existingProperty.form;
     const formattedUsage = usage ? usage.toUpperCase() : existingProperty.usage;
 
-    // Validate form and usage enums if they're being updated
     if (form) {
       const validForms = ['APARTMENT', 'BUNGALOW', 'VILLA', 'OFFICE', 'SHOP', 'DUPLEX', 'TOWNHOUSE', 'MAISONETTE', 'WAREHOUSE', 'INDUSTRIAL_BUILDING', 'RETAIL_CENTER'];
       if (!validForms.includes(formattedForm)) {
-        // Clean up uploaded file if validation fails
         if (req.file && fs.existsSync(req.file.path)) {
           fs.unlinkSync(req.file.path);
         }
@@ -369,7 +379,6 @@ export const updateProperty = async (req, res) => {
     if (usage) {
       const validUsages = ['RESIDENTIAL', 'COMMERCIAL', 'INDUSTRIAL', 'INSTITUTIONAL', 'MIXED_USE'];
       if (!validUsages.includes(formattedUsage)) {
-        // Clean up uploaded file if validation fails
         if (req.file && fs.existsSync(req.file.path)) {
           fs.unlinkSync(req.file.path);
         }
@@ -379,43 +388,34 @@ export const updateProperty = async (req, res) => {
       }
     }
 
-    // Check if usage type is changing
     if (usage && formattedUsage !== existingProperty.usage) {
-      // Validate existing units against new usage type
       const hasUnits = existingProperty.units.length > 0;
       
       if (hasUnits) {
-        // Check if there are issues with existing units based on the new usage type
         const residentialUnits = existingProperty.units.filter(u => u.unitType === 'RESIDENTIAL');
         const commercialUnits = existingProperty.units.filter(u => u.unitType === 'COMMERCIAL');
         
-        // If changing to pure RESIDENTIAL and there are COMMERCIAL units
         if (formattedUsage === 'RESIDENTIAL' && commercialUnits.length > 0) {
-          // Clean up uploaded file if validation fails
           if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
           }
           return res.status(400).json({
-            message: 'Cannot change to RESIDENTIAL usage type. Property has COMMERCIAL units. Please update or remove them first.'
+            message: 'Cannot change to RESIDENTIAL usage type. Property has COMMERCIAL units.'
           });
         }
         
-        // If changing to COMMERCIAL/INDUSTRIAL/INSTITUTIONAL and there are RESIDENTIAL units
         if (['COMMERCIAL', 'INDUSTRIAL', 'INSTITUTIONAL'].includes(formattedUsage) && residentialUnits.length > 0) {
-          // Clean up uploaded file if validation fails
           if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
           }
           return res.status(400).json({
-            message: `Cannot change to ${formattedUsage} usage type. Property has RESIDENTIAL units. Please update or remove them first.`
+            message: `Cannot change to ${formattedUsage} usage type. Property has RESIDENTIAL units.`
           });
         }
       }
     }
 
-    // Validate commission fee if provided
     if (commissionFee && (commissionFee < 0 || commissionFee > 100)) {
-      // Clean up uploaded file if validation fails
       if (req.file && fs.existsSync(req.file.path)) {
         fs.unlinkSync(req.file.path);
       }
@@ -424,17 +424,14 @@ export const updateProperty = async (req, res) => {
       });
     }
 
-    // Handle image file - if new image uploaded
     let imagePath = existingProperty.image;
     if (req.file) {
-      // Delete old image if it exists
       if (existingProperty.image && fs.existsSync(existingProperty.image)) {
         fs.unlinkSync(existingProperty.image);
       }
       imagePath = req.file.path;
     }
 
-    // Prepare update data object
     const updateData = {
       name: name !== undefined ? name : undefined,
       address: address !== undefined ? address : undefined,
@@ -443,7 +440,6 @@ export const updateProperty = async (req, res) => {
       usage: formattedUsage,
       commissionFee: commissionFee !== undefined ? parseFloat(commissionFee) : undefined,
       image: imagePath,
-      // Bank details
       accountNo: accountNo !== undefined ? accountNo : undefined,
       accountName: accountName !== undefined ? accountName : undefined,
       bank: bank !== undefined ? bank : undefined,
@@ -451,61 +447,42 @@ export const updateProperty = async (req, res) => {
       branchCode: branchCode !== undefined ? branchCode : undefined
     };
 
-    // Handle landlord relation if provided
     if (landlordId !== undefined) {
       if (landlordId === null || landlordId === '') {
-        // Remove landlord association
-        updateData.landlord = {
-          disconnect: true
-        };
+        updateData.landlord = { disconnect: true };
       } else {
-        // Verify landlord exists before connecting
         const existingLandlord = await prisma.landlord.findUnique({
           where: { id: landlordId }
         });
         if (!existingLandlord) {
-          // Clean up uploaded file if validation fails
           if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
           }
           return res.status(400).json({ message: 'Landlord not found.' });
         }
         
-        // Connect to existing landlord
-        updateData.landlord = {
-          connect: { id: landlordId }
-        };
+        updateData.landlord = { connect: { id: landlordId } };
       }
     }
 
-    // Handle manager relation if provided
     if (managerId !== undefined) {
       if (managerId === null || managerId === '') {
-        // Remove manager association
-        updateData.manager = {
-          disconnect: true
-        };
+        updateData.manager = { disconnect: true };
       } else {
-        // Verify manager exists before connecting
         const existingManager = await prisma.user.findUnique({
           where: { id: managerId }
         });
         if (!existingManager) {
-          // Clean up uploaded file if validation fails
           if (req.file && fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
           }
           return res.status(400).json({ message: 'Manager not found.' });
         }
         
-        // Connect to existing manager
-        updateData.manager = {
-          connect: { id: managerId }
-        };
+        updateData.manager = { connect: { id: managerId } };
       }
     }
 
-    // Remove undefined values from updateData
     Object.keys(updateData).forEach(key => {
       if (updateData[key] === undefined) {
         delete updateData[key];
@@ -513,7 +490,7 @@ export const updateProperty = async (req, res) => {
     });
 
     const property = await prisma.property.update({
-      where: { id: req.params.id },
+      where: { id: propertyId },
       data: updateData,
       include: {
         landlord: true,
@@ -531,6 +508,10 @@ export const updateProperty = async (req, res) => {
       }
     });
 
+    // Invalidate cache for this property
+    await permissionService.invalidatePropertyAccessCache(propertyId);
+    await permissionService.invalidateUserCache(userId);
+
     res.json({
       success: true,
       message: 'Property updated successfully',
@@ -538,7 +519,6 @@ export const updateProperty = async (req, res) => {
     });
   } catch (error) {
     console.error('Update property error:', error);
-    // Clean up uploaded file if update fails
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -551,26 +531,45 @@ export const updateProperty = async (req, res) => {
 
 // @desc    Delete property
 // @route   DELETE /api/properties/:id
-// @access  Private (Admin only)
+// @access  Private (Admin only with DELETE_PROPERTY permission)
 export const deleteProperty = async (req, res) => {
   try {
-    // Check if property exists
+    const userId = req.user.id;
+    const propertyId = req.params.id;
+
+    // Check DELETE_PROPERTY permission
+    const canDelete = await permissionService.checkPermission(
+      userId, 
+      'property', 
+      'delete', 
+      propertyId
+    );
+    
+    if (!canDelete) {
+      return res.status(403).json({ 
+        message: 'You do not have permission to delete this property' 
+      });
+    }
+
     const existingProperty = await prisma.property.findUnique({
-      where: { id: req.params.id }
+      where: { id: propertyId }
     });
 
     if (!existingProperty) {
       return res.status(404).json({ message: 'Property not found' });
     }
 
-    // Delete associated image file if it exists
     if (existingProperty.image && fs.existsSync(existingProperty.image)) {
       fs.unlinkSync(existingProperty.image);
     }
 
     await prisma.property.delete({
-      where: { id: req.params.id }
+      where: { id: propertyId }
     });
+
+    // Invalidate cache
+    await permissionService.invalidatePropertyAccessCache(propertyId);
+    await permissionService.invalidateUserCache(userId);
 
     res.json({ message: 'Property deleted successfully' });
   } catch (error) {
@@ -621,30 +620,47 @@ export const getManagerProperties = async (req, res) => {
 // @access  Private
 export const updatePropertyImage = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const propertyId = req.params.id;
+
     if (!req.file) {
       return res.status(400).json({ message: 'Image file is required.' });
     }
 
-    // Check if property exists
+    // Check EDIT_PROPERTY permission
+    const canEdit = await permissionService.checkPermission(
+      userId, 
+      'property', 
+      'edit', 
+      propertyId
+    );
+    
+    if (!canEdit) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(403).json({ 
+        message: 'You do not have permission to update this property\'s image' 
+      });
+    }
+
     const existingProperty = await prisma.property.findUnique({
-      where: { id: req.params.id }
+      where: { id: propertyId }
     });
 
     if (!existingProperty) {
-      // Clean up uploaded file
       if (req.file && fs.existsSync(req.file.path)) {
         fs.unlinkSync(req.file.path);
       }
       return res.status(404).json({ message: 'Property not found' });
     }
 
-    // Delete old image if it exists
     if (existingProperty.image && fs.existsSync(existingProperty.image)) {
       fs.unlinkSync(existingProperty.image);
     }
 
     const property = await prisma.property.update({
-      where: { id: req.params.id },
+      where: { id: propertyId },
       data: { image: req.file.path },
       include: {
         landlord: true,
@@ -654,7 +670,6 @@ export const updatePropertyImage = async (req, res) => {
 
     res.json(property);
   } catch (error) {
-    // Clean up uploaded file if update fails
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -664,10 +679,25 @@ export const updatePropertyImage = async (req, res) => {
 
 // @desc    Update property commission fee only
 // @route   PATCH /api/properties/:id/commission
-// @access  Private (Admin only)
+// @access  Private (Admin only with APPROVE_COMMISSIONS permission)
 export const updatePropertyCommission = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const propertyId = req.params.id;
     const { commissionFee } = req.body;
+
+    // Check PROCESS_COMMISSIONS or APPROVE_COMMISSIONS permission
+    const canUpdateCommission = await permissionService.hasAnyPermission(
+      userId,
+      ['PROCESS_COMMISSIONS', 'APPROVE_COMMISSIONS'],
+      propertyId
+    );
+    
+    if (!canUpdateCommission) {
+      return res.status(403).json({ 
+        message: 'You do not have permission to update commission fees' 
+      });
+    }
 
     if (commissionFee === undefined || commissionFee === null) {
       return res.status(400).json({ message: 'Commission fee is required.' });
@@ -679,9 +709,8 @@ export const updatePropertyCommission = async (req, res) => {
       });
     }
 
-    // Check if property exists
     const existingProperty = await prisma.property.findUnique({
-      where: { id: req.params.id }
+      where: { id: propertyId }
     });
 
     if (!existingProperty) {
@@ -689,13 +718,16 @@ export const updatePropertyCommission = async (req, res) => {
     }
 
     const property = await prisma.property.update({
-      where: { id: req.params.id },
+      where: { id: propertyId },
       data: { commissionFee: parseFloat(commissionFee) },
       include: {
         landlord: true,
         manager: { select: { id: true, name: true, email: true } }
       }
     });
+
+    // Invalidate cache
+    await permissionService.invalidatePropertyAccessCache(propertyId);
 
     res.json(property);
   } catch (error) {
@@ -705,7 +737,7 @@ export const updatePropertyCommission = async (req, res) => {
 
 // @desc    Serve property image
 // @route   GET /api/properties/:id/image
-// @access  Public (or Private based on your needs)
+// @access  Public
 export const getPropertyImage = async (req, res) => {
   try {
     const property = await prisma.property.findUnique({

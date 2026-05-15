@@ -2,8 +2,63 @@ import prisma from "../lib/prisma.js";
 import { generatePDF } from '../utils/pdfGenerator.js';
 import { uploadToStorage, generateFileName } from '../utils/storage.js';
 import { generateActivationPDF as generateActivationPDFTemplate } from '../utils/activationTemplate.js';
+import permissionService from "../services/permissionService.js";
 
-//const prisma = new PrismaClient();
+// Helper function to check activation request permissions
+const checkActivationPermission = async (userId, userRole, propertyId, operation) => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    // Managers have access to their own properties
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    return await permissionService.checkPermission(userId, 'activationRequest', operation, propertyId);
+  }
+  
+  return false;
+};
+
+// Helper function to check if user has access to an activation request
+const checkActivationRequestAccess = async (userId, userRole, activationId, operation = 'view') => {
+  const activation = await prisma.activationRequest.findUnique({
+    where: { id: activationId },
+    include: {
+      property: true
+    }
+  });
+
+  if (!activation) {
+    return { hasAccess: false, activation: null };
+  }
+
+  if (userRole === 'ADMIN') {
+    return { hasAccess: true, activation };
+  }
+  
+  if (userRole === 'MANAGER') {
+    const hasAccess = activation.property.managerId === userId;
+    return { hasAccess, activation };
+  }
+  
+  if (userRole === 'USER') {
+    const hasAccess = await checkActivationPermission(
+      userId,
+      userRole,
+      activation.propertyId,
+      operation
+    );
+    return { hasAccess, activation };
+  }
+  
+  return { hasAccess: false, activation };
+};
 
 /**
  * Sanitize activation data - remove fields not in Prisma schema
@@ -53,7 +108,7 @@ const sanitizeActivationData = (data) => {
     'expectedVisitors',
     'licenseFeePerDay',
     'proposedBudget',
-    'vat' // Added vat to numeric fields
+    'vat'
   ];
   
   numericFields.forEach(field => {
@@ -198,17 +253,19 @@ const calculateVATDetails = (baseAmount, vatRate, vatType) => {
 /**
  * Create new activation request
  * POST /api/activations
+ * Requires CREATE_ACTIVATION_REQUEST permission
  */
 export const createActivationRequest = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const activationData = req.body;
 
-    // Validate property access
+    // Validate property access and permission
     const property = await prisma.property.findFirst({
       where: {
         id: activationData.propertyId,
-        managerId: managerId
+        ...(userRole === 'MANAGER' && { managerId: userId })
       },
       include: {
         landlord: true
@@ -220,6 +277,24 @@ export const createActivationRequest = async (req, res) => {
         success: false,
         message: 'You do not have access to this property' 
       });
+    }
+
+    // Check CREATE_ACTIVATION_REQUEST permission for USER role
+    if (userRole === 'USER') {
+      const hasCreatePermission = await checkActivationPermission(
+        userId,
+        userRole,
+        activationData.propertyId,
+        'create'
+      );
+      
+      if (!hasCreatePermission) {
+        return res.status(403).json({ 
+          success: false,
+          message: 'Access denied. You do not have permission to create activation requests.',
+          requiredPermission: 'CREATE_ACTIVATION_REQUEST'
+        });
+      }
     }
 
     // Sanitize data
@@ -242,7 +317,7 @@ export const createActivationRequest = async (req, res) => {
     }
 
     // Generate unique request number
-    //const requestNumber = await generateRequestNumber();
+    const requestNumber = await generateRequestNumber();
 
     // Calculate VAT details if applicable
     let vat = sanitizedData.vat !== undefined ? sanitizedData.vat : 16; // Default to 16%
@@ -270,7 +345,7 @@ export const createActivationRequest = async (req, res) => {
       data: {
         ...sanitizedData,
         requestNumber,
-        managerId,
+        managerId: userId,
         status: 'DRAFT',
         vat,
         vatType,
@@ -353,10 +428,12 @@ export const createActivationRequest = async (req, res) => {
 /**
  * Get all activation requests for manager
  * GET /api/activations
+ * Requires VIEW_ACTIVATION_REQUESTS permission
  */
 export const getActivationRequests = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { 
       propertyId, 
       status, 
@@ -364,18 +441,76 @@ export const getActivationRequests = async (req, res) => {
       endDate, 
       activationType,
       companyName,
-      vatType, // Added vatType filter
+      vatType,
       page = 1, 
       limit = 10 
     } = req.query;
 
-    const where = { managerId };
+    let where = {};
 
+    // Apply role-based filtering
+    if (userRole === 'MANAGER') {
+      where.managerId = userId;
+    } else if (userRole === 'USER') {
+      // Get accessible property IDs
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.json({
+          success: true,
+          count: 0,
+          totalCount: 0,
+          data: [],
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: 0
+          }
+        });
+      }
+      
+      where.propertyId = { in: accessiblePropertyIds };
+      
+      // Filter properties where user has VIEW_ACTIVATION_REQUESTS permission
+      const propertiesWithPermission = [];
+      for (const propId of accessiblePropertyIds) {
+        const hasViewPermission = await checkActivationPermission(
+          userId,
+          userRole,
+          propId,
+          'view'
+        );
+        if (hasViewPermission) {
+          propertiesWithPermission.push(propId);
+        }
+      }
+      
+      if (propertiesWithPermission.length === 0) {
+        return res.json({
+          success: true,
+          count: 0,
+          totalCount: 0,
+          data: [],
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: 0
+          }
+        });
+      }
+      
+      where.propertyId = { in: propertiesWithPermission };
+    } else if (userRole === 'ADMIN') {
+      // Admin sees all
+      where = {};
+    }
+
+    // Apply filters
     if (propertyId) where.propertyId = propertyId;
     if (status) where.status = status;
     if (activationType) where.activationType = activationType;
     if (companyName) where.companyName = { contains: companyName, mode: 'insensitive' };
-    if (vatType) where.vatType = vatType; // Added vatType filter
+    if (vatType) where.vatType = vatType;
     
     if (startDate || endDate) {
       where.startDate = {};
@@ -453,34 +588,23 @@ export const getActivationRequests = async (req, res) => {
 /**
  * Get single activation request
  * GET /api/activations/:id
+ * Requires VIEW_ACTIVATION_REQUESTS permission
  */
 export const getActivationRequest = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
-    const managerId = req.user.id;
 
-    const activation = await prisma.activationRequest.findFirst({
-      where: {
-        id,
-        managerId
-      },
-      include: {
-        property: {
-          include: {
-            landlord: true
-          }
-        },
-        manager: {
-          select: {
-            id: true,
-            name: true,
-            email: true
-          }
-        }
-      }
-    });
+    // Check access with VIEW_ACTIVATION_REQUESTS permission
+    const { hasAccess, activation } = await checkActivationRequestAccess(
+      userId,
+      userRole,
+      id,
+      'view'
+    );
 
-    if (!activation) {
+    if (!hasAccess || !activation) {
       return res.status(404).json({ 
         success: false,
         message: 'Activation request not found' 
@@ -515,19 +639,24 @@ export const getActivationRequest = async (req, res) => {
 /**
  * Update activation request
  * PUT /api/activations/:id
+ * Requires EDIT_ACTIVATION_REQUEST permission
  */
 export const updateActivationRequest = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
-    const managerId = req.user.id;
     const updateData = req.body;
 
-    // Check if activation exists and belongs to manager
-    const existing = await prisma.activationRequest.findFirst({
-      where: { id, managerId }
-    });
+    // Check access with EDIT_ACTIVATION_REQUEST permission
+    const { hasAccess, activation: existing } = await checkActivationRequestAccess(
+      userId,
+      userRole,
+      id,
+      'edit'
+    );
 
-    if (!existing) {
+    if (!hasAccess || !existing) {
       return res.status(404).json({ 
         success: false,
         message: 'Activation request not found' 
@@ -551,8 +680,8 @@ export const updateActivationRequest = async (req, res) => {
         'licenseFeePerDay',
         'numberOfDays',
         'proposedBudget',
-        'vat', // Allow vat updates
-        'vatType' // Allow vatType updates
+        'vat',
+        'vatType'
       ];
       
       // Filter out fields that shouldn't be updated
@@ -654,31 +783,23 @@ export const updateActivationRequest = async (req, res) => {
 /**
  * Generate PDF for activation request
  * POST /api/activations/:id/generate-pdf
+ * Requires VIEW_ACTIVATION_REQUESTS permission
  */
 export const generateActivationPDFController = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
-    const managerId = req.user.id;
 
-    const activation = await prisma.activationRequest.findFirst({
-      where: { id, managerId },
-      include: {
-        property: {
-          include: {
-            landlord: true
-          }
-        },
-        manager: {
-          select: {
-            id: true,
-            name: true,
-            email: true
-          }
-        }
-      }
-    });
+    // Check access with VIEW_ACTIVATION_REQUESTS permission
+    const { hasAccess, activation } = await checkActivationRequestAccess(
+      userId,
+      userRole,
+      id,
+      'view'
+    );
 
-    if (!activation) {
+    if (!hasAccess || !activation) {
       return res.status(404).json({ 
         success: false,
         message: 'Activation request not found' 
@@ -742,31 +863,23 @@ export const generateActivationPDFController = async (req, res) => {
 /**
  * Submit activation request for review
  * POST /api/activations/:id/submit
+ * Requires EDIT_ACTIVATION_REQUEST permission (to submit a draft)
  */
 export const submitActivationRequest = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
-    const managerId = req.user.id;
 
-    const activation = await prisma.activationRequest.findFirst({
-      where: { id, managerId },
-      include: {
-        property: {
-          include: {
-            landlord: true
-          }
-        },
-        manager: {
-          select: {
-            id: true,
-            name: true,
-            email: true
-          }
-        }
-      }
-    });
+    // Check access with EDIT_ACTIVATION_REQUEST permission
+    const { hasAccess, activation } = await checkActivationRequestAccess(
+      userId,
+      userRole,
+      id,
+      'edit'
+    );
 
-    if (!activation) {
+    if (!hasAccess || !activation) {
       return res.status(404).json({ 
         success: false,
         message: 'Activation request not found' 
@@ -887,17 +1000,23 @@ export const submitActivationRequest = async (req, res) => {
 /**
  * Delete activation request
  * DELETE /api/activations/:id
+ * Requires DELETE_ACTIVATION_REQUEST permission
  */
 export const deleteActivationRequest = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
-    const managerId = req.user.id;
 
-    const activation = await prisma.activationRequest.findFirst({
-      where: { id, managerId }
-    });
+    // Check access with DELETE_ACTIVATION_REQUEST permission
+    const { hasAccess, activation } = await checkActivationRequestAccess(
+      userId,
+      userRole,
+      id,
+      'delete'
+    );
 
-    if (!activation) {
+    if (!hasAccess || !activation) {
       return res.status(404).json({ 
         success: false,
         message: 'Activation request not found' 
@@ -934,31 +1053,23 @@ export const deleteActivationRequest = async (req, res) => {
 /**
  * Download activation PDF
  * GET /api/activations/:id/download
+ * Requires VIEW_ACTIVATION_REQUESTS permission
  */
 export const downloadActivationPDF = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
-    const managerId = req.user.id;
 
-    const activation = await prisma.activationRequest.findFirst({
-      where: { id, managerId },
-      include: {
-        property: {
-          include: {
-            landlord: true
-          }
-        },
-        manager: {
-          select: {
-            id: true,
-            name: true,
-            email: true
-          }
-        }
-      }
-    });
+    // Check access with VIEW_ACTIVATION_REQUESTS permission
+    const { hasAccess, activation } = await checkActivationRequestAccess(
+      userId,
+      userRole,
+      id,
+      'view'
+    );
 
-    if (!activation) {
+    if (!hasAccess || !activation) {
       return res.status(404).json({ 
         success: false,
         message: 'Activation request not found' 
@@ -1052,26 +1163,49 @@ export const downloadActivationPDF = async (req, res) => {
 /**
  * Get activation request statistics
  * GET /api/activations/stats
+ * Requires VIEW_ACTIVATION_REQUESTS permission
  */
 export const getActivationStats = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let where = {};
+
+    // Apply role-based filtering
+    if (userRole === 'MANAGER') {
+      where.managerId = userId;
+    } else if (userRole === 'USER') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.json({
+          success: true,
+          data: {
+            total: 0,
+            byStatus: {},
+            byVATType: {},
+            upcoming: 0
+          }
+        });
+      }
+      
+      where.propertyId = { in: accessiblePropertyIds };
+    }
 
     const stats = await prisma.activationRequest.groupBy({
       by: ['status'],
-      where: { managerId },
+      where,
       _count: {
         status: true
       }
     });
 
-    const totalCount = await prisma.activationRequest.count({
-      where: { managerId }
-    });
+    const totalCount = await prisma.activationRequest.count({ where });
 
     const upcomingActivations = await prisma.activationRequest.count({
       where: {
-        managerId,
+        ...where,
         status: 'APPROVED',
         startDate: {
           gte: new Date()
@@ -1082,7 +1216,7 @@ export const getActivationStats = async (req, res) => {
     // Additional stats for VAT
     const vatStats = await prisma.activationRequest.groupBy({
       by: ['vatType'],
-      where: { managerId },
+      where,
       _count: {
         vatType: true
       }
@@ -1117,17 +1251,26 @@ export const getActivationStats = async (req, res) => {
 /**
  * Get VAT summary for activations
  * GET /api/activations/vat-summary
+ * Requires VIEW_ACTIVATION_REQUESTS permission
  */
 export const getVATSummary = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { startDate, endDate, propertyId } = req.query;
 
-    const where = { 
-      managerId,
+    let where = { 
       vatType: { not: 'NOT_APPLICABLE' },
       vat: { not: null }
     };
+
+    // Apply role-based filtering
+    if (userRole === 'MANAGER') {
+      where.managerId = userId;
+    } else if (userRole === 'USER') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      where.propertyId = { in: accessiblePropertyIds };
+    }
 
     if (propertyId) where.propertyId = propertyId;
     if (startDate) where.startDate = { gte: new Date(startDate) };

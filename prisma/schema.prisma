@@ -8,14 +8,26 @@ datasource db {
 }
 
 model User {
-  id                 String              @id @default(uuid())
-  name               String
-  email              String              @unique
-  password           String
-  role               Role
-  isApproved         Boolean             @default(false)
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
+  id         String  @id @default(uuid())
+  name       String
+  email      String  @unique
+  password   String
+  role       Role
+  isApproved Boolean @default(false)
+
+  // Managed User Fields
+  isManagedUser        Boolean   @default(false)
+  createdByManagerId   String?
+  canManagerLogin      Boolean   @default(true)
+  lastLoginAt          DateTime?
+  passwordChangedAt    DateTime?
+  passwordResetToken   String?
+  passwordResetExpires DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
   commissions        ManagerCommission[]
   properties         Property[]
   todos              ToDo[]
@@ -23,7 +35,22 @@ model User {
   dailyReports       DailyReport[]
   activationRequests ActivationRequest[]
   demandLetters      DemandLetter[]
-  createdLeads       Lead[]              @relation(name: "CreatedLeads") // ADD THIS
+  createdLeads       Lead[]              @relation(name: "CreatedLeads")
+
+  // Manager-User Relations
+  createdByManager User?  @relation("ManagerCreatedUsers", fields: [createdByManagerId], references: [id])
+  managedUsers     User[] @relation("ManagerCreatedUsers")
+
+  // RBAC Relations
+  customRoleCreatedBy   CustomRole[]               @relation("CreatedByRole")
+  customRolePermissions CustomRolePermission[]     @relation("GrantedByPermission")
+  userAssignments       UserRoleAssignment[]       @relation("UserAssignments")
+  userAssignedBy        UserRoleAssignment[]       @relation("AssignedByUser")
+  rolePropertyAccess    CustomRolePropertyAccess[] @relation("CreatedByUser")
+  userPropertyAccess    PropertyAccess[]           @relation("UserPropertyAccess")
+  propertyAccessGranted PropertyAccess[]           @relation("GrantedByUser")
+  rbacAuditLogs         RBACAuditLog[]             @relation("PerformerAudit")
+  managedPermissionsBy  ManagedPermission[]        @relation("ManagerPermission")
 }
 
 model Landlord {
@@ -69,7 +96,199 @@ model Property {
   dailyReports       DailyReport[]
   activationRequests ActivationRequest[]
   demandLetters      DemandLetter[]
+
+  // RBAC Relations
+  roleAccess CustomRolePropertyAccess[]
+  userAccess PropertyAccess[]
 }
+
+// ============== RBAC Models ==============
+
+enum PermissionScope {
+  GLOBAL
+  PROPERTY
+}
+
+model Permission {
+  id          String          @id @default(uuid())
+  code        String          @unique
+  name        String
+  description String?
+  category    String
+  scope       PermissionScope @default(PROPERTY)
+  createdAt   DateTime        @default(now())
+
+  rolePermissions CustomRolePermission[]
+
+  @@index([category])
+  @@index([code])
+  @@index([scope])
+}
+
+model RoleTemplate {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  category    String
+  permissions Json
+  isSystem    Boolean  @default(false)
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  customRoles CustomRole[]
+
+  @@index([category])
+  @@index([isSystem])
+  @@index([createdBy])
+}
+
+model CustomRole {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  createdById String
+  templateId  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy           User                       @relation("CreatedByRole", fields: [createdById], references: [id])
+  template            RoleTemplate?              @relation(fields: [templateId], references: [id])
+  assignments         UserRoleAssignment[]
+  permissions         CustomRolePermission[]
+  propertyAccess      CustomRolePropertyAccess[]
+  managedBy           ManagedPermission[]
+  propertyAssignments PropertyAccess[]           @relation("RolePropertyAccess")
+
+  @@unique([name, createdById])
+  @@index([createdById])
+  @@index([name])
+  @@index([templateId])
+}
+
+model CustomRolePermission {
+  id           String   @id @default(uuid())
+  roleId       String
+  permissionId String
+  grantedAt    DateTime @default(now())
+  grantedById  String
+
+  role       CustomRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  grantedBy  User       @relation("GrantedByPermission", fields: [grantedById], references: [id])
+
+  @@unique([roleId, permissionId])
+  @@index([roleId])
+  @@index([permissionId])
+  @@index([grantedById])
+}
+
+model UserRoleAssignment {
+  id         String    @id @default(uuid())
+  userId     String
+  roleId     String
+  assignedBy String
+  assignedAt DateTime  @default(now())
+  expiresAt  DateTime?
+  isActive   Boolean   @default(true)
+
+  user           User       @relation("UserAssignments", fields: [userId], references: [id], onDelete: Cascade)
+  role           CustomRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  assignedByUser User       @relation("AssignedByUser", fields: [assignedBy], references: [id])
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+  @@index([assignedBy])
+  @@index([isActive])
+  @@index([expiresAt])
+}
+
+model CustomRolePropertyAccess {
+  id         String   @id @default(uuid())
+  roleId     String
+  propertyId String
+  createdAt  DateTime @default(now())
+  createdBy  String
+  isActive   Boolean  @default(true)
+
+  role          CustomRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  property      Property   @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  createdByUser User       @relation("CreatedByUser", fields: [createdBy], references: [id])
+
+  @@unique([roleId, propertyId])
+  @@index([roleId])
+  @@index([propertyId])
+  @@index([createdBy])
+}
+
+model PropertyAccess {
+  id         String    @id @default(uuid())
+  userId     String
+  propertyId String
+  roleId     String?
+  grantedBy  String
+  grantedAt  DateTime  @default(now())
+  expiresAt  DateTime?
+  isActive   Boolean   @default(true)
+
+  canView           Boolean @default(true)
+  canEdit           Boolean @default(false)
+  canDelete         Boolean @default(false)
+  canExport         Boolean @default(false)
+  customPermissions Json?
+
+  user          User        @relation("UserPropertyAccess", fields: [userId], references: [id], onDelete: Cascade)
+  property      Property    @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  role          CustomRole? @relation("RolePropertyAccess", fields: [roleId], references: [id])
+  grantedByUser User        @relation("GrantedByUser", fields: [grantedBy], references: [id])
+
+  @@unique([userId, propertyId])
+  @@index([userId])
+  @@index([propertyId])
+  @@index([roleId])
+  @@index([grantedBy])
+  @@index([isActive])
+  @@index([expiresAt])
+  @@index([canView, canEdit, canDelete])
+}
+
+model RBACAuditLog {
+  id             String   @id @default(uuid())
+  action         String
+  performedBy    String
+  targetUser     String?
+  targetRole     String?
+  targetProperty String?
+  changes        Json?
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  performer User @relation("PerformerAudit", fields: [performedBy], references: [id])
+
+  @@index([performedBy])
+  @@index([targetUser])
+  @@index([targetRole])
+  @@index([createdAt])
+  @@index([action])
+}
+
+model ManagedPermission {
+  id        String   @id @default(uuid())
+  managerId String
+  roleId    String
+  grantedAt DateTime @default(now())
+
+  manager User       @relation("ManagerPermission", fields: [managerId], references: [id])
+  role    CustomRole @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([managerId, roleId])
+  @@index([managerId])
+  @@index([roleId])
+}
+
+// ============== Existing Models Continue Below ==============
 
 model ManagerCommission {
   id                   String             @id @default(uuid())
@@ -77,7 +296,7 @@ model ManagerCommission {
   managerId            String
   commissionFee        Float
   incomeAmount         Float
-  originalIncomeAmount Float? // Original total payment amount (including VAT if applicable)
+  originalIncomeAmount Float?
   commissionAmount     Float
   periodStart          DateTime
   periodEnd            DateTime
@@ -101,21 +320,17 @@ model CommissionInvoice {
   invoiceNumber String   @unique
   invoiceDate   DateTime @default(now())
 
-  // Relations
-  commissionId String            @unique // Add @unique for one-to-one
+  commissionId String            @unique
   commission   ManagerCommission @relation(fields: [commissionId], references: [id], onDelete: Cascade)
 
-  // Header info
   propertyName String
   lrNumber     String?
 
   landlordName    String
   landlordAddress String?
 
-  // User entered
   description String
 
-  // Money
   collectionAmount Float
   commissionRate   Float
   commissionAmount Float
@@ -123,7 +338,6 @@ model CommissionInvoice {
   vatAmount        Float @default(0)
   totalAmount      Float
 
-  // Bank details (user input)
   bankName      String
   accountName   String
   accountNumber String
@@ -132,7 +346,6 @@ model CommissionInvoice {
   swiftCode     String?
   currency      String? @default("KES")
 
-  // Generated file
   pdfUrl String
 
   createdAt DateTime @default(now())
@@ -197,7 +410,7 @@ model ServiceCharge {
   type        ServiceChargeType
   fixedAmount Float?
   percentage  Float?
-  perSqFtRate Float?
+  perSqftRate Float?            @map("perSqFtRate")
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   tenant      Tenant            @relation(fields: [tenantId], references: [id])
@@ -221,7 +434,7 @@ model PaymentReport {
   billInvoices  BillInvoice[]
   invoices      Invoice[]
   tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  receiptUrl    String?  // Add this field
+  receiptUrl    String?
 }
 
 model Income {
@@ -254,7 +467,7 @@ model Invoice {
   notes           String?
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
-  paymentPolicy   PaymentPolicy? // Added this field
+  paymentPolicy   PaymentPolicy?
   paymentReport   PaymentReport? @relation(fields: [paymentReportId], references: [id])
   tenant          Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   demandLetters   DemandLetter[]
@@ -262,7 +475,7 @@ model Invoice {
   @@index([tenantId])
   @@index([invoiceNumber])
   @@index([status])
-  @@index([paymentPolicy]) // Added index for paymentPolicy
+  @@index([paymentPolicy])
 }
 
 model BillInvoice {
@@ -294,7 +507,6 @@ model BillInvoice {
   bill                Bill           @relation(fields: [billId], references: [id], onDelete: Cascade)
   paymentReport       PaymentReport? @relation(fields: [paymentReportId], references: [id])
   tenant              Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  // Removed: @@index([paymentPolicy])  // Added index for paymentPolicy
 
   @@index([billId])
   @@index([tenantId])
@@ -359,12 +571,11 @@ model Lead {
   updatedAt    DateTime      @updatedAt
   companyName  String?
   idNumber     String?
-  createdById  String?       // ADD THIS FIELD
+  createdById  String?
   property     Property?     @relation(fields: [propertyId], references: [id])
-  createdBy    User?         @relation(fields: [createdById], references: [id], name: "CreatedLeads") // ADD THIS RELATION
+  createdBy    User?         @relation(fields: [createdById], references: [id], name: "CreatedLeads")
   offerLetters OfferLetter[]
 }
-
 
 model OfferLetter {
   id              String      @id @default(uuid())
@@ -399,8 +610,6 @@ model OfferLetter {
   createdBy       User?       @relation(fields: [createdById], references: [id])
 }
 
-// Add these to your existing schema.prisma file
-
 model DailyReport {
   id            String   @id @default(uuid())
   propertyId    String
@@ -410,73 +619,59 @@ model DailyReport {
   timeSubmitted DateTime
   preparedBy    String
 
-  // Security Report
   securityProvider          String?
   shiftCoverage             String?
   securityIncidents         String?
   securityActions           String?
   securityOutstandingIssues String?
 
-  // Cleaning & Sanitation
   cleaningContractor       String?
-  areasCleaned             Json? // Store as JSON array
+  areasCleaned             Json?
   cleanlinessStandard      String?
   cleaningIssues           String?
   cleaningCorrectiveAction String?
 
-  // Maintenance & Repairs
-  preventiveTasks Json? // Store as JSON array of tasks
-  repairs         Json? // Store as JSON array of repairs
+  preventiveTasks Json?
+  repairs         Json?
 
-  // Tenant Complaints
-  tenantComplaints Json? // Store as JSON array
+  tenantComplaints Json?
 
-  // Landlord Instructions
   landlordInstructions String?
   landlordActionTaken  String?
   landlordStatus       String?
 
-  // Leads & Enquiries
   newEnquiries   Int?    @default(0)
   enquirySource  String?
   unitsEnquired  String?
   followUpAction String?
   siteVisits     Int?    @default(0)
 
-  // Bookings & Occupancy
   bookingsReceived  String?
   bookingsConfirmed Int?    @default(0)
   bookingsCancelled Int?    @default(0)
   occupancyLevel    Float?  @default(0)
   bookingsRemarks   String?
 
-  // Activations/Events
   activationName   String?
   activityNature   String?
   activityDateTime DateTime?
   activityImpact   String?
 
-  // Utilities Status
   waterStatus         String? @default("NORMAL")
   electricityStatus   String? @default("NORMAL")
   otherServicesStatus String? @default("NORMAL")
   utilitiesRemarks    String?
 
-  // General Observations
   operationalChallenges String?
   healthSafetyIssues    String?
 
-  // Attachments
-  attachments Json? // Store as JSON array of attachments
+  attachments Json?
 
-  // Status
   status ReportStatus @default(DRAFT)
 
-  // Timestamps
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // Relations
   property Property @relation(fields: [propertyId], references: [id])
   manager  User     @relation(fields: [managerId], references: [id])
 
@@ -499,7 +694,6 @@ model ActivationRequest {
   propertyId    String
   managerId     String
 
-  // Part 1 - Client Information (Required for template)
   companyName        String
   postalAddress      String
   telephone          String
@@ -509,7 +703,6 @@ model ActivationRequest {
   email              String
   mobileNo           String
 
-  // Part 2 - Description of Activation/Exhibition (Required for template)
   startDate        DateTime
   setupTime        String
   endDate          DateTime
@@ -519,16 +712,13 @@ model ActivationRequest {
   expectedVisitors Int?
   soundSystem      Boolean  @default(false)
 
-  // Part 3 - Cost of Activation/Exhibition (Required for template)
   licenseFeePerDay Float?
   numberOfDays     Int?
-  proposedBudget   Float? // Fallback for licenseFeePerDay
+  proposedBudget   Float?
 
-  // VAT Information (NEW FIELDS)
-  vatType VATType @default(NOT_APPLICABLE) // Added this field
-  vat     Float?  @default(16) // Added this field with 16% default
+  vatType VATType @default(NOT_APPLICABLE)
+  vat     Float?  @default(16)
 
-  // Payment Details (Required for template)
   bankName      String?
   bankBranch    String?
   accountName   String?
@@ -537,24 +727,19 @@ model ActivationRequest {
   paybillNumber String?
   mpesaAccount  String?
 
-  // Manager Information (Required for template)
-  managerName        String? // Manager's name for signature
-  managerDesignation String? // Manager's designation
+  managerName        String?
+  managerDesignation String?
 
-  // Document Management
-  documentUrl String? // Generated PDF URL
+  documentUrl String?
   status      ActivationStatus @default(DRAFT)
 
-  // Timestamps (Used in template)
   submittedAt DateTime?
   approvedAt  DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  // Signature Information
   signatureDate DateTime?
 
-  // Relations
   property Property @relation(fields: [propertyId], references: [id])
   manager  User     @relation(fields: [managerId], references: [id])
 
@@ -599,40 +784,33 @@ model DemandLetter {
   propertyId    String
   landlordId    String
   unitId        String
-  invoiceId     String? // Link to specific invoice
-  generatedById String? // User who generated the letter
+  invoiceId     String?
+  generatedById String?
   issueDate     DateTime @default(now())
 
-  // Letter-specific data
   outstandingAmount  Float
-  rentalPeriod       String // e.g., "Month of June 2025"
-  dueDate            DateTime // Date when payment was due
-  demandPeriod       String? // e.g., "7 days"
+  rentalPeriod       String
+  dueDate            DateTime
+  demandPeriod       String?
   partialPayment     Float?         @default(0)
   partialPaymentDate DateTime?
-  generatedAt        DateTime? // When PDF was generated
-  paymentPolicy      PaymentPolicy? // Link to tenant's payment policy
+  generatedAt        DateTime?
+  paymentPolicy      PaymentPolicy?
 
-  // Contact information
-  landlordContact String? // Auto-filled from landlord
-  tenantContact   String? // Auto-filled from tenant
+  landlordContact String?
+  tenantContact   String?
 
-  // References
   referenceNumber    String?
-  previousInvoiceRef String? // Reference to original invoice
+  previousInvoiceRef String?
 
-  // Status
   status DemandLetterStatus @default(DRAFT)
 
-  // Document
-  documentUrl String? // Generated PDF URL
+  documentUrl String?
   notes       String?
 
-  // Timestamps
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // Relations
   tenant      Tenant   @relation(fields: [tenantId], references: [id])
   property    Property @relation(fields: [propertyId], references: [id])
   landlord    Landlord @relation(fields: [landlordId], references: [id])
@@ -660,6 +838,7 @@ enum DemandLetterStatus {
 enum Role {
   ADMIN
   MANAGER
+  USER
 }
 
 enum PropertyForm {
@@ -747,8 +926,8 @@ enum PaymentStatus {
   PAID
   PARTIAL
   UNPAID
-  CREDIT // For storing credit balances
-  PREPAID // For future periods covered by overpayment
+  CREDIT
+  PREPAID
 }
 
 enum IncomeFrequency {

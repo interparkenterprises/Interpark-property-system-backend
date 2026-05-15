@@ -1,4 +1,72 @@
 import prisma from "../lib/prisma.js";
+import permissionService from "../services/permissionService.js";
+
+// Helper function to check if user has access to a property with specific permission
+const checkPropertyAccess = async (userId, userRole, propertyId, requiredPermission = 'canView') => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    return await permissionService.checkPropertyAccess(userId, propertyId, requiredPermission);
+  }
+  
+  return false;
+};
+
+// Helper function to check unit-specific permissions
+const checkUnitPermission = async (userId, userRole, propertyId, operation) => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    return await permissionService.checkUnitPermission(userId, propertyId, operation);
+  }
+  
+  return false;
+};
+
+// Helper function to check if user has write access to a specific unit
+const checkUnitWriteAccess = async (userId, userRole, unitId, operation = 'edit') => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    const unit = await prisma.unit.findUnique({
+      where: { id: unitId },
+      include: { property: true }
+    });
+    if (!unit) return false;
+    return unit.property.managerId === userId;
+  }
+  
+  if (userRole === 'USER') {
+    const unit = await prisma.unit.findUnique({
+      where: { id: unitId },
+      include: { property: true }
+    });
+    if (!unit) return false;
+    return await permissionService.checkUnitPermission(userId, unit.propertyId, operation);
+  }
+  
+  return false;
+};
 
 // Helper function to determine unit type based on property usage
 const determineUnitType = (propertyUsage, requestedUnitType) => {
@@ -70,23 +138,92 @@ const prepareUnitData = (propertyUsage, unitType, data) => {
 // @access  Private
 export const getUnits = async (req, res) => {
   try {
-    const units = await prisma.unit.findMany({
-      include: {
-        property: {
-          select: {
-            id: true,
-            name: true,
-            address: true,
-            usage: true,
-            form: true
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let units;
+
+    if (userRole === 'ADMIN') {
+      // Admin sees all units
+      units = await prisma.unit.findMany({
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          },
+          tenant: true
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else if (userRole === 'MANAGER') {
+      // Manager sees units for their properties
+      units = await prisma.unit.findMany({
+        where: {
+          property: {
+            managerId: userId
           }
         },
-        tenant: true
-      },
-      orderBy: { property: { name: 'asc' } }
-    });
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          },
+          tenant: true
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else if (userRole === 'USER') {
+      // USER sees units for accessible properties where they have VIEW_UNITS permission
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.json([]);
+      }
+      
+      // Filter properties where user has VIEW_UNITS permission
+      const propertiesWithPermission = [];
+      for (const propertyId of accessiblePropertyIds) {
+        const hasViewPermission = await checkUnitPermission(userId, userRole, propertyId, 'view');
+        if (hasViewPermission) {
+          propertiesWithPermission.push(propertyId);
+        }
+      }
+      
+      units = await prisma.unit.findMany({
+        where: {
+          propertyId: { in: propertiesWithPermission }
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          },
+          tenant: true
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
     res.json(units);
   } catch (error) {
+    console.error('Get units error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -96,8 +233,17 @@ export const getUnits = async (req, res) => {
 // @access  Private
 export const getUnitsByProperty = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { propertyId } = req.params;
-    const { status } = req.query; // Get status from query parameters
+    const { status } = req.query;
+
+    // Check if user has VIEW_UNITS permission for this property
+    const hasViewPermission = await checkUnitPermission(userId, userRole, propertyId, 'view');
+    
+    if (!hasViewPermission) {
+      return res.status(403).json({ message: 'Access denied to view units for this property' });
+    }
     
     // Build where clause
     const whereClause = { propertyId };
@@ -124,6 +270,7 @@ export const getUnitsByProperty = async (req, res) => {
     });
     res.json(units);
   } catch (error) {
+    console.error('Get units by property error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -133,8 +280,12 @@ export const getUnitsByProperty = async (req, res) => {
 // @access  Private
 export const getUnit = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+
     const unit = await prisma.unit.findUnique({
-      where: { id: req.params.id },
+      where: { id },
       include: {
         property: {
           include: {
@@ -154,8 +305,16 @@ export const getUnit = async (req, res) => {
       return res.status(404).json({ message: 'Unit not found' });
     }
 
+    // Check if user has VIEW_UNITS permission
+    const hasViewPermission = await checkUnitPermission(userId, userRole, unit.propertyId, 'view');
+    
+    if (!hasViewPermission) {
+      return res.status(403).json({ message: 'Access denied to view this unit' });
+    }
+
     res.json(unit);
   } catch (error) {
+    console.error('Get unit error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -165,6 +324,8 @@ export const getUnit = async (req, res) => {
 // @access  Private
 export const createUnit = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { 
       propertyId, 
       unitNo,
@@ -184,6 +345,16 @@ export const createUnit = async (req, res) => {
     if (!propertyId || !sizeSqFt || !rentType || !rentAmount) {
       return res.status(400).json({
         message: 'Property, size, rent type, and rent amount are required fields.'
+      });
+    }
+
+    // Check if user has CREATE_UNIT permission
+    const hasCreatePermission = await checkUnitPermission(userId, userRole, propertyId, 'create');
+    
+    if (!hasCreatePermission) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to create units for this property.',
+        requiredPermission: 'CREATE_UNIT'
       });
     }
 
@@ -309,6 +480,9 @@ export const createUnit = async (req, res) => {
 // @access  Private
 export const updateUnit = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
     const { 
       unitNo,
       floor,
@@ -325,10 +499,10 @@ export const updateUnit = async (req, res) => {
 
     // Fetch existing unit with property details
     const existingUnit = await prisma.unit.findUnique({
-      where: { id: req.params.id },
+      where: { id },
       include: {
         property: {
-          select: { usage: true, name: true }
+          select: { usage: true, name: true, managerId: true }
         },
         tenant: true
       }
@@ -336,6 +510,16 @@ export const updateUnit = async (req, res) => {
 
     if (!existingUnit) {
       return res.status(404).json({ message: 'Unit not found' });
+    }
+
+    // Check EDIT_UNIT permission
+    const hasEditPermission = await checkUnitWriteAccess(userId, userRole, id, 'edit');
+    
+    if (!hasEditPermission) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to update this unit.',
+        requiredPermission: 'EDIT_UNIT'
+      });
     }
 
     // Check if unit has a tenant - if yes, restrict rent amount updates
@@ -449,7 +633,7 @@ export const updateUnit = async (req, res) => {
     }
 
     const unit = await prisma.unit.update({
-      where: { id: req.params.id },
+      where: { id },
       data: updateData,
       include: {
         property: {
@@ -493,12 +677,26 @@ export const updateUnit = async (req, res) => {
 
 // @desc    Delete unit
 // @route   DELETE /api/units/:id
-// @access  Private (Admin only)
+// @access  Private
 export const deleteUnit = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+
+    // Check DELETE_UNIT permission
+    const hasDeletePermission = await checkUnitWriteAccess(userId, userRole, id, 'delete');
+    
+    if (!hasDeletePermission) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to delete this unit.',
+        requiredPermission: 'DELETE_UNIT'
+      });
+    }
+
     // Check if unit has a tenant
     const unit = await prisma.unit.findUnique({
-      where: { id: req.params.id },
+      where: { id },
       include: { tenant: true }
     });
 
@@ -513,11 +711,70 @@ export const deleteUnit = async (req, res) => {
     }
 
     await prisma.unit.delete({
-      where: { id: req.params.id }
+      where: { id }
     });
 
     res.json({ message: 'Unit deleted successfully' });
   } catch (error) {
+    console.error('Delete unit error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Update unit status (vacant/occupied)
+// @route   PATCH /api/units/:id/status
+// @access  Private
+export const updateUnitStatus = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status || !['VACANT', 'OCCUPIED'].includes(status)) {
+      return res.status(400).json({ message: 'Valid status (VACANT or OCCUPIED) is required' });
+    }
+
+    // Fetch existing unit
+    const existingUnit = await prisma.unit.findUnique({
+      where: { id },
+      include: { property: true }
+    });
+
+    if (!existingUnit) {
+      return res.status(404).json({ message: 'Unit not found' });
+    }
+
+    // Check UPDATE_UNIT_STATUS permission
+    const hasUpdateStatusPermission = await checkUnitWriteAccess(userId, userRole, id, 'updateStatus');
+    
+    if (!hasUpdateStatusPermission) {
+      return res.status(403).json({ 
+        message: 'Access denied. You do not have permission to update unit status.',
+        requiredPermission: 'UPDATE_UNIT_STATUS'
+      });
+    }
+
+    const updatedUnit = await prisma.unit.update({
+      where: { id },
+      data: { status },
+      include: {
+        property: {
+          select: {
+            id: true,
+            name: true,
+            address: true
+          }
+        }
+      }
+    });
+
+    res.json({
+      message: `Unit status updated to ${status}`,
+      unit: updatedUnit
+    });
+  } catch (error) {
+    console.error('Update unit status error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -527,23 +784,89 @@ export const deleteUnit = async (req, res) => {
 // @access  Private
 export const getVacantUnits = async (req, res) => {
   try {
-    const units = await prisma.unit.findMany({
-      where: { status: 'VACANT' },
-      include: {
-        property: {
-          select: {
-            id: true,
-            name: true,
-            address: true,
-            usage: true,
-            form: true
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let units;
+
+    if (userRole === 'ADMIN') {
+      units = await prisma.unit.findMany({
+        where: { status: 'VACANT' },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
           }
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else if (userRole === 'MANAGER') {
+      units = await prisma.unit.findMany({
+        where: {
+          status: 'VACANT',
+          property: {
+            managerId: userId
+          }
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          }
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else if (userRole === 'USER') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.json([]);
+      }
+      
+      // Filter properties where user has VIEW_UNITS permission
+      const propertiesWithPermission = [];
+      for (const propertyId of accessiblePropertyIds) {
+        const hasViewPermission = await checkUnitPermission(userId, userRole, propertyId, 'view');
+        if (hasViewPermission) {
+          propertiesWithPermission.push(propertyId);
         }
-      },
-      orderBy: { property: { name: 'asc' } }
-    });
+      }
+      
+      units = await prisma.unit.findMany({
+        where: {
+          status: 'VACANT',
+          propertyId: { in: propertiesWithPermission }
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          }
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
     res.json(units);
   } catch (error) {
+    console.error('Get vacant units error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -553,28 +876,104 @@ export const getVacantUnits = async (req, res) => {
 // @access  Private
 export const getOccupiedUnits = async (req, res) => {
   try {
-    const units = await prisma.unit.findMany({
-      where: { status: 'OCCUPIED' },
-      include: {
-        property: {
-          select: {
-            id: true,
-            name: true,
-            address: true,
-            usage: true,
-            form: true
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let units;
+
+    if (userRole === 'ADMIN') {
+      units = await prisma.unit.findMany({
+        where: { status: 'OCCUPIED' },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          },
+          tenant: {
+            include: {
+              serviceCharge: true
+            }
           }
         },
-        tenant: {
-          include: {
-            serviceCharge: true
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else if (userRole === 'MANAGER') {
+      units = await prisma.unit.findMany({
+        where: {
+          status: 'OCCUPIED',
+          property: {
+            managerId: userId
           }
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          },
+          tenant: {
+            include: {
+              serviceCharge: true
+            }
+          }
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else if (userRole === 'USER') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.json([]);
+      }
+      
+      // Filter properties where user has VIEW_UNITS permission
+      const propertiesWithPermission = [];
+      for (const propertyId of accessiblePropertyIds) {
+        const hasViewPermission = await checkUnitPermission(userId, userRole, propertyId, 'view');
+        if (hasViewPermission) {
+          propertiesWithPermission.push(propertyId);
         }
-      },
-      orderBy: { property: { name: 'asc' } }
-    });
+      }
+      
+      units = await prisma.unit.findMany({
+        where: {
+          status: 'OCCUPIED',
+          propertyId: { in: propertiesWithPermission }
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true,
+              usage: true,
+              form: true
+            }
+          },
+          tenant: {
+            include: {
+              serviceCharge: true
+            }
+          }
+        },
+        orderBy: { property: { name: 'asc' } }
+      });
+    } else {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
     res.json(units);
   } catch (error) {
+    console.error('Get occupied units error:', error);
     res.status(400).json({ message: error.message });
   }
 };

@@ -1,17 +1,17 @@
 import prisma from "../lib/prisma.js";
 import { uploadToStorage, generateFileName } from '../utils/storage.js';
 import { DailyReportHelper } from '../utils/dailyReportHelper.js';
-
-//const prisma = new PrismaClient();
+import permissionService from "../services/permissionService.js";
 
 export class DailyReportController {
   // Create daily report with PDF generation
   async createReport(req, res) {
     try {
       const { propertyId, reportDate, ...reportData } = req.body;
-      const managerId = req.user.id;
+      const userId = req.user.id;
+      const userRole = req.user.role;
 
-      // 1. Check if user has permission for this property
+      // 1. Check if property exists
       const property = await prisma.property.findUnique({
         where: { id: propertyId },
         include: {
@@ -27,15 +27,36 @@ export class DailyReportController {
         });
       }
 
-      // Check if manager has access to this property
-      if (req.user.role === 'MANAGER' && property.managerId !== managerId) {
+      // 2. Use permission service for access check
+      let hasAccess = false;
+
+      if (userRole === 'ADMIN') {
+        hasAccess = true;
+      } else {
+        // Check general CREATE_DAILY_REPORTS permission
+        const canCreateReport = await permissionService.checkPermission(
+          userId, 
+          'report', 
+          'create', 
+          propertyId
+        );
+        
+        if (canCreateReport) {
+          hasAccess = true;
+        } else {
+          // Fallback: Check if user is the property manager
+          hasAccess = property.managerId === userId;
+        }
+      }
+
+      if (!hasAccess) {
         return res.status(403).json({
           success: false,
           message: 'You do not have permission to create reports for this property'
         });
       }
 
-      // 2. Check if report already exists for this date
+      // 3. Check if report already exists for this date
       const startOfDay = new Date(reportDate);
       startOfDay.setHours(0, 0, 0, 0);
       
@@ -59,14 +80,14 @@ export class DailyReportController {
         });
       }
 
-      // 3. Extract day from reportDate
+      // 4. Extract day from reportDate
       const reportDateObj = new Date(reportDate);
       const day = reportDateObj.toLocaleDateString('en-US', { weekday: 'long' });
 
-      // 4. Prepare report data for initial creation
+      // 5. Prepare report data for initial creation
       const initialReportData = {
         propertyId,
-        managerId,
+        managerId: userRole === 'MANAGER' ? userId : (property.managerId || userId),
         reportDate: reportDateObj,
         preparedBy: req.user.name,
         timeSubmitted: new Date(),
@@ -75,7 +96,7 @@ export class DailyReportController {
         ...DailyReportHelper.prepareReportData(reportData)
       };
 
-      // 5. Create the report first (without PDF)
+      // 6. Create the report first (without PDF)
       const report = await prisma.dailyReport.create({
         data: initialReportData,
         include: {
@@ -95,14 +116,14 @@ export class DailyReportController {
         }
       });
 
-      // 6. Generate PDF
+      // 7. Generate PDF
       const pdfBuffer = await DailyReportHelper.generateReportPDF(report);
       
-      // 7. Upload PDF to storage
+      // 8. Upload PDF to storage
       const fileName = generateFileName(`daily_report_${property.name.replace(/\s+/g, '_')}_${reportDateObj.getTime()}`);
       const pdfUrl = await uploadToStorage(pdfBuffer, fileName, 'reports');
 
-      // 8. Create attachment object
+      // 9. Create attachment object
       const attachment = {
         type: 'PDF',
         fileName,
@@ -111,7 +132,7 @@ export class DailyReportController {
         isPrimary: true
       };
 
-      // 9. Update report with attachment
+      // 10. Update report with attachment
       const updatedReport = await prisma.dailyReport.update({
         where: { id: report.id },
         data: {
@@ -158,6 +179,7 @@ export class DailyReportController {
     try {
       const { id } = req.params;
       const { includePdf } = req.query;
+      const userId = req.user.id;
 
       const report = await prisma.dailyReport.findUnique({
         where: { id },
@@ -186,8 +208,15 @@ export class DailyReportController {
         });
       }
 
-      // Check permissions
-      if (req.user.role === 'MANAGER' && report.managerId !== req.user.id) {
+      // Use permission service for access check
+      const hasAccess = await permissionService.checkPermission(
+        userId, 
+        'report', 
+        'view', 
+        report.propertyId
+      );
+
+      if (!hasAccess) {
         return res.status(403).json({
           success: false,
           message: 'You do not have permission to view this report'
@@ -225,6 +254,7 @@ export class DailyReportController {
       const { id } = req.params;
       const updateData = req.body;
       const userId = req.user.id;
+      const userRole = req.user.role;
 
       // Check if report exists
       const existingReport = await prisma.dailyReport.findUnique({
@@ -241,22 +271,34 @@ export class DailyReportController {
         });
       }
 
-      // Check permissions
-      if (req.user.role === 'MANAGER') {
-        if (existingReport.managerId !== userId) {
-          return res.status(403).json({
-            success: false,
-            message: 'You can only update your own reports'
-          });
-        }
+      // Use permission service for access check
+      let hasAccess = false;
 
-        // Managers can only update DRAFT reports
-        if (existingReport.status !== 'DRAFT') {
-          return res.status(400).json({
-            success: false,
-            message: 'Only DRAFT reports can be updated'
-          });
-        }
+      if (userRole === 'ADMIN') {
+        hasAccess = true;
+      } else {
+        // Check EDIT_DAILY_REPORTS permission
+        hasAccess = await permissionService.checkPermission(
+          userId, 
+          'report', 
+          'edit', 
+          existingReport.propertyId
+        );
+      }
+
+      if (!hasAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to update this report'
+        });
+      }
+
+      // Non-admin users can only update DRAFT reports
+      if (userRole !== 'ADMIN' && existingReport.status !== 'DRAFT') {
+        return res.status(400).json({
+          success: false,
+          message: 'Only DRAFT reports can be updated'
+        });
       }
 
       // Prepare update data
@@ -353,9 +395,13 @@ export class DailyReportController {
     try {
       const { id } = req.params;
       const userId = req.user.id;
+      const userRole = req.user.role;
 
       const existingReport = await prisma.dailyReport.findUnique({
-        where: { id }
+        where: { id },
+        include: {
+          property: true
+        }
       });
 
       if (!existingReport) {
@@ -365,11 +411,25 @@ export class DailyReportController {
         });
       }
 
-      // Check if user is the report owner
-      if (existingReport.managerId !== userId) {
+      // Use permission service for access check
+      let hasAccess = false;
+
+      if (userRole === 'ADMIN') {
+        hasAccess = true;
+      } else {
+        // Check SUBMIT_DAILY_REPORTS permission
+        hasAccess = await permissionService.checkPermission(
+          userId, 
+          'report', 
+          'submit', 
+          existingReport.propertyId
+        );
+      }
+
+      if (!hasAccess) {
         return res.status(403).json({
           success: false,
-          message: 'You can only submit your own reports'
+          message: 'You do not have permission to submit this report'
         });
       }
 
@@ -381,7 +441,7 @@ export class DailyReportController {
         });
       }
 
-      // Update only status and updatedAt (no submittedAt field in your model)
+      // Update only status and updatedAt
       const submittedReport = await prisma.dailyReport.update({
         where: { id },
         data: {
@@ -411,19 +471,20 @@ export class DailyReportController {
     try {
       const { propertyId } = req.params;
       const { startDate, endDate, status } = req.query;
+      const userId = req.user.id;
 
-      // Check if user has access to this property
-      if (req.user.role === 'MANAGER') {
-        const property = await prisma.property.findUnique({
-          where: { id: propertyId }
+      // Use permission service to check if user has access to this property
+      const hasAccess = await permissionService.checkPropertyAccess(
+        userId, 
+        propertyId, 
+        'canView'
+      );
+
+      if (!hasAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view reports for this property'
         });
-
-        if (!property || property.managerId !== req.user.id) {
-          return res.status(403).json({
-            success: false,
-            message: 'You do not have permission to view reports for this property'
-          });
-        }
       }
 
       const where = {
@@ -473,14 +534,110 @@ export class DailyReportController {
     }
   }
 
+  // Get all reports by manager (for managers to see their team's reports)
+  async getReportsByManager(req, res) {
+    try {
+      const { startDate, endDate, status, propertyId } = req.query;
+      const userId = req.user.id;
+      const userRole = req.user.role;
+
+      // Check permission for viewing reports by manager
+      let hasPermission = false;
+      
+      if (userRole === 'ADMIN') {
+        hasPermission = true;
+      } else if (userRole === 'MANAGER') {
+        hasPermission = await permissionService.checkPermission(
+          userId, 
+          'report', 
+          'view'
+        );
+      }
+
+      if (!hasPermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view reports by manager'
+        });
+      }
+
+      let managerId = userId;
+      
+      // Admin can specify a different manager
+      if (userRole === 'ADMIN' && req.query.managerId) {
+        managerId = req.query.managerId;
+      }
+
+      const where = {
+        managerId
+      };
+
+      if (propertyId) {
+        where.propertyId = propertyId;
+      }
+
+      if (startDate && endDate) {
+        where.reportDate = {
+          gte: new Date(startDate),
+          lte: new Date(endDate)
+        };
+      }
+
+      if (status) {
+        where.status = status;
+      }
+
+      const reports = await prisma.dailyReport.findMany({
+        where,
+        orderBy: {
+          reportDate: 'desc'
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true
+            }
+          },
+          manager: {
+            select: {
+              id: true,
+              name: true,
+              email: true
+            }
+          }
+        }
+      });
+
+      res.status(200).json({
+        success: true,
+        count: reports.length,
+        data: reports
+      });
+
+    } catch (error) {
+      console.error('Error getting manager reports:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to get manager reports',
+        error: error.message
+      });
+    }
+  }
+
   // Delete report
   async deleteReport(req, res) {
     try {
       const { id } = req.params;
       const userId = req.user.id;
+      const userRole = req.user.role;
 
       const existingReport = await prisma.dailyReport.findUnique({
-        where: { id }
+        where: { id },
+        include: {
+          property: true
+        }
       });
 
       if (!existingReport) {
@@ -490,22 +647,34 @@ export class DailyReportController {
         });
       }
 
-      // Check permissions
-      if (req.user.role === 'MANAGER') {
-        if (existingReport.managerId !== userId) {
-          return res.status(403).json({
-            success: false,
-            message: 'You can only delete your own reports'
-          });
-        }
+      // Use permission service for access check
+      let hasAccess = false;
 
-        // Managers can only delete DRAFT reports
-        if (existingReport.status !== 'DRAFT') {
-          return res.status(400).json({
-            success: false,
-            message: 'Only DRAFT reports can be deleted'
-          });
-        }
+      if (userRole === 'ADMIN') {
+        hasAccess = true;
+      } else {
+        // Check DELETE_DAILY_REPORTS permission
+        hasAccess = await permissionService.checkPermission(
+          userId, 
+          'report', 
+          'delete', 
+          existingReport.propertyId
+        );
+      }
+
+      if (!hasAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to delete this report'
+        });
+      }
+
+      // Non-admin users can only delete DRAFT reports
+      if (userRole !== 'ADMIN' && existingReport.status !== 'DRAFT') {
+        return res.status(400).json({
+          success: false,
+          message: 'Only DRAFT reports can be deleted'
+        });
       }
 
       await prisma.dailyReport.delete({
@@ -531,6 +700,7 @@ export class DailyReportController {
   async downloadReportPDF(req, res) {
     try {
       const { id } = req.params;
+      const userId = req.user.id;
 
       const report = await prisma.dailyReport.findUnique({
         where: { id },
@@ -550,8 +720,15 @@ export class DailyReportController {
         });
       }
 
-      // Check permissions
-      if (req.user.role === 'MANAGER' && report.managerId !== req.user.id) {
+      // Use permission service for access check
+      const hasAccess = await permissionService.checkPermission(
+        userId, 
+        'report', 
+        'view', 
+        report.propertyId
+      );
+
+      if (!hasAccess) {
         return res.status(403).json({
           success: false,
           message: 'You do not have permission to download this report'
@@ -584,12 +761,19 @@ export class DailyReportController {
   async getAllReports(req, res) {
     try {
       const { startDate, endDate, status, propertyId, managerId } = req.query;
+      const userId = req.user.id;
+      const userRole = req.user.role;
 
-      // Check if user is admin
-      if (req.user.role !== 'ADMIN') {
+      // Check if user has VIEW_DAILY_REPORTS permission
+      const hasPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_DAILY_REPORTS'
+      );
+
+      if (!hasPermission && userRole !== 'ADMIN') {
         return res.status(403).json({
           success: false,
-          message: 'Only administrators can view all reports'
+          message: 'You do not have permission to view all reports'
         });
       }
 
@@ -653,29 +837,47 @@ export class DailyReportController {
     }
   }
 
-  // Review report (approve/reject - admin only)
+  // Review report (approve/reject)
   async reviewReport(req, res) {
     try {
       const { id } = req.params;
       const { action, comments } = req.body;
-      const reviewerId = req.user.id;
-
-      // Check if user is admin
-      if (req.user.role !== 'ADMIN') {
-        return res.status(403).json({
-          success: false,
-          message: 'Only administrators can review reports'
-        });
-      }
+      const userId = req.user.id;
+      const userRole = req.user.role;
 
       const existingReport = await prisma.dailyReport.findUnique({
-        where: { id }
+        where: { id },
+        include: {
+          property: true,
+          manager: true
+        }
       });
 
       if (!existingReport) {
         return res.status(404).json({
           success: false,
           message: 'Report not found'
+        });
+      }
+
+      // Check if user has APPROVE_DAILY_REPORTS permission
+      let hasPermission = false;
+      
+      if (userRole === 'ADMIN') {
+        hasPermission = true;
+      } else {
+        hasPermission = await permissionService.checkPermission(
+          userId, 
+          'report', 
+          'approve', 
+          existingReport.propertyId
+        );
+      }
+
+      if (!hasPermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'Only administrators or users with approval permission can review reports'
         });
       }
 
@@ -692,7 +894,7 @@ export class DailyReportController {
         where: { id },
         data: {
           status: newStatus,
-          reviewedBy: reviewerId,
+          reviewedBy: userId,
           reviewComments: comments,
           updatedAt: new Date()
         },
@@ -700,6 +902,14 @@ export class DailyReportController {
           property: {
             include: {
               landlord: true
+            }
+          },
+          manager: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              role: true
             }
           }
         }
@@ -716,6 +926,105 @@ export class DailyReportController {
       res.status(500).json({
         success: false,
         message: 'Failed to review report',
+        error: error.message
+      });
+    }
+  }
+
+  // Get reports by managed user (for managed users to see their reports)
+  async getMyReports(req, res) {
+    try {
+      const { startDate, endDate, status, propertyId } = req.query;
+      const userId = req.user.id;
+      const userRole = req.user.role;
+
+      // Check if user has VIEW_DAILY_REPORTS permission
+      const hasViewPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_DAILY_REPORTS'
+      );
+
+      if (!hasViewPermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view reports'
+        });
+      }
+
+      // Get all properties the user has access to
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+
+      if (accessiblePropertyIds.length === 0) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: []
+        });
+      }
+
+      const where = {
+        propertyId: {
+          in: accessiblePropertyIds
+        }
+      };
+
+      if (propertyId) {
+        // Verify user has access to this specific property
+        const hasAccess = accessiblePropertyIds.includes(propertyId);
+        if (!hasAccess) {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to this property'
+          });
+        }
+        where.propertyId = propertyId;
+      }
+
+      if (startDate && endDate) {
+        where.reportDate = {
+          gte: new Date(startDate),
+          lte: new Date(endDate)
+        };
+      }
+
+      if (status) {
+        where.status = status;
+      }
+
+      const reports = await prisma.dailyReport.findMany({
+        where,
+        orderBy: {
+          reportDate: 'desc'
+        },
+        include: {
+          property: {
+            select: {
+              id: true,
+              name: true,
+              address: true
+            }
+          },
+          manager: {
+            select: {
+              id: true,
+              name: true,
+              email: true
+            }
+          }
+        }
+      });
+
+      res.status(200).json({
+        success: true,
+        count: reports.length,
+        data: reports
+      });
+
+    } catch (error) {
+      console.error('Error getting my reports:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to get reports',
         error: error.message
       });
     }

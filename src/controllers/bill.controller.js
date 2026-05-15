@@ -1,13 +1,148 @@
 import prisma from "../lib/prisma.js";
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
-//import PDFDocument from 'pdfkit';
 import { uploadToStorage } from '../utils/storage.js';
+import permissionService from "../services/permissionService.js";
+import { generateBillInvoicePDF } from "./billinvoice.controller.js";
 
-//const prisma = new PrismaClient();
+// ======================================================
+// PERMISSION HELPER FUNCTIONS
+// ======================================================
+
+// Helper function to check if user has access to a property with specific permission
+const checkPropertyAccess = async (userId, userRole, propertyId, requiredPermission = 'canView') => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    return await permissionService.checkPropertyAccess(userId, propertyId, requiredPermission);
+  }
+  
+  return false;
+};
+
+// Helper function to check bill permission for a property
+const checkBillPermission = async (userId, userRole, propertyId, operation) => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    // Map operation to permission code
+    const permissionMap = {
+      view: 'VIEW_BILLS',
+      create: 'CREATE_BILL',
+      edit: 'EDIT_BILL',
+      delete: 'DELETE_BILL',
+      pay: 'PAY_BILL',
+      recordMeterReading: 'RECORD_METER_READINGS'
+    };
+    
+    const permissionCode = permissionMap[operation];
+    if (!permissionCode) return false;
+    
+    return await permissionService.hasPermission(userId, permissionCode, propertyId);
+  }
+  
+  return false;
+};
+
+// Helper function to check if user has access to a specific bill
+const checkBillAccess = async (userId, userRole, billId, operation = 'view') => {
+  if (userRole === 'ADMIN') {
+    return true;
+  }
+  
+  // Get property ID from bill
+  const bill = await prisma.bill.findUnique({
+    where: { id: billId },
+    include: {
+      tenant: {
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          }
+        }
+      }
+    }
+  });
+  
+  if (!bill) return false;
+  
+  const propertyId = bill.tenant?.unit?.propertyId;
+  if (!propertyId) return false;
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findFirst({
+      where: { id: propertyId, managerId: userId }
+    });
+    return !!property;
+  }
+  
+  if (userRole === 'USER') {
+    return await checkBillPermission(userId, userRole, propertyId, operation);
+  }
+  
+  return false;
+};
+
+// Helper function to get accessible property IDs for filtering
+const getAccessiblePropertyIds = async (userId, userRole, operation = 'view') => {
+  if (userRole === 'ADMIN') {
+    const allProperties = await prisma.property.findMany({ select: { id: true } });
+    return allProperties.map(p => p.id);
+  }
+  
+  if (userRole === 'MANAGER') {
+    const properties = await prisma.property.findMany({
+      where: { managerId: userId },
+      select: { id: true }
+    });
+    return properties.map(p => p.id);
+  }
+  
+  if (userRole === 'USER') {
+    const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+    
+    // Filter properties where user has VIEW_BILLS permission
+    const propertiesWithPermission = [];
+    for (const propertyId of accessiblePropertyIds) {
+      const hasPermission = await checkBillPermission(userId, userRole, propertyId, operation);
+      if (hasPermission) {
+        propertiesWithPermission.push(propertyId);
+      }
+    }
+    return propertiesWithPermission;
+  }
+  
+  return [];
+};
+
+// ======================================================
+// BILL CONTROLLER FUNCTIONS
+// ======================================================
 
 // Create a new bill
 export const createBill = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const {
       tenantId,
       type,
@@ -27,25 +162,43 @@ export const createBill = async (req, res) => {
       });
     }
 
-    // Validate tenant exists
+    // Validate tenant exists and get property ID
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
+      include: {
+        unit: {
+          include: {
+            property: true
+          }
+        }
+      }
     });
+    
     if (!tenant) {
       return res.status(404).json({ error: 'Tenant not found.' });
     }
 
-    // ==============================================
-    // NEW: Get previous reading from last bill
-    // ==============================================
+    const propertyId = tenant.unit?.propertyId;
+    
+    // Check CREATE_BILL permission
+    const hasCreatePermission = await checkBillPermission(userId, userRole, propertyId, 'create');
+    
+    if (!hasCreatePermission) {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You do not have permission to create bills for this property.',
+        requiredPermission: 'CREATE_BILL'
+      });
+    }
+
+    // Get previous reading from last bill if not provided
     let previousReadingToUse = previousReading;
     
-    // If previousReading is not provided, fetch the last bill's current reading
     if (previousReading === undefined) {
       const lastBill = await prisma.bill.findFirst({
         where: {
           tenantId,
-          type, // Same bill type (WATER/ELECTRICITY)
+          type,
         },
         orderBy: {
           issuedAt: 'desc',
@@ -59,9 +212,8 @@ export const createBill = async (req, res) => {
 
       if (lastBill) {
         previousReadingToUse = lastBill.currentReading;
-        console.log(`Auto-filled previous reading from last ${type} bill: ${previousReadingToUse} (Bill ID: ${lastBill.id})`);
+        console.log(`Auto-filled previous reading from last ${type} bill: ${previousReadingToUse}`);
       } else {
-        // No previous bill found, require previousReading to be provided
         return res.status(400).json({
           error: `No previous ${type} bill found for this tenant. Please provide a previous reading.`,
           suggestion: 'This appears to be the first bill for this utility type.'
@@ -113,7 +265,7 @@ export const createBill = async (req, res) => {
             unit: {
               select: {
                 property: {
-                  select: { name: true, address: true }
+                  select: { name: true, address: true, id: true }
                 }
               }
             }
@@ -130,13 +282,12 @@ export const createBill = async (req, res) => {
       usage: {
         units,
         period: 'Since last bill',
-        consumptionRate: units / (new Date().getDate()) // Approximate daily usage
+        consumptionRate: units / (new Date().getDate())
       }
     });
   } catch (error) {
     console.error('Error creating bill:', error);
     
-    // Handle specific errors
     if (error.code === 'P2003') {
       return res.status(400).json({ 
         error: 'Invalid tenant ID.',
@@ -158,14 +309,45 @@ export const createBill = async (req, res) => {
   }
 };
 
-// Helper function to get the last bill info
+// Get last bill info
 export const getLastBillInfo = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { tenantId, type } = req.query;
 
     if (!tenantId || !type) {
       return res.status(400).json({ 
         error: 'tenantId and type are required.' 
+      });
+    }
+
+    // Get tenant to check property access
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      include: {
+        unit: {
+          include: {
+            property: true
+          }
+        }
+      }
+    });
+    
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found.' });
+    }
+    
+    const propertyId = tenant.unit?.propertyId;
+    
+    // Check VIEW_BILLS permission
+    const hasViewPermission = await checkBillPermission(userId, userRole, propertyId, 'view');
+    
+    if (!hasViewPermission) {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You do not have permission to view bills for this tenant.',
+        requiredPermission: 'VIEW_BILLS'
       });
     }
 
@@ -211,16 +393,63 @@ export const getLastBillInfo = async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 };
+
 // Get all bills
 export const getAllBills = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { page = 1, limit = 10, type, status, tenantId } = req.query;
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
-    const whereClause = {};
+    let whereClause = {};
     if (type) whereClause.type = type;
     if (status) whereClause.status = status;
     if (tenantId) whereClause.tenantId = tenantId;
+
+    // Apply role-based filtering
+    if (userRole === 'ADMIN') {
+      // Admin sees all bills
+      // No additional where clause needed
+    } else if (userRole === 'MANAGER') {
+      // Manager sees bills for their properties
+      whereClause = {
+        ...whereClause,
+        tenant: {
+          unit: {
+            property: {
+              managerId: userId
+            }
+          }
+        }
+      };
+    } else if (userRole === 'USER') {
+      // USER sees bills for accessible properties with VIEW_BILLS permission
+      const accessiblePropertyIds = await getAccessiblePropertyIds(userId, userRole, 'view');
+      
+      if (accessiblePropertyIds.length === 0) {
+        return res.status(200).json({
+          bills: [],
+          pagination: {
+            page: parseInt(page, 10),
+            limit: parseInt(limit, 10),
+            total: 0,
+            totalPages: 0
+          }
+        });
+      }
+      
+      whereClause = {
+        ...whereClause,
+        tenant: {
+          unit: {
+            propertyId: { in: accessiblePropertyIds }
+          }
+        }
+      };
+    } else {
+      return res.status(403).json({ error: 'Access denied' });
+    }
 
     const bills = await prisma.bill.findMany({
       where: whereClause,
@@ -232,10 +461,16 @@ export const getAllBills = async (req, res) => {
           select: {
             fullName: true,
             contact: true,
+            KRAPin: true,
             unit: {
               select: {
+                unitNo: true,
                 property: {
-                  select: { name: true }
+                  select: { 
+                    id: true,
+                    name: true,
+                    address: true
+                  }
                 }
               }
             }
@@ -264,7 +499,20 @@ export const getAllBills = async (req, res) => {
 // Get a specific bill by ID
 export const getBillById = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
+
+    // Check VIEW_BILLS permission for this bill
+    const hasViewPermission = await checkBillAccess(userId, userRole, id, 'view');
+    
+    if (!hasViewPermission) {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You do not have permission to view this bill.',
+        requiredPermission: 'VIEW_BILLS'
+      });
+    }
 
     const bill = await prisma.bill.findUnique({
       where: { id },
@@ -273,14 +521,23 @@ export const getBillById = async (req, res) => {
           select: {
             fullName: true,
             contact: true,
+            KRAPin: true,
             unit: {
               select: {
+                unitNo: true,
                 property: {
-                  select: { name: true, address: true }
+                  select: { 
+                    id: true,
+                    name: true, 
+                    address: true 
+                  }
                 }
               }
             }
           }
+        },
+        billInvoices: {
+          orderBy: { createdAt: 'desc' }
         }
       }
     });
@@ -299,8 +556,21 @@ export const getBillById = async (req, res) => {
 // Update a bill by ID
 export const updateBill = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
     const updates = req.body;
+
+    // Check EDIT_BILL permission
+    const hasEditPermission = await checkBillAccess(userId, userRole, id, 'edit');
+    
+    if (!hasEditPermission) {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You do not have permission to update this bill.',
+        requiredPermission: 'EDIT_BILL'
+      });
+    }
 
     // Find the existing bill
     const existingBill = await prisma.bill.findUnique({
@@ -363,7 +633,20 @@ export const updateBill = async (req, res) => {
 // Delete a bill by ID
 export const deleteBill = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
+
+    // Check DELETE_BILL permission
+    const hasDeletePermission = await checkBillAccess(userId, userRole, id, 'delete');
+    
+    if (!hasDeletePermission) {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You do not have permission to delete this bill.',
+        requiredPermission: 'DELETE_BILL'
+      });
+    }
 
     const bill = await prisma.bill.findUnique({
       where: { id },
@@ -384,15 +667,27 @@ export const deleteBill = async (req, res) => {
   }
 };
 
-
-// Pay bill with update to the same invoice
+// Pay bill
 export const payBill = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
     const { amount } = req.body;
 
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: "Invalid payment amount" });
+    }
+
+    // Check PAY_BILL permission
+    const hasPayPermission = await checkBillAccess(userId, userRole, id, 'pay');
+    
+    if (!hasPayPermission) {
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You do not have permission to pay this bill.',
+        requiredPermission: 'PAY_BILL'
+      });
     }
 
     const bill = await prisma.bill.findUnique({
@@ -403,10 +698,9 @@ export const payBill = async (req, res) => {
             unit: { include: { property: true } }
           }
         },
-        // IMPORTANT: Include existing invoices
         billInvoices: {
           orderBy: { createdAt: 'desc' },
-          take: 1 // Get the latest invoice
+          take: 1
         }
       }
     });
@@ -419,7 +713,6 @@ export const payBill = async (req, res) => {
     const remainingBalance = roundTo2(grandTotal - bill.amountPaid);
     const now = new Date();
 
-    // Validate payment
     if (newAmountPaid > grandTotal + 0.01) {
       return res.status(400).json({
         error: `Payment exceeds bill total. Maximum: Ksh ${remainingBalance.toLocaleString()}`
@@ -441,7 +734,6 @@ export const payBill = async (req, res) => {
     }
 
     const { updatedBill, invoice } = await prisma.$transaction(async (tx) => {
-      // 1. Update Bill
       const updatedBill = await tx.bill.update({
         where: { id },
         data: {
@@ -464,18 +756,13 @@ export const payBill = async (req, res) => {
       if (newAmountPaid >= grandTotal) invoiceStatus = "PAID";
       else if (newAmountPaid > 0) invoiceStatus = "PARTIAL";
 
-      // Check for overdue
       if (bill.dueDate && now > bill.dueDate && invoiceStatus !== "PAID") {
         invoiceStatus = "OVERDUE";
       }
 
       let invoice;
 
-      // ========================================
-      // KEY CHANGE: Update existing or create new
-      // ========================================
       if (bill.billInvoices && bill.billInvoices.length > 0) {
-        // UPDATE existing invoice
         const existingInvoice = bill.billInvoices[0];
         
         invoice = await tx.billInvoice.update({
@@ -491,7 +778,6 @@ export const payBill = async (req, res) => {
           }
         });
       } else {
-        // CREATE new invoice (only if none exists)
         const invoiceNumber = await generateBillInvoiceNumber();
         const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
 
@@ -527,7 +813,6 @@ export const payBill = async (req, res) => {
       timeout: 30000,
     });
 
-    // 3. Regenerate PDF with updated data (OUTSIDE transaction)
     let pdfUrl = null;
     if (invoice) {
       try {
