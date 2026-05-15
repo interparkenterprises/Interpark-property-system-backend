@@ -562,7 +562,7 @@ async function generateInvoicePDF(invoice, tenant) {
       // Invoice title
       doc.fontSize(28)
         .fillColor('#1e293b')
-        .text('INVOICE', { align: 'center' })
+        .text('Pro Forma Invoice', { align: 'center' })
         .moveDown(0.3);
       
       // Property name below the title (bold but smaller)
