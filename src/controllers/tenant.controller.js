@@ -360,14 +360,14 @@ export const getTenantsByProperty = async (req, res) => {
   }
 };
 
-// @desc    Get all tenants with overdue payments (optionally filtered by property)
-// @route   GET /api/tenants/overdue?propertyId=xxx
+// @desc    Get all tenants with overdue payments (optionally filtered by property and days)
+// @route   GET /api/tenants/overdue?propertyId=xxx&daysOverdue=7|14|30|60|90|custom&customDays=27
 // @access  Private
 export const getOverdueTenants = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
-    const { propertyId } = req.query;
+    const { propertyId, daysOverdue, customDays } = req.query;
 
     let tenants;
     let baseWhere = {};
@@ -434,6 +434,8 @@ export const getOverdueTenants = async (req, res) => {
             },
             filter: {
               propertyId: propertyId || null,
+              daysOverdue: daysOverdue || null,
+              customDays: customDays ? parseInt(customDays) : null,
               scope: propertyId ? 'specific_property' : 'accessible_properties'
             }
           });
@@ -461,6 +463,8 @@ export const getOverdueTenants = async (req, res) => {
             },
             filter: {
               propertyId: propertyId || null,
+              daysOverdue: daysOverdue || null,
+              customDays: customDays ? parseInt(customDays) : null,
               scope: 'no_permission'
             }
           });
@@ -484,9 +488,13 @@ export const getOverdueTenants = async (req, res) => {
               property: true
             }
           },
-          paymentReports: true,
+          paymentReports: {
+            orderBy: { datePaid: 'desc' }
+          },
           serviceCharge: true,
-          incomes: true
+          incomes: {
+            orderBy: { createdAt: 'desc' }
+          }
         },
         orderBy: { fullName: 'asc' }
       });
@@ -494,13 +502,54 @@ export const getOverdueTenants = async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
+    // Helper function to calculate exact overdue days
+    const calculateOverdueDays = (tenant) => {
+      const paymentSummary = getPaymentSummary(tenant);
+      
+      if (!paymentSummary.nextPayment?.isOverdue) {
+        return 0;
+      }
+      
+      // Calculate days based on next due date
+      const nextDueDate = paymentSummary.nextPayment.dueDate;
+      if (nextDueDate) {
+        const dueDateObj = new Date(nextDueDate);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        dueDateObj.setHours(0, 0, 0, 0);
+        
+        const diffTime = today - dueDateObj;
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        return diffDays > 0 ? diffDays : 0;
+      }
+      
+      // Fallback: calculate based on payments behind
+      const paymentsBehind = paymentSummary.nextPayment?.paymentsBehind || 0;
+      const paymentPeriod = tenant.paymentPolicy === 'MONTHLY' ? 30 :
+                           tenant.paymentPolicy === 'QUARTERLY' ? 90 : 365;
+      return paymentsBehind * paymentPeriod;
+    };
+    
+    // Helper function to get human-readable overdue period
+    const getOverduePeriodText = (days) => {
+      if (days <= 0) return 'Not overdue';
+      if (days <= 7) return `${days} day${days !== 1 ? 's' : ''} (1 week)`;
+      if (days <= 14) return `${days} days (2 weeks)`;
+      if (days <= 30) return `${days} days (1 month)`;
+      if (days <= 60) return `${days} days (2 months)`;
+      if (days <= 90) return `${days} days (3 months)`;
+      if (days <= 180) return `${days} days (6 months)`;
+      return `${days} days (Over 6 months)`;
+    };
+    
     // Filter tenants with overdue payments and enhance their data
-    const overdueTenants = tenants
+    let overdueTenants = tenants
       .map(tenant => {
         const rentInfo = calculateEscalatedRent(tenant);
         const monthlyRent = rentInfo.currentRent;
         const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
         const paymentSummary = getPaymentSummary(tenant);
+        const overdueDays = calculateOverdueDays(tenant);
         
         return {
           ...tenant,
@@ -510,12 +559,34 @@ export const getOverdueTenants = async (req, res) => {
             paymentAmount: paymentAmount,
             paymentPolicy: tenant.paymentPolicy
           },
-          paymentSummary
+          paymentSummary,
+          overdueDetails: {
+            daysOverdue: overdueDays,
+            periodText: getOverduePeriodText(overdueDays),
+            category: getOverdueCategory(overdueDays)
+          }
         };
       })
       .filter(tenant => {
         // Only include tenants that are overdue
-        return tenant.paymentSummary.nextPayment?.isOverdue === true;
+        if (!tenant.paymentSummary.nextPayment?.isOverdue) {
+          return false;
+        }
+        
+        // Apply days overdue filter if specified
+        if (daysOverdue) {
+          const overdueDays = tenant.overdueDetails.daysOverdue;
+          
+          if (daysOverdue === 'custom' && customDays) {
+            const customDaysNum = parseInt(customDays);
+            return overdueDays >= customDaysNum;
+          } else {
+            const filterDays = parseInt(daysOverdue);
+            return overdueDays >= filterDays;
+          }
+        }
+        
+        return true;
       });
 
     // Calculate summary statistics
@@ -525,6 +596,25 @@ export const getOverdueTenants = async (req, res) => {
     }, 0);
 
     const totalOverdueTenants = overdueTenants.length;
+    
+    // Calculate overdue days statistics
+    const overdueDaysStats = {
+      min: overdueTenants.length > 0 ? Math.min(...overdueTenants.map(t => t.overdueDetails.daysOverdue)) : 0,
+      max: overdueTenants.length > 0 ? Math.max(...overdueTenants.map(t => t.overdueDetails.daysOverdue)) : 0,
+      average: overdueTenants.length > 0 
+        ? Math.round(overdueTenants.reduce((sum, t) => sum + t.overdueDetails.daysOverdue, 0) / overdueTenants.length)
+        : 0
+    };
+    
+    // Group by overdue categories
+    const overdueCategories = {
+      week1: overdueTenants.filter(t => t.overdueDetails.daysOverdue <= 7).length,
+      week2: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 7 && t.overdueDetails.daysOverdue <= 14).length,
+      month1: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 14 && t.overdueDetails.daysOverdue <= 30).length,
+      month2: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 30 && t.overdueDetails.daysOverdue <= 60).length,
+      month3: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 60 && t.overdueDetails.daysOverdue <= 90).length,
+      more: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 90).length
+    };
 
     res.json({
       success: true,
@@ -534,10 +624,14 @@ export const getOverdueTenants = async (req, res) => {
       summary: {
         totalOverdueTenants,
         totalOverdueAmount,
-        averageOverdueAmount: totalOverdueTenants > 0 ? totalOverdueAmount / totalOverdueTenants : 0
+        averageOverdueAmount: totalOverdueTenants > 0 ? totalOverdueAmount / totalOverdueTenants : 0,
+        overdueDaysStats,
+        overdueCategories
       },
       filter: {
         propertyId: propertyId || null,
+        daysOverdue: daysOverdue || null,
+        customDays: customDays ? parseInt(customDays) : null,
         scope: propertyId ? 'specific_property' : (userRole === 'MANAGER' ? 'managed_properties' : (userRole === 'USER' ? 'accessible_properties' : 'all_properties'))
       }
     });
@@ -547,6 +641,195 @@ export const getOverdueTenants = async (req, res) => {
   }
 };
 
+// Helper function to get overdue category
+function getOverdueCategory(days) {
+  if (days <= 0) return 'NOT_OVERDUE';
+  if (days <= 7) return '1_WEEK';
+  if (days <= 14) return '2_WEEKS';
+  if (days <= 30) return '1_MONTH';
+  if (days <= 60) return '2_MONTHS';
+  if (days <= 90) return '3_MONTHS';
+  return 'OVER_3_MONTHS';
+}
+
+// @desc    Get tenants with their next upcoming payment due date (regardless of time)
+// @route   GET /api/tenants/property/:propertyId/next-payments
+// @access  Private
+export const getNextPaymentsByProperty = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { propertyId } = req.params;
+
+    // Check access to property
+    let hasAccess = false;
+
+    if (userRole === 'ADMIN') {
+      hasAccess = true;
+    } else if (userRole === 'MANAGER') {
+      const property = await prisma.property.findFirst({
+        where: { id: propertyId, managerId: userId }
+      });
+      hasAccess = !!property;
+    } else if (userRole === 'USER') {
+      hasAccess = await checkTenantPermission(userId, userRole, propertyId, 'view');
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ 
+        message: 'Access denied to this property',
+        requiredPermission: 'VIEW_TENANTS'
+      });
+    }
+
+    // Fetch tenants for the property
+    const tenants = await prisma.tenant.findMany({
+      where: {
+        unit: {
+          propertyId: propertyId
+        }
+      },
+      include: {
+        unit: {
+          include: {
+            property: true
+          }
+        },
+        paymentReports: {
+          orderBy: { datePaid: 'desc' }
+        },
+        serviceCharge: true
+      },
+      orderBy: { fullName: 'asc' }
+    });
+
+    // Calculate next payment for each tenant
+    const tenantsWithNextPayment = [];
+    const now = new Date();
+
+    for (const tenant of tenants) {
+      // Calculate rent info with escalation
+      const rentInfo = calculateEscalatedRent(tenant);
+      const monthlyRent = rentInfo.currentRent;
+      const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+      const paymentSummary = getPaymentSummary(tenant);
+      
+      // Get the next due date
+      const nextDueDate = paymentSummary.nextPayment?.dueDate;
+      const isOverdue = paymentSummary.nextPayment?.isOverdue || false;
+      
+      if (nextDueDate) {
+        const dueDateObj = new Date(nextDueDate);
+        
+        // Calculate days until due (negative if overdue)
+        const daysUntilDue = Math.ceil((dueDateObj - now) / (1000 * 60 * 60 * 24));
+        
+        // Calculate service charge for this period
+        let serviceChargeAmount = 0;
+        if (tenant.serviceCharge) {
+          switch (tenant.serviceCharge.type) {
+            case 'FIXED':
+              serviceChargeAmount = tenant.serviceCharge.fixedAmount || 0;
+              break;
+            case 'PERCENTAGE':
+              serviceChargeAmount = (monthlyRent * (tenant.serviceCharge.percentage || 0)) / 100;
+              break;
+            case 'PER_SQ_FT':
+              serviceChargeAmount = (tenant.unit.sizeSqFt || 0) * (tenant.serviceCharge.perSqftRate || 0);
+              break;
+          }
+        }
+        
+        // Calculate VAT if applicable
+        let vatAmount = 0;
+        if (tenant.vatType !== 'NOT_APPLICABLE' && tenant.vatRate > 0) {
+          const subtotal = paymentAmount + serviceChargeAmount;
+          vatAmount = tenant.vatType === 'INCLUSIVE' 
+            ? (subtotal * tenant.vatRate) / (100 + tenant.vatRate)
+            : (subtotal * tenant.vatRate) / 100;
+        }
+        
+        const totalDue = paymentAmount + serviceChargeAmount + vatAmount;
+        
+        tenantsWithNextPayment.push({
+          id: tenant.id,
+          name: tenant.fullName,
+          contact: {
+            email: tenant.email,
+            phone: tenant.contact,
+            kra: tenant.KRAPin
+          },
+          unit: {
+            number: tenant.unit.unitNo,
+            type: tenant.unit.type,
+            size: tenant.unit.sizeSqFt,
+            floor: tenant.unit.floor
+          },
+          payment: {
+            dueDate: paymentSummary.nextPayment.dueDateFormatted,
+            daysUntilDue: daysUntilDue,
+            isOverdue: isOverdue,
+            amount: {
+              rent: paymentAmount,
+              serviceCharge: serviceChargeAmount,
+              vat: vatAmount,
+              total: Math.round(totalDue * 100) / 100
+            },
+            status: paymentSummary.status,
+            policy: tenant.paymentPolicy
+          },
+          rent: {
+            current: monthlyRent,
+            escalation: tenant.escalationRate ? {
+              rate: tenant.escalationRate,
+              frequency: tenant.escalationFrequency,
+              nextDate: rentInfo.nextEscalationDate
+            } : null
+          },
+          history: paymentSummary.paymentHistory.lastPaymentDate ? {
+            lastPayment: paymentSummary.paymentHistory.lastPaymentDateFormatted,
+            paymentsMade: paymentSummary.paymentHistory.paymentsMade
+          } : null
+        });
+      }
+    }
+
+    // Sort by days until due (most urgent first)
+    tenantsWithNextPayment.sort((a, b) => a.payment.daysUntilDue - b.payment.daysUntilDue);
+
+    // Calculate summary statistics
+    const summary = {
+      total: tenantsWithNextPayment.length,
+      overdue: tenantsWithNextPayment.filter(t => t.payment.isOverdue).length,
+      upcoming: tenantsWithNextPayment.filter(t => !t.payment.isOverdue).length,
+      amounts: {
+        outstanding: tenantsWithNextPayment.reduce((sum, t) => 
+          sum + (t.payment.isOverdue ? t.payment.amount.total : 0), 0),
+        upcoming: tenantsWithNextPayment.reduce((sum, t) => 
+          sum + (!t.payment.isOverdue ? t.payment.amount.total : 0), 0)
+      },
+      byPolicy: {
+        MONTHLY: tenantsWithNextPayment.filter(t => t.payment.policy === 'MONTHLY').length,
+        QUARTERLY: tenantsWithNextPayment.filter(t => t.payment.policy === 'QUARTERLY').length,
+        ANNUAL: tenantsWithNextPayment.filter(t => t.payment.policy === 'ANNUAL').length
+      }
+    };
+
+    res.json({
+      success: true,
+      property: {
+        id: propertyId,
+        name: tenants[0]?.unit.property.name || 'Unknown'
+      },
+      summary,
+      payments: tenantsWithNextPayment
+    });
+    
+  } catch (error) {
+    console.error('Get next payments error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
 // @desc    Create tenant
 // @route   POST /api/tenants
 // @access  Private (ADMIN, MANAGER, and USER with CREATE_TENANT permission)

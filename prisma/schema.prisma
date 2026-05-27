@@ -51,6 +51,10 @@ model User {
   propertyAccessGranted PropertyAccess[]           @relation("GrantedByUser")
   rbacAuditLogs         RBACAuditLog[]             @relation("PerformerAudit")
   managedPermissionsBy  ManagedPermission[]        @relation("ManagerPermission")
+
+  // NEW: Employee relations
+  employeesCreated      Employee[]      @relation("EmployeeCreator")
+  salaryPaymentsRecorded SalaryPayment[] @relation("PaymentRecorder")
 }
 
 model Landlord {
@@ -983,4 +987,73 @@ enum LetterType {
 enum ToDoStatus {
   PENDING
   COMPLETED
+}
+
+model Employee {
+  id              String         @id @default(uuid())
+  name            String
+  phoneNumber     String?
+  email           String?        @unique
+  jobTitle        String
+  jobDescription  String?
+  salaryAmount    Float
+  paymentFrequency PaymentFrequency @default(MONTHLY)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  createdById     String
+  status          EmployeeStatus @default(ACTIVE)
+  
+  salaryPayments  SalaryPayment[]
+  
+  createdBy       User           @relation("EmployeeCreator", fields: [createdById], references: [id])
+  
+  @@index([createdById])
+  @@index([status])
+  @@index([jobTitle])
+}
+
+model SalaryPayment {
+  id              String         @id @default(uuid())
+  employeeId      String
+  amount          Float
+  paymentDate     DateTime       @default(now())
+  paymentPeriod   String
+  paymentMethod   PaymentMethod
+  transactionRef  String?
+  notes           String?
+  receiptUrl      String?
+  status          PaymentStatus  @default(PAID)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  recordedById    String
+  
+  employee        Employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  recordedBy      User           @relation("PaymentRecorder", fields: [recordedById], references: [id])
+  
+  @@unique([employeeId, paymentPeriod])
+  @@index([employeeId])
+  @@index([paymentDate])
+  @@index([status])
+  @@index([recordedById])
+}
+
+enum PaymentFrequency {
+  MONTHLY
+  BI_WEEKLY
+  WEEKLY
+  DAILY
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  TERMINATED
+  ON_LEAVE
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  MPESA
+  CHEQUE
 }

@@ -414,61 +414,87 @@ export const createCustomRole = async (req, res) => {
       return res.status(400).json({ error: 'permissionIds array is required' });
     }
     
+    // Remove duplicates
+    const uniquePermissionIds = [...new Set(permissionIds)];
+    const uniquePropertyIds = [...new Set(propertyIds)];
+    
     // Verify manager's properties (outside transaction)
     const managerProperties = await prisma.property.findMany({
-      where: { managerId }
+      where: { managerId },
+      select: { id: true }
     });
-    const managerPropertyIds = managerProperties.map(p => p.id);
+    const managerPropertyIds = new Set(managerProperties.map(p => p.id));
     
-    const invalidProperties = propertyIds.filter(id => !managerPropertyIds.includes(id));
+    const invalidProperties = uniquePropertyIds.filter(id => !managerPropertyIds.has(id));
     if (invalidProperties.length > 0) {
       return res.status(400).json({ 
         error: `You don't manage properties: ${invalidProperties.join(', ')}` 
       });
     }
     
-    // Create role and permissions atomically
-    const role = await prisma.$transaction(async (tx) => {
-      const newRole = await tx.customRole.create({
-        data: {
-          name,
-          description,
-          createdById: managerId,
-          permissions: {
-            create: permissionIds.map(permissionId => ({
-              permission: { connect: { id: permissionId } },
-              grantedBy: { connect: { id: managerId } }
-            }))
-          }
-        },
-        include: {
-          permissions: {
-            include: { permission: true }
-          }
-        }
-      });
-      
-      // Batch property access creation
-      await tx.customRolePropertyAccess.createMany({
-        data: propertyIds.map(propertyId => ({
-          roleId: newRole.id,
-          propertyId,
-          createdBy: managerId
-        }))
-      });
-      
-      return newRole;
-    }, {
-      timeout: 15000 // 15 seconds
+    // Step 1: Create the role
+    const newRole = await prisma.customRole.create({
+      data: {
+        name,
+        description,
+        createdById: managerId
+      }
     });
     
-    // Log audit outside transaction (non-critical)
-    await prisma.rBACAuditLog.create({
+    // Step 2: Create permissions and property access in parallel
+    const operations = [];
+    
+    if (uniquePermissionIds.length > 0) {
+      operations.push(
+        prisma.customRolePermission.createMany({
+          data: uniquePermissionIds.map(permissionId => ({
+            roleId: newRole.id,
+            permissionId,
+            grantedById: managerId
+          })),
+          skipDuplicates: true
+        })
+      );
+    }
+    
+    if (uniquePropertyIds.length > 0) {
+      operations.push(
+        prisma.customRolePropertyAccess.createMany({
+          data: uniquePropertyIds.map(propertyId => ({
+            roleId: newRole.id,
+            propertyId,
+            createdBy: managerId
+          })),
+          skipDuplicates: true
+        })
+      );
+    }
+    
+    // Execute all operations in parallel
+    if (operations.length > 0) {
+      await Promise.all(operations);
+    }
+    
+    // Step 3: Fetch the complete role
+    const completeRole = await prisma.customRole.findUnique({
+      where: { id: newRole.id },
+      include: {
+        permissions: {
+          include: { permission: true }
+        },
+        propertyAccess: {
+          include: { property: true }
+        }
+      }
+    });
+    
+    // Log audit (non-blocking)
+    prisma.rBACAuditLog.create({
       data: {
         action: 'CREATE_CUSTOM_ROLE',
         performedBy: managerId,
-        targetRole: role.id,
-        changes: { name, description, permissionIds, propertyIds }
+        targetRole: newRole.id,
+        changes: { name, description, permissionIds: uniquePermissionIds, propertyIds: uniquePropertyIds }
       }
     }).catch(err => {
       console.error('Audit log failed:', err.message);
@@ -477,7 +503,7 @@ export const createCustomRole = async (req, res) => {
     res.status(201).json({
       success: true,
       message: 'Custom role created successfully',
-      data: role
+      data: completeRole
     });
     
   } catch (error) {
@@ -673,35 +699,27 @@ export const deleteCustomRole = async (req, res) => {
 // MANAGED USER MANAGEMENT
 // ======================================================
 
-// @desc    Create managed user with custom role
+// @desc    Create managed user with custom role (role already has property access)
 // @route   POST /api/rbac/users
 // @access  Private/Manager
 export const createManagedUser = async (req, res) => {
   try {
     const managerId = req.user.id;
-    const { name, email, roleId, propertyIds, expiresAt, canEdit, canExport } = req.body;
+    const { name, email, roleId, expiresAt, canEdit, canExport } = req.body;
     
-    // Verify role belongs to manager
+    // Verify role belongs to manager and get its property access
     const role = await prisma.customRole.findFirst({
       where: { id: roleId, createdById: managerId },
-      include: { propertyAccess: true }
+      include: { 
+        propertyAccess: {
+          where: { isActive: true },
+          select: { propertyId: true }
+        }
+      }
     });
     
     if (!role) {
       return res.status(400).json({ error: 'Invalid role - not created by you' });
-    }
-    
-    // Verify properties belong to manager
-    const managerProperties = await prisma.property.findMany({
-      where: { managerId }
-    });
-    const managerPropertyIds = managerProperties.map(p => p.id);
-    
-    const invalidProperties = propertyIds.filter(id => !managerPropertyIds.includes(id));
-    if (invalidProperties.length > 0) {
-      return res.status(400).json({ 
-        error: `You don't manage properties: ${invalidProperties.join(', ')}` 
-      });
     }
     
     // Check if user already exists
@@ -729,7 +747,7 @@ export const createManagedUser = async (req, res) => {
         }
       });
       
-      // Assign role
+      // Assign role (property access will be inherited from role)
       await tx.userRoleAssignment.create({
         data: {
           userId: user.id,
@@ -740,39 +758,37 @@ export const createManagedUser = async (req, res) => {
         }
       });
       
-      // Grant property access
-      for (const propertyId of propertyIds) {
-        await tx.propertyAccess.create({
-          data: {
-            userId: user.id,
-            propertyId,
-            grantedBy: managerId,
-            isActive: true,
-            canView: true,
-            canEdit: canEdit || false,
-            canExport: canExport || false
-          }
-        });
-      }
+      // NOTE: No direct property access creation needed!
+      // User inherits all property access from their role
+      // The permission checking middleware will look at:
+      // User -> Role -> PropertyAccess (via CustomRolePropertyAccess)
       
       return user;
     }, {
       timeout: 15000
     });
     
-    // Log audit OUTSIDE transaction (non-critical)
+    // Log audit OUTSIDE transaction
+    const rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
+    
     await prisma.rBACAuditLog.create({
       data: {
         action: 'CREATE_MANAGED_USER',
         performedBy: managerId,
         targetUser: newUser.id,
-        changes: { name, email, roleId, propertyIds, expiresAt }
+        changes: { 
+          name, 
+          email, 
+          roleId, 
+          inheritedProperties: rolePropertyIds,
+          expiresAt 
+        }
       }
     }).catch(err => {
       console.error('Audit log failed:', err.message);
     });
     
-    // Send welcome email OUTSIDE transaction (non-critical)
+    // Send welcome email
     const manager = await prisma.user.findUnique({
       where: { id: managerId },
       select: { name: true }
@@ -789,7 +805,7 @@ export const createManagedUser = async (req, res) => {
       console.error('Welcome email failed:', err.message);
     });
     
-    // Invalidate cache for the new user (though they don't have cache yet, good practice)
+    // Invalidate cache
     await invalidateUserCaches([newUser.id]);
     
     res.status(201).json({
@@ -798,11 +814,17 @@ export const createManagedUser = async (req, res) => {
       data: {
         id: newUser.id,
         name: newUser.name,
-        email: newUser.email
+        email: newUser.email,
+        role: {
+          id: role.id,
+          name: role.name,
+          propertyAccessCount: rolePropertyIds.length
+        }
       },
       temporaryPassword: tempPassword
     });
   } catch (error) {
+    console.error('Create managed user error:', error);
     res.status(400).json({ message: error.message });
   }
 };
@@ -824,7 +846,15 @@ export const getManagedUsers = async (req, res) => {
           where: { isActive: true },
           include: {
             role: {
-              select: { id: true, name: true, description: true }
+              include: {
+                propertyAccess: {  // Include role's property access
+                  where: { isActive: true },
+                  include: { property: true }
+                },
+                permissions: {  // Include role's permissions
+                  include: { permission: true }
+                }
+              }
             }
           }
         },
@@ -842,14 +872,14 @@ export const getManagedUsers = async (req, res) => {
   }
 };
 
-// @desc    Update managed user access
+// @desc    Update managed user access (role-based, properties inherited from role)
 // @route   PUT /api/rbac/users/:userId/access
 // @access  Private/Manager
 export const updateManagedUserAccess = async (req, res) => {
   try {
     const managerId = req.user.id;
     const { userId } = req.params;
-    const { roleId, propertyIds, canEdit, canExport, expiresAt, isActive } = req.body;
+    const { roleId, expiresAt, isActive } = req.body;
     
     // Verify user belongs to manager
     const user = await prisma.user.findFirst({
@@ -857,6 +887,12 @@ export const updateManagedUserAccess = async (req, res) => {
         id: userId,
         createdByManagerId: managerId,
         isManagedUser: true
+      },
+      include: {
+        userAssignments: {
+          where: { isActive: true },
+          select: { roleId: true }
+        }
       }
     });
     
@@ -864,34 +900,37 @@ export const updateManagedUserAccess = async (req, res) => {
       return res.status(404).json({ error: 'User not found or not managed by you' });
     }
     
-    // Pre-fetch role validation outside transaction
+    // Validate new role if provided
     let role = null;
+    let rolePropertyIds = [];
+    
     if (roleId) {
       role = await prisma.customRole.findFirst({
-        where: { id: roleId, createdById: managerId }
+        where: { id: roleId, createdById: managerId },
+        include: {
+          propertyAccess: {
+            where: { isActive: true },
+            select: { propertyId: true }
+          }
+        }
       });
+      
       if (!role) {
         return res.status(400).json({ error: 'Invalid role - not created by you' });
       }
+      
+      rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
     }
     
-    // Pre-fetch existing assignments outside transaction
-    const existingRoleAssignment = roleId ? await prisma.userRoleAssignment.findUnique({
-      where: { userId_roleId: { userId, roleId } }
-    }) : null;
+    const currentRoleId = user.userAssignments[0]?.roleId;
+    const changes = { 
+      oldRoleId: currentRoleId,
+      newRoleId: roleId, 
+      expiresAt, 
+      isActive 
+    };
     
-    // Pre-fetch existing property access outside transaction
-    let existingPropertyAccesses = [];
-    if (propertyIds && propertyIds.length > 0) {
-      existingPropertyAccesses = await prisma.propertyAccess.findMany({
-        where: { userId, propertyId: { in: propertyIds } }
-      });
-    }
-    
-    // Build changes for audit log
-    const changes = { roleId, propertyIds, canEdit, canExport, expiresAt, isActive };
-    
-    // Execute only critical DB writes in transaction
+    // Execute transaction - only role assignment updates
     await prisma.$transaction(async (tx) => {
       // Update role assignment
       if (roleId) {
@@ -901,9 +940,15 @@ export const updateManagedUserAccess = async (req, res) => {
           data: { isActive: false }
         });
         
-        if (existingRoleAssignment) {
+        // Check if assignment already exists (including inactive)
+        const existingAssignment = await tx.userRoleAssignment.findUnique({
+          where: { userId_roleId: { userId, roleId } }
+        });
+        
+        if (existingAssignment) {
+          // Reactivate existing assignment
           await tx.userRoleAssignment.update({
-            where: { id: existingRoleAssignment.id },
+            where: { id: existingAssignment.id },
             data: {
               isActive: true,
               assignedBy: managerId,
@@ -912,6 +957,7 @@ export const updateManagedUserAccess = async (req, res) => {
             }
           });
         } else {
+          // Create new assignment
           await tx.userRoleAssignment.create({
             data: {
               userId,
@@ -922,78 +968,61 @@ export const updateManagedUserAccess = async (req, res) => {
             }
           });
         }
-      }
-      
-      // Update property access
-      if (propertyIds) {
-        // Deactivate all current property access
-        await tx.propertyAccess.updateMany({
-          where: { userId },
-          data: { isActive: false }
+      } else if (expiresAt !== undefined) {
+        // Update expiry on current active role
+        await tx.userRoleAssignment.updateMany({
+          where: { userId, isActive: true },
+          data: { expiresAt: expiresAt ? new Date(expiresAt) : null }
         });
-        
-        const existingAccessMap = new Map(
-          existingPropertyAccesses.map(a => [a.propertyId, a])
-        );
-        
-        for (const propertyId of propertyIds) {
-          const existing = existingAccessMap.get(propertyId);
-          
-          if (existing) {
-            await tx.propertyAccess.update({
-              where: { id: existing.id },
-              data: {
-                isActive: true,
-                canView: true,
-                canEdit: canEdit || false,
-                canExport: canExport || false,
-                grantedBy: managerId,
-                grantedAt: new Date()
-              }
-            });
-          } else {
-            await tx.propertyAccess.create({
-              data: {
-                userId,
-                propertyId,
-                grantedBy: managerId,
-                isActive: true,
-                canView: true,
-                canEdit: canEdit || false,
-                canExport: canExport || false
-              }
-            });
-          }
-        }
       }
       
-      // Update user status
+      // Update user login status
       if (isActive !== undefined) {
         await tx.user.update({
           where: { id: userId },
           data: { canManagerLogin: isActive }
         });
       }
+      
+      // NOTE: No direct property access management!
+      // Property access is always inherited from the assigned role
+      // If you need to grant additional properties beyond the role,
+      // use the grantAdditionalPropertyAccess endpoint
     }, {
-      timeout: 15000 // 15 seconds for the critical writes
+      timeout: 15000
     });
     
-    // Log audit OUTSIDE transaction (non-critical)
+    // Log audit
     await prisma.rBACAuditLog.create({
       data: {
         action: 'UPDATE_MANAGED_USER_ACCESS',
         performedBy: managerId,
         targetUser: userId,
-        changes
+        changes: {
+          ...changes,
+          inheritedProperties: rolePropertyIds,
+          note: 'Property access is inherited from role'
+        }
       }
     }).catch(err => {
       console.error('Audit log failed:', err.message);
     });
     
-    // Invalidate cache OUTSIDE transaction
+    // Invalidate cache
     await invalidateUserCaches([userId]);
     
-    res.json({ success: true, message: 'User access updated successfully' });
+    res.json({ 
+      success: true, 
+      message: roleId 
+        ? `User role updated to "${role?.name}" with ${rolePropertyIds.length} property(ies) inherited`
+        : 'User access updated successfully',
+      data: roleId ? {
+        roleId,
+        roleName: role?.name,
+        inheritedPropertyCount: rolePropertyIds.length
+      } : null
+    });
+    
   } catch (error) {
     console.error('Update managed user access error:', error);
     res.status(400).json({ message: error.message });

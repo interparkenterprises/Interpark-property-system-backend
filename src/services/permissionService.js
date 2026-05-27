@@ -52,6 +52,14 @@ class PermissionService {
         delete: 'DELETE_BILLS',
         recordMeterReading: 'RECORD_METER_READINGS'
       },
+      // Bill Invoice permissions (add this new section)
+      billInvoice: {
+        view: 'VIEW_BILL_INVOICES',
+        create: 'CREATE_BILL_INVOICE',
+        edit: 'EDIT_BILL_INVOICE_PAYMENT',
+        delete: 'DELETE_BILL_INVOICE',
+        download: 'DOWNLOAD_BILL_INVOICE'
+      },
       // Maintenance permissions
       maintenance: {
         view: 'VIEW_MAINTENANCE_REQUESTS',

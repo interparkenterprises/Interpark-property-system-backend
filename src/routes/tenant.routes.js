@@ -3,6 +3,7 @@ import {
   getTenants,
   getTenant,
   getOverdueTenants,
+  getNextPaymentsByProperty,
   getTenantsByProperty,
   createTenant,
   updateTenant,
@@ -26,6 +27,9 @@ router.route('/')
 router.route('/property/:propertyId')
   .get(authorize('ADMIN', 'MANAGER', 'USER'), getTenantsByProperty);
   
+router.route('/property/:propertyId/next-payments')
+  .get(authorize('ADMIN', 'MANAGER', 'USER'), getNextPaymentsByProperty);
+
 router.route('/overdue')
   .get(authorize('ADMIN', 'MANAGER', 'USER'), getOverdueTenants);
 

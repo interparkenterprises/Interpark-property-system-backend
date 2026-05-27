@@ -50,19 +50,8 @@ const checkBillInvoicePermission = async (userId, userRole, propertyId, operatio
   }
   
   if (userRole === 'USER') {
-    // Map operation to permission code
-    const permissionMap = {
-      view: 'VIEW_BILL_INVOICES',
-      create: 'CREATE_BILL_INVOICE',
-      edit: 'EDIT_BILL_INVOICE_PAYMENT',
-      delete: 'DELETE_BILL_INVOICE',
-      download: 'DOWNLOAD_BILL_INVOICE'
-    };
-    
-    const permissionCode = permissionMap[operation];
-    if (!permissionCode) return false;
-    
-    return await permissionService.hasPermission(userId, permissionCode, propertyId);
+    // Use the centralized permission service
+    return await permissionService.checkPermission(userId, 'billInvoice', operation, propertyId);
   }
   
   return false;
