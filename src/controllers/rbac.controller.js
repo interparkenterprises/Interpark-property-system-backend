@@ -705,34 +705,41 @@ export const deleteCustomRole = async (req, res) => {
 export const createManagedUser = async (req, res) => {
   try {
     const managerId = req.user.id;
-    const { name, email, roleId, expiresAt, canEdit, canExport } = req.body;
-    
-    // Verify role belongs to manager and get its property access
-    const role = await prisma.customRole.findFirst({
-      where: { id: roleId, createdById: managerId },
-      include: { 
-        propertyAccess: {
-          where: { isActive: true },
-          select: { propertyId: true }
+    const { name, email, roleId, expiresAt } = req.body;
+
+    // OPTIMIZATION 1: Run parallel queries
+    const [role, existingUser] = await Promise.all([
+      prisma.customRole.findFirst({
+        where: { id: roleId, createdById: managerId },
+        select: {  // Use select instead of include for better performance
+          id: true,
+          name: true,
+          propertyAccess: {
+            where: { isActive: true },
+            select: { propertyId: true },
+            take: 1000  // Limit if many properties
+          }
         }
-      }
-    });
-    
+      }),
+      prisma.user.findUnique({ 
+        where: { email },
+        select: { id: true }  // Only fetch what we need
+      })
+    ]);
+
     if (!role) {
       return res.status(400).json({ error: 'Invalid role - not created by you' });
     }
-    
-    // Check if user already exists
-    const existingUser = await prisma.user.findUnique({ where: { email } });
+
     if (existingUser) {
       return res.status(400).json({ error: 'User with this email already exists' });
     }
-    
-    // Generate temporary password
+
     const tempPassword = generateSecurePassword();
     const hashedPassword = await hashPassword(tempPassword);
-    
-    // Create user with transaction
+    const rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
+
+    // OPTIMIZATION 2: Even lighter transaction
     const newUser = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
@@ -744,10 +751,10 @@ export const createManagedUser = async (req, res) => {
           isManagedUser: true,
           createdByManagerId: managerId,
           canManagerLogin: true
-        }
+        },
+        select: { id: true, name: true, email: true }  // Only return what's needed
       });
-      
-      // Assign role (property access will be inherited from role)
+
       await tx.userRoleAssignment.create({
         data: {
           userId: user.id,
@@ -757,57 +764,11 @@ export const createManagedUser = async (req, res) => {
           expiresAt: expiresAt ? new Date(expiresAt) : null
         }
       });
-      
-      // NOTE: No direct property access creation needed!
-      // User inherits all property access from their role
-      // The permission checking middleware will look at:
-      // User -> Role -> PropertyAccess (via CustomRolePropertyAccess)
-      
+
       return user;
-    }, {
-      timeout: 15000
     });
-    
-    // Log audit OUTSIDE transaction
-    const rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
-    
-    await prisma.rBACAuditLog.create({
-      data: {
-        action: 'CREATE_MANAGED_USER',
-        performedBy: managerId,
-        targetUser: newUser.id,
-        changes: { 
-          name, 
-          email, 
-          roleId, 
-          inheritedProperties: rolePropertyIds,
-          expiresAt 
-        }
-      }
-    }).catch(err => {
-      console.error('Audit log failed:', err.message);
-    });
-    
-    // Send welcome email
-    const manager = await prisma.user.findUnique({
-      where: { id: managerId },
-      select: { name: true }
-    });
-    
-    await sendWelcomeEmail({
-      email: newUser.email,
-      name: newUser.name,
-      temporaryPassword: tempPassword,
-      role: role.name,
-      loginUrl: `${process.env.FRONTEND_URL}/login` || 'http://localhost:3000/login',
-      createdBy: manager?.name || 'Manager'
-    }).catch(err => {
-      console.error('Welcome email failed:', err.message);
-    });
-    
-    // Invalidate cache
-    await invalidateUserCaches([newUser.id]);
-    
+
+    //  IMMEDIATE RESPONSE
     res.status(201).json({
       success: true,
       message: 'User created successfully',
@@ -823,9 +784,61 @@ export const createManagedUser = async (req, res) => {
       },
       temporaryPassword: tempPassword
     });
+
+    // 🚀 BACKGROUND TASKS - Use Promise.all for better async handling
+    const backgroundTasks = async () => {
+      // Run all background tasks in parallel
+      await Promise.allSettled([
+        // Audit log
+        prisma.rBACAuditLog.create({
+          data: {
+            action: 'CREATE_MANAGED_USER',
+            performedBy: managerId,
+            targetUser: newUser.id,
+            changes: {
+              name,
+              email,
+              roleId,
+              inheritedProperties: rolePropertyIds,
+              expiresAt
+            }
+          }
+        }).catch(err => console.error('Audit log failed:', err.message)),
+        
+        // Welcome email (get manager info first)
+        (async () => {
+          const manager = await prisma.user.findUnique({
+            where: { id: managerId },
+            select: { name: true }
+          });
+          return sendWelcomeEmail({
+            email: newUser.email,
+            name: newUser.name,
+            temporaryPassword: tempPassword,
+            role: role.name,
+            loginUrl: `${process.env.FRONTEND_URL}/login` || 'http://localhost:3000/login',
+            createdBy: manager?.name || 'Manager'
+          }).catch(err => console.error('Welcome email failed:', err.message));
+        })(),
+        
+        // Cache invalidation
+        invalidateUserCaches([newUser.id]).catch(err => 
+          console.error('Cache invalidation failed:', err.message)
+        )
+      ]);
+    };
+
+    // Use setImmediate or queueMicrotask for even faster response
+    queueMicrotask(() => backgroundTasks());
+    // or keep setImmediate
+    // setImmediate(() => backgroundTasks());
+
   } catch (error) {
     console.error('Create managed user error:', error);
-    res.status(400).json({ message: error.message });
+    // Make sure to only send response if headers haven't been sent
+    if (!res.headersSent) {
+      res.status(400).json({ message: error.message });
+    }
   }
 };
 
