@@ -711,19 +711,19 @@ export const createManagedUser = async (req, res) => {
     const [role, existingUser] = await Promise.all([
       prisma.customRole.findFirst({
         where: { id: roleId, createdById: managerId },
-        select: {  // Use select instead of include for better performance
+        select: {
           id: true,
           name: true,
           propertyAccess: {
             where: { isActive: true },
             select: { propertyId: true },
-            take: 1000  // Limit if many properties
+            take: 1000
           }
         }
       }),
       prisma.user.findUnique({ 
         where: { email },
-        select: { id: true }  // Only fetch what we need
+        select: { id: true }
       })
     ]);
 
@@ -739,7 +739,7 @@ export const createManagedUser = async (req, res) => {
     const hashedPassword = await hashPassword(tempPassword);
     const rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
 
-    // OPTIMIZATION 2: Even lighter transaction
+    // OPTIMIZATION 2: Lighter transaction
     const newUser = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
@@ -752,7 +752,7 @@ export const createManagedUser = async (req, res) => {
           createdByManagerId: managerId,
           canManagerLogin: true
         },
-        select: { id: true, name: true, email: true }  // Only return what's needed
+        select: { id: true, name: true, email: true }
       });
 
       await tx.userRoleAssignment.create({
@@ -768,7 +768,7 @@ export const createManagedUser = async (req, res) => {
       return user;
     });
 
-    //  IMMEDIATE RESPONSE
+    // IMMEDIATE RESPONSE
     res.status(201).json({
       success: true,
       message: 'User created successfully',
@@ -785,8 +785,27 @@ export const createManagedUser = async (req, res) => {
       temporaryPassword: tempPassword
     });
 
-    // 🚀 BACKGROUND TASKS - Use Promise.all for better async handling
+    // 🚀 BACKGROUND TASKS - Optimized for Resend
     const backgroundTasks = async () => {
+      // Get manager info once (reused across tasks)
+      const manager = await prisma.user.findUnique({
+        where: { id: managerId },
+        select: { name: true }
+      }).catch(err => {
+        console.error('Failed to fetch manager:', err.message);
+        return { name: 'Manager' };
+      });
+
+      // Prepare email data
+      const emailData = {
+        email: newUser.email,
+        name: newUser.name,
+        temporaryPassword: tempPassword,
+        role: role.name,
+        loginUrl: `${process.env.FRONTEND_URL}/login`,
+        createdBy: manager?.name || 'Manager'
+      };
+
       // Run all background tasks in parallel
       await Promise.allSettled([
         // Audit log
@@ -805,21 +824,10 @@ export const createManagedUser = async (req, res) => {
           }
         }).catch(err => console.error('Audit log failed:', err.message)),
         
-        // Welcome email (get manager info first)
-        (async () => {
-          const manager = await prisma.user.findUnique({
-            where: { id: managerId },
-            select: { name: true }
-          });
-          return sendWelcomeEmail({
-            email: newUser.email,
-            name: newUser.name,
-            temporaryPassword: tempPassword,
-            role: role.name,
-            loginUrl: `${process.env.FRONTEND_URL}/login` || 'http://localhost:3000/login',
-            createdBy: manager?.name || 'Manager'
-          }).catch(err => console.error('Welcome email failed:', err.message));
-        })(),
+        // Welcome email with Resend (faster and more reliable)
+        sendWelcomeEmail(emailData).catch(err => 
+          console.error('Welcome email failed:', err.message)
+        ),
         
         // Cache invalidation
         invalidateUserCaches([newUser.id]).catch(err => 
@@ -828,14 +836,11 @@ export const createManagedUser = async (req, res) => {
       ]);
     };
 
-    // Use setImmediate or queueMicrotask for even faster response
+    // Use queueMicrotask for faster response
     queueMicrotask(() => backgroundTasks());
-    // or keep setImmediate
-    // setImmediate(() => backgroundTasks());
 
   } catch (error) {
     console.error('Create managed user error:', error);
-    // Make sure to only send response if headers haven't been sent
     if (!res.headersSent) {
       res.status(400).json({ message: error.message });
     }

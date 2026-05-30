@@ -31,7 +31,8 @@
     "nodemailer": "^8.0.5",
     "pdfkit": "^0.17.2",
     "pg": "^8.17.2",
-    "puppeteer": "^24.33.0"
+    "puppeteer": "^24.33.0",
+    "resend": "^6.12.4"
   },
   "devDependencies": {
     "@types/pg": "^8.16.0",
