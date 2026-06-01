@@ -2,6 +2,8 @@ import express from 'express';
 import {
   getPaymentReports,
   getPaymentsByTenant,
+  getPropertyBillsPaymentReport,
+  getPropertyRentPaymentReport,
   createPaymentReport,
   getIncomeReports,
   createIncome,
@@ -26,6 +28,8 @@ router.route('/')
 
 router.get('/tenant/:tenantId', getPaymentsByTenant);
 router.get('/outstanding/:tenantId', getOutstandingInvoices);
+router.get('/property/:propertyId/bills', getPropertyBillsPaymentReport);
+router.get('/property/:propertyId/rent', getPropertyRentPaymentReport);
 
 // Preview expected charges (useful for frontend before submitting)
 router.get('/preview/:tenantId', authorize('ADMIN', 'MANAGER'), previewPayment);

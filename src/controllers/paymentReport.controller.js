@@ -354,6 +354,626 @@ export const getPaymentsByTenant = async (req, res) => {
   }
 };
 
+// @desc    Get payment report for a whole property (Rent only)
+// @route   GET /api/payments/property/:propertyId/rent-report
+// @access  Private
+export const getPropertyRentPaymentReport = async (req, res) => {
+  try {
+    const { propertyId } = req.params;
+    const { 
+      dateFrom, 
+      dateTo,
+      status,
+      page = 1,
+      limit = 50
+    } = req.query;
+
+    const { skip, limit: take } = getPaginationParams({ page, limit });
+
+    // Validate property exists
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { id: true, name: true, address: true }
+    });
+
+    if (!property) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+
+    // Build where clause for payment reports
+    const where = {
+      tenant: {
+        unit: {
+          propertyId: propertyId
+        }
+      }
+    };
+
+    // Filter by payment status
+    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'PREPAID', 'CREDIT'].includes(status)) {
+      where.status = status;
+    }
+
+    // Filter by date range
+    if (dateFrom || dateTo) {
+      where.paymentPeriod = {};
+      if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
+      if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
+    }
+
+    // Get all tenants in this property for summary
+    const tenants = await prisma.tenant.findMany({
+      where: {
+        unit: {
+          propertyId: propertyId
+        }
+      },
+      include: {
+        unit: {
+          select: {
+            id: true,
+            type: true,
+            unitNo: true,
+            floor: true,
+            sizeSqFt: true
+          }
+        },
+        paymentReports: {
+          where: {
+            status: { notIn: ['CREDIT', 'PREPAID'] }
+          },
+          select: {
+            amountPaid: true,
+            totalDue: true,
+            arrears: true,
+            status: true,
+            paymentPeriod: true
+          }
+        }
+      }
+    });
+
+    // Get paginated payment reports
+    const total = await prisma.paymentReport.count({ where });
+
+    const paymentReports = await prisma.paymentReport.findMany({
+      where,
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            email: true,
+            vatType: true,
+            paymentPolicy: true,
+            rent: true,
+            unit: {
+              select: {
+                id: true,
+                type: true,
+                unitNo: true,
+                floor: true,
+                sizeSqFt: true
+              }
+            }
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            balance: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
+          }
+        }
+      },
+      orderBy: { paymentPeriod: 'desc' },
+      skip,
+      take: parseInt(take)
+    });
+
+    // Calculate property-wide summaries
+    let totalRentCollected = 0;
+    let totalRentExpected = 0;
+    let totalArrears = 0;
+    let totalOverdueCount = 0;
+    let fullyPaidCount = 0;
+    let partialPaidCount = 0;
+    let unpaidCount = 0;
+
+    // Process all tenants for summary
+    for (const tenant of tenants) {
+      const tenantReports = tenant.paymentReports;
+      
+      // Calculate total paid for this tenant
+      const tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
+      const tenantExpected = tenantReports.reduce((sum, report) => sum + report.totalDue, 0);
+      const tenantArrears = tenantReports.reduce((sum, report) => sum + report.arrears, 0);
+      
+      totalRentCollected += tenantPaid;
+      totalRentExpected += tenantExpected;
+      totalArrears += tenantArrears;
+      
+      // Count payment statuses
+      const latestReport = tenantReports[0];
+      if (latestReport) {
+        if (latestReport.status === 'PAID') fullyPaidCount++;
+        else if (latestReport.status === 'PARTIAL') partialPaidCount++;
+        else if (latestReport.status === 'UNPAID') unpaidCount++;
+      }
+      
+      // Check for overdue payments
+      const hasOverdue = tenantReports.some(report => 
+        report.status === 'UNPAID' && new Date(report.paymentPeriod) < new Date()
+      );
+      if (hasOverdue) totalOverdueCount++;
+    }
+
+    // Calculate collection rate
+    const collectionRate = totalRentExpected > 0 
+      ? (totalRentCollected / totalRentExpected) * 100 
+      : 0;
+
+    // Group by month for trend analysis
+    const monthlyTrends = {};
+    paymentReports.forEach(report => {
+      const monthKey = new Date(report.paymentPeriod).toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short' 
+      });
+      
+      if (!monthlyTrends[monthKey]) {
+        monthlyTrends[monthKey] = {
+          month: monthKey,
+          expected: 0,
+          collected: 0,
+          arrears: 0,
+          reportCount: 0
+        };
+      }
+      
+      monthlyTrends[monthKey].expected += report.totalDue;
+      monthlyTrends[monthKey].collected += report.amountPaid;
+      monthlyTrends[monthKey].arrears += report.arrears;
+      monthlyTrends[monthKey].reportCount++;
+    });
+
+    // Calculate outstanding balances per tenant
+    const tenantOutstanding = tenants.map(tenant => {
+      const totalDue = tenant.paymentReports.reduce((sum, r) => sum + r.totalDue, 0);
+      const totalPaid = tenant.paymentReports.reduce((sum, r) => sum + r.amountPaid, 0);
+      const tenantArrears = tenant.paymentReports.reduce((sum, r) => sum + r.arrears, 0);
+      
+      return {
+        tenantId: tenant.id,
+        tenantName: tenant.fullName,
+        unitNo: tenant.unit?.unitNo || 'N/A',
+        unitType: tenant.unit?.type || 'N/A',
+        expectedTotal: totalDue,
+        paidTotal: totalPaid,
+        outstandingBalance: totalDue - totalPaid,
+        arrears: tenantArrears,
+        lastPaymentDate: tenant.paymentReports[0]?.paymentPeriod || null,
+        paymentStatus: tenant.paymentReports[0]?.status || 'UNPAID'
+      };
+    }).filter(t => t.outstandingBalance > 0 || t.arrears > 0);
+
+    res.json({
+      success: true,
+      data: {
+        property: {
+          id: property.id,
+          name: property.name,
+          address: property.address
+        },
+        summary: {
+          totalTenants: tenants.length,
+          totalRentCollected,
+          totalRentExpected,
+          totalArrears,
+          collectionRate: parseFloat(collectionRate.toFixed(2)),
+          collectionRateStatus: collectionRate >= 90 ? 'EXCELLENT' : collectionRate >= 75 ? 'GOOD' : collectionRate >= 50 ? 'AVERAGE' : 'POOR',
+          paymentBreakdown: {
+            fullyPaid: fullyPaidCount,
+            partiallyPaid: partialPaidCount,
+            unpaid: unpaidCount,
+            overdue: totalOverdueCount
+          }
+        },
+        monthlyTrends: Object.values(monthlyTrends),
+        tenantOutstanding,
+        paymentReports: paymentReports.map(report => ({
+          id: report.id,
+          tenantName: report.tenant.fullName,
+          unitNo: report.tenant.unit?.unitNo || 'N/A',
+          paymentPeriod: report.paymentPeriod,
+          expectedAmount: report.totalDue,
+          amountPaid: report.amountPaid,
+          arrears: report.arrears,
+          status: report.status,
+          invoiceCount: report.invoices.length,
+          datePaid: report.datePaid
+        })),
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(take),
+          total,
+          totalPages: Math.ceil(total / take)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property rent payment report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate property rent payment report',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Get payment report for a whole property (Bills - Water & Electricity)
+// @route   GET /api/payments/property/:propertyId/bills-report
+// @access  Private
+export const getPropertyBillsPaymentReport = async (req, res) => {
+  try {
+    const { propertyId } = req.params;
+    const { 
+      dateFrom, 
+      dateTo,
+      billType,
+      status,
+      page = 1,
+      limit = 50
+    } = req.query;
+
+    const { skip, limit: take } = getPaginationParams({ page, limit });
+
+    // Validate property exists
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { id: true, name: true, address: true }
+    });
+
+    if (!property) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+
+    // Build where clause for bill invoices
+    const where = {
+      tenant: {
+        unit: {
+          propertyId: propertyId
+        }
+      }
+    };
+
+    // Filter by bill type (Water or Electricity)
+    if (billType && ['WATER', 'ELECTRICITY'].includes(billType.toUpperCase())) {
+      where.billType = billType.toUpperCase();
+    }
+
+    // Filter by status
+    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'OVERDUE', 'CANCELLED'].includes(status)) {
+      where.status = status;
+    }
+
+    // Filter by date range - using issueDate
+    if (dateFrom || dateTo) {
+      where.issueDate = {};
+      if (dateFrom) where.issueDate.gte = new Date(dateFrom);
+      if (dateTo) where.issueDate.lte = new Date(dateTo);
+    }
+
+    // Get all tenants in this property with their bill invoices
+    const tenants = await prisma.tenant.findMany({
+      where: {
+        unit: {
+          propertyId: propertyId
+        }
+      },
+      include: {
+        unit: {
+          select: {
+            id: true,
+            type: true,
+            unitNo: true,
+            floor: true,
+            sizeSqFt: true
+          }
+        },
+        billInvoices: {
+          where: {
+            ...(billType ? { billType: billType.toUpperCase() } : {}),
+            ...(status ? { status } : {}),
+            ...(dateFrom || dateTo ? {
+              issueDate: {
+                ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
+                ...(dateTo ? { lte: new Date(dateTo) } : {})
+              }
+            } : {})
+          },
+          orderBy: { issueDate: 'desc' }
+          // Removed the 'items' include since it doesn't exist in the schema
+        }
+      }
+    });
+
+    // Get paginated bill invoices
+    const total = await prisma.billInvoice.count({ where });
+
+    const billInvoices = await prisma.billInvoice.findMany({
+      where,
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            email: true,
+            unit: {
+              select: {
+                id: true,
+                type: true,
+                unitNo: true,
+                floor: true
+              }
+            }
+          }
+        }
+        // Removed the 'items' include since it doesn't exist in the schema
+      },
+      orderBy: { issueDate: 'desc' },
+      skip,
+      take: parseInt(take)
+    });
+
+    // Calculate summaries
+    let totalWaterBills = 0;
+    let totalWaterCollected = 0;
+    let totalWaterArrears = 0;
+    let totalElectricityBills = 0;
+    let totalElectricityCollected = 0;
+    let totalElectricityArrears = 0;
+    let totalBillsExpected = 0;
+    let totalBillsCollected = 0;
+    let totalBillsArrears = 0;
+
+    // Track paid/unpaid counts
+    let paidBillsCount = 0;
+    let partialBillsCount = 0;
+    let unpaidBillsCount = 0;
+    let overdueBillsCount = 0;
+
+    // Process all bill invoices
+    for (const tenant of tenants) {
+      for (const invoice of tenant.billInvoices) {
+        const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
+        const amountPaid = invoice.amountPaid || 0;
+        const balance = invoice.balance || (grandTotal - amountPaid);
+        
+        if (invoice.billType === 'WATER') {
+          totalWaterBills += grandTotal;
+          totalWaterCollected += amountPaid;
+          totalWaterArrears += balance;
+        } else if (invoice.billType === 'ELECTRICITY') {
+          totalElectricityBills += grandTotal;
+          totalElectricityCollected += amountPaid;
+          totalElectricityArrears += balance;
+        }
+        
+        totalBillsExpected += grandTotal;
+        totalBillsCollected += amountPaid;
+        totalBillsArrears += balance;
+        
+        // Count by status
+        if (invoice.status === 'PAID') paidBillsCount++;
+        else if (invoice.status === 'PARTIAL') partialBillsCount++;
+        else if (invoice.status === 'UNPAID') unpaidBillsCount++;
+        else if (invoice.status === 'OVERDUE') overdueBillsCount++;
+      }
+    }
+
+    // Calculate collection rates
+    const waterCollectionRate = totalWaterBills > 0 ? (totalWaterCollected / totalWaterBills) * 100 : 0;
+    const electricityCollectionRate = totalElectricityBills > 0 ? (totalElectricityCollected / totalElectricityBills) * 100 : 0;
+    const overallCollectionRate = totalBillsExpected > 0 ? (totalBillsCollected / totalBillsExpected) * 100 : 0;
+
+    // Group by bill type and month for trends - using issueDate
+    const monthlyTrends = {};
+    billInvoices.forEach(invoice => {
+      const monthKey = new Date(invoice.issueDate).toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short' 
+      });
+      const billType = invoice.billType;
+      
+      if (!monthlyTrends[monthKey]) {
+        monthlyTrends[monthKey] = {
+          month: monthKey,
+          water: { expected: 0, collected: 0, arrears: 0 },
+          electricity: { expected: 0, collected: 0, arrears: 0 },
+          total: { expected: 0, collected: 0, arrears: 0 }
+        };
+      }
+      
+      const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
+      const amountPaid = invoice.amountPaid || 0;
+      const balance = invoice.balance || (grandTotal - amountPaid);
+      
+      if (billType === 'WATER') {
+        monthlyTrends[monthKey].water.expected += grandTotal;
+        monthlyTrends[monthKey].water.collected += amountPaid;
+        monthlyTrends[monthKey].water.arrears += balance;
+      } else if (billType === 'ELECTRICITY') {
+        monthlyTrends[monthKey].electricity.expected += grandTotal;
+        monthlyTrends[monthKey].electricity.collected += amountPaid;
+        monthlyTrends[monthKey].electricity.arrears += balance;
+      }
+      
+      monthlyTrends[monthKey].total.expected += grandTotal;
+      monthlyTrends[monthKey].total.collected += amountPaid;
+      monthlyTrends[monthKey].total.arrears += balance;
+    });
+
+    // Calculate tenant-wise bill summary
+    const tenantBillSummary = tenants.map(tenant => {
+      let waterTotal = 0, waterPaid = 0, waterBalance = 0;
+      let electricityTotal = 0, electricityPaid = 0, electricityBalance = 0;
+      
+      tenant.billInvoices.forEach(invoice => {
+        const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
+        const amountPaid = invoice.amountPaid || 0;
+        const balance = invoice.balance || (grandTotal - amountPaid);
+        
+        if (invoice.billType === 'WATER') {
+          waterTotal += grandTotal;
+          waterPaid += amountPaid;
+          waterBalance += balance;
+        } else if (invoice.billType === 'ELECTRICITY') {
+          electricityTotal += grandTotal;
+          electricityPaid += amountPaid;
+          electricityBalance += balance;
+        }
+      });
+      
+      return {
+        tenantId: tenant.id,
+        tenantName: tenant.fullName,
+        unitNo: tenant.unit?.unitNo || 'N/A',
+        unitType: tenant.unit?.type || 'N/A',
+        water: {
+          total: waterTotal,
+          paid: waterPaid,
+          outstanding: waterBalance,
+          status: waterBalance === 0 ? 'PAID' : waterPaid > 0 ? 'PARTIAL' : 'UNPAID'
+        },
+        electricity: {
+          total: electricityTotal,
+          paid: electricityPaid,
+          outstanding: electricityBalance,
+          status: electricityBalance === 0 ? 'PAID' : electricityPaid > 0 ? 'PARTIAL' : 'UNPAID'
+        },
+        totalOutstanding: waterBalance + electricityBalance
+      };
+    }).filter(t => t.totalOutstanding > 0);
+
+    // Calculate delinquency report (bills overdue by more than 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const delinquentBills = billInvoices.filter(invoice => 
+      invoice.status === 'OVERDUE' || 
+      (invoice.status === 'UNPAID' && new Date(invoice.dueDate) < thirtyDaysAgo)
+    );
+
+    res.json({
+      success: true,
+      data: {
+        property: {
+          id: property.id,
+          name: property.name,
+          address: property.address
+        },
+        summary: {
+          totalTenants: tenants.length,
+          totalBillInvoices: billInvoices.length,
+          water: {
+            totalBilled: totalWaterBills,
+            totalCollected: totalWaterCollected,
+            totalArrears: totalWaterArrears,
+            collectionRate: parseFloat(waterCollectionRate.toFixed(2)),
+            status: waterCollectionRate >= 90 ? 'EXCELLENT' : waterCollectionRate >= 75 ? 'GOOD' : waterCollectionRate >= 50 ? 'AVERAGE' : 'POOR'
+          },
+          electricity: {
+            totalBilled: totalElectricityBills,
+            totalCollected: totalElectricityCollected,
+            totalArrears: totalElectricityArrears,
+            collectionRate: parseFloat(electricityCollectionRate.toFixed(2)),
+            status: electricityCollectionRate >= 90 ? 'EXCELLENT' : electricityCollectionRate >= 75 ? 'GOOD' : electricityCollectionRate >= 50 ? 'AVERAGE' : 'POOR'
+          },
+          overall: {
+            totalBilled: totalBillsExpected,
+            totalCollected: totalBillsCollected,
+            totalArrears: totalBillsArrears,
+            collectionRate: parseFloat(overallCollectionRate.toFixed(2)),
+            delinquentBillsCount: delinquentBills.length,
+            paymentBreakdown: {
+              paid: paidBillsCount,
+              partial: partialBillsCount,
+              unpaid: unpaidBillsCount,
+              overdue: overdueBillsCount
+            }
+          }
+        },
+        monthlyTrends: Object.values(monthlyTrends),
+        tenantOutstanding: tenantBillSummary,
+        delinquentBills: delinquentBills.map(invoice => ({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          tenantName: invoice.tenant.fullName,
+          unitNo: invoice.tenant.unit?.unitNo || 'N/A',
+          billType: invoice.billType,
+          amount: invoice.grandTotal || invoice.totalAmount,
+          amountPaid: invoice.amountPaid || 0,
+          balance: invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0)),
+          issueDate: invoice.issueDate,
+          dueDate: invoice.dueDate,
+          daysOverdue: Math.floor((new Date() - new Date(invoice.dueDate)) / (1000 * 60 * 60 * 24)),
+          status: invoice.status
+        })),
+        billInvoices: billInvoices.map(invoice => ({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          tenantName: invoice.tenant.fullName,
+          unitNo: invoice.tenant.unit?.unitNo || 'N/A',
+          billType: invoice.billType,
+          billReferenceNumber: invoice.billReferenceNumber,
+          billReferenceDate: invoice.billReferenceDate,
+          issueDate: invoice.issueDate,
+          dueDate: invoice.dueDate,
+          totalAmount: invoice.grandTotal || invoice.totalAmount,
+          amountPaid: invoice.amountPaid || 0,
+          balance: invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0)),
+          status: invoice.status,
+          unitsConsumed: invoice.units,
+          chargePerUnit: invoice.chargePerUnit,
+          previousReading: invoice.previousReading,
+          currentReading: invoice.currentReading,
+          vatRate: invoice.vatRate,
+          vatAmount: invoice.vatAmount
+        })),
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(take),
+          total,
+          totalPages: Math.ceil(total / take)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property bills payment report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate property bills payment report',
+      error: error.message
+    });
+  }
+};
+
 // @desc    Get outstanding invoices for a tenant
 // @route   GET /api/payments/outstanding/:tenantId
 // @access  Private

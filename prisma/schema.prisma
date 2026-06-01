@@ -53,8 +53,12 @@ model User {
   managedPermissionsBy  ManagedPermission[]        @relation("ManagerPermission")
 
   // NEW: Employee relations
-  employeesCreated      Employee[]      @relation("EmployeeCreator")
+  employeesCreated       Employee[]      @relation("EmployeeCreator")
   salaryPaymentsRecorded SalaryPayment[] @relation("PaymentRecorder")
+  // NEW: Add these relation fields for task assignments and approvals
+  assignedTasks          ToDo[]          @relation("AssignedTasks")
+  approvedTasks          ToDo[]          @relation("ApprovedTasks")
+  reviewedTasks          ToDo[]          @relation("ReviewedTasks")
 }
 
 model Landlord {
@@ -763,15 +767,61 @@ enum ActivationStatus {
   CANCELLED
 }
 
+enum ToDoStatus {
+  PENDING
+  IN_PROGRESS
+  PENDING_APPROVAL
+  COMPLETED
+  OVERDUE
+  REJECTED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
 model ToDo {
-  id          String     @id @default(uuid())
-  userId      String
+  id          String       @id @default(uuid())
+  userId      String // The user who needs to complete the task
   title       String
   description String?
-  status      ToDoStatus @default(PENDING)
+  status      ToDoStatus   @default(PENDING)
+  priority    TaskPriority @default(MEDIUM)
   dueDate     DateTime?
-  createdAt   DateTime   @default(now())
-  user        User       @relation(fields: [userId], references: [id])
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime?     @updatedAt
+  completedAt DateTime?
+
+  // Task assignment fields
+  assignedById     String? // Manager who assigned this task (if any)
+  requiresApproval Boolean @default(false) // Whether task needs approval
+
+  // Self-created task fields
+  isSelfCreated   Boolean   @default(false)
+  approvedById    String? // Manager who approved the self-created task
+  approvedAt      DateTime?
+  rejectionReason String? // Reason for rejection if task is rejected
+
+  // Completion fields
+  completionNotes String? // Notes when marking as complete
+  reviewedById    String? // Manager who reviewed/approved the task
+  reviewedAt      DateTime?
+
+  // Relations
+  user       User  @relation(fields: [userId], references: [id])
+  assignedBy User? @relation("AssignedTasks", fields: [assignedById], references: [id])
+  approvedBy User? @relation("ApprovedTasks", fields: [approvedById], references: [id])
+  reviewedBy User? @relation("ReviewedTasks", fields: [reviewedById], references: [id])
+
+  @@index([userId])
+  @@index([assignedById])
+  @@index([status])
+  @@index([dueDate])
+  @@index([userId, status])
+  @@index([userId, dueDate])
 }
 
 model News {
@@ -984,52 +1034,47 @@ enum LetterType {
   RESIDENTIAL
 }
 
-enum ToDoStatus {
-  PENDING
-  COMPLETED
-}
-
 model Employee {
-  id              String         @id @default(uuid())
-  name            String
-  phoneNumber     String?
-  email           String?        @unique
-  jobTitle        String
-  jobDescription  String?
-  salaryAmount    Float
+  id               String           @id @default(uuid())
+  name             String
+  phoneNumber      String?
+  email            String?          @unique
+  jobTitle         String
+  jobDescription   String?
+  salaryAmount     Float
   paymentFrequency PaymentFrequency @default(MONTHLY)
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
-  createdById     String
-  status          EmployeeStatus @default(ACTIVE)
-  
-  salaryPayments  SalaryPayment[]
-  
-  createdBy       User           @relation("EmployeeCreator", fields: [createdById], references: [id])
-  
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  createdById      String
+  status           EmployeeStatus   @default(ACTIVE)
+
+  salaryPayments SalaryPayment[]
+
+  createdBy User @relation("EmployeeCreator", fields: [createdById], references: [id])
+
   @@index([createdById])
   @@index([status])
   @@index([jobTitle])
 }
 
 model SalaryPayment {
-  id              String         @id @default(uuid())
-  employeeId      String
-  amount          Float
-  paymentDate     DateTime       @default(now())
-  paymentPeriod   String
-  paymentMethod   PaymentMethod
-  transactionRef  String?
-  notes           String?
-  receiptUrl      String?
-  status          PaymentStatus  @default(PAID)
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
-  recordedById    String
-  
-  employee        Employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  recordedBy      User           @relation("PaymentRecorder", fields: [recordedById], references: [id])
-  
+  id             String        @id @default(uuid())
+  employeeId     String
+  amount         Float
+  paymentDate    DateTime      @default(now())
+  paymentPeriod  String
+  paymentMethod  PaymentMethod
+  transactionRef String?
+  notes          String?
+  receiptUrl     String?
+  status         PaymentStatus @default(PAID)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  recordedById   String
+
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  recordedBy User     @relation("PaymentRecorder", fields: [recordedById], references: [id])
+
   @@unique([employeeId, paymentPeriod])
   @@index([employeeId])
   @@index([paymentDate])
