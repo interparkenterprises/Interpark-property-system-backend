@@ -2,6 +2,7 @@ import prisma from "../lib/prisma.js";
 import { hashPassword, comparePassword } from '../utils/hashPassword.js';
 import generateToken from '../utils/generateToken.js';
 import permissionService from "../services/permissionService.js";
+import jwt from 'jsonwebtoken';
 
 // Helper function to get user's accessible properties
 async function getUserAccessibleProperties(userId, userRole) {
@@ -47,24 +48,26 @@ export const registerUser = async (req, res) => {
     res.status(400).json({ message: error.message });
   }
 };
-
-// @desc    Register new admin
-// @route   POST /api/auth/register-admin
-// @access  Public ONLY if no admin exists, otherwise Admin only
-export const registerAdmin = async (req, res) => {
+// @desc    Register FIRST admin (only when no admin exists)
+// @route   POST /api/auth/register-first-admin
+// @access  Public (only works if no admin exists in the system)
+export const registerFirstAdmin = async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
+    // Check if any admin already exists
     const adminExists = await prisma.user.findFirst({
       where: { role: 'ADMIN' }
     });
 
     if (adminExists) {
-      if (!req.user || req.user.role !== 'ADMIN') {
-        return res.status(403).json({ message: 'Not authorized to create admin users' });
-      }
+      return res.status(403).json({ 
+        message: 'Admin already exists. Please use /api/auth/register-admin with authentication.',
+        hint: 'You must be logged in as an existing admin to create additional admin accounts.'
+      });
     }
 
+    // Check if user with this email already exists
     const userExists = await prisma.user.findUnique({
       where: { email }
     });
@@ -73,6 +76,7 @@ export const registerAdmin = async (req, res) => {
       return res.status(400).json({ message: 'User already exists' });
     }
 
+    // Create the first admin
     const user = await prisma.user.create({
       data: {
         name,
@@ -83,20 +87,81 @@ export const registerAdmin = async (req, res) => {
       }
     });
 
+    // Generate token for immediate login
+    const token = generateToken(user.id, user.role);
+
     res.status(201).json({
-      message: adminExists
-        ? 'Admin created by existing admin'
-        : 'First admin created successfully',
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      isApproved: user.isApproved,
-      token: generateToken(user.id, user.role)
+      success: true,
+      message: 'First admin created successfully',
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        isApproved: user.isApproved
+      },
+      token
     });
 
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    console.error('First admin registration error:', error);
+    res.status(400).json({ 
+      success: false,
+      message: error.message 
+    });
+  }
+};
+
+// @desc    Register additional admin (requires existing admin authentication)
+// @route   POST /api/auth/register-admin
+// @access  Private/Admin only
+export const registerAdmin = async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    // Check if user already exists
+    const userExists = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    if (userExists) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'User already exists' 
+      });
+    }
+
+    // Create new admin
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email,
+        password: await hashPassword(password),
+        role: 'ADMIN',
+        isApproved: true
+      }
+    });
+
+    // Don't send token for additional admins (they should login separately)
+    res.status(201).json({
+      success: true,
+      message: 'Admin created successfully by existing admin',
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        isApproved: user.isApproved,
+        createdAt: user.createdAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Admin registration error:', error);
+    res.status(400).json({ 
+      success: false,
+      message: error.message 
+    });
   }
 };
 

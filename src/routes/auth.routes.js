@@ -4,6 +4,7 @@ import {
   loginUser, 
   getProfile, 
   registerAdmin,
+  registerFirstAdmin,
   updateUserRole,
   approveUser,
   getPendingUsers,
@@ -17,13 +18,14 @@ const router = express.Router();
 // Public routes
 router.post('/register', registerUser);
 router.post('/login', loginUser);
+router.post('/register-first-admin', registerFirstAdmin);  // New route for first admin
 
 // Protected routes
 router.get('/profile', protect, getProfile);
 router.post('/change-password', protect, changePassword);
 
 // Admin only routes
-router.post('/register-admin', registerAdmin);
+router.post('/register-admin', protect, adminProtect, registerAdmin);  // Now protected
 router.get('/users', protect, adminProtect, getAllUsers);
 router.get('/users/pending', protect, adminProtect, getPendingUsers);
 router.put('/users/:id/role', protect, adminProtect, updateUserRole);
