@@ -154,6 +154,19 @@ class PermissionService {
       return false;
     }
     
+    // Special handling for CREATE operations (no property exists yet)
+    if (operation === 'create') {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true }
+      });
+      
+      // Allow ADMIN and MANAGER to create resources
+      if (user?.role === 'ADMIN' || user?.role === 'MANAGER') {
+        return true;
+      }
+    }
+    
     return this.hasPermission(userId, permissionCode, propertyId);
   }
 
@@ -219,6 +232,20 @@ class PermissionService {
     const cached = cacheService.get(cacheKey);
     if (cached && cached[requiredPermission] !== undefined) {
       return cached[requiredPermission];
+    }
+
+    // -------------------------------
+    // MANAGER CHECK - Managers have full access to properties they own
+    // -------------------------------
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+
+    if (property?.managerId === userId) {
+      // Manager owns this property - grant all access
+      cacheService.set(cacheKey, { [requiredPermission]: true });
+      return true;
     }
 
     // -------------------------------
@@ -320,19 +347,6 @@ class PermissionService {
     }
 
     // -------------------------------
-    // MANAGER CHECK
-    // -------------------------------
-    const property = await prisma.property.findUnique({
-      where: { id: propertyId },
-      select: { managerId: true }
-    });
-
-    if (property?.managerId === userId) {
-      cacheService.set(cacheKey, { [requiredPermission]: true });
-      return true;
-    }
-
-    // -------------------------------
     // ADMIN CHECK
     // -------------------------------
     const user = await prisma.user.findUnique({
@@ -351,6 +365,28 @@ class PermissionService {
   // PERMISSION CHECK (WITH CACHE)
   // ======================================================
   async hasPermission(userId, permissionCode, propertyId = null) {
+    // First, check if user is MANAGER with property ownership
+    if (propertyId) {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true }
+      });
+      
+      // MANAGERs have all permissions on properties they own
+      if (user?.role === 'MANAGER') {
+        // Check if this MANAGER owns the property
+        const property = await prisma.property.findUnique({
+          where: { id: propertyId },
+          select: { managerId: true }
+        });
+        
+        if (property?.managerId === userId) {
+          // MANAGER owns this property - grant all permissions
+          return true;
+        }
+      }
+    }
+    
     const cacheKey = cacheService.getUserPermissionsKey(userId);
 
     // Try cache
@@ -609,6 +645,12 @@ class PermissionService {
       return ids;
     }
 
+    // For MANAGERs, include properties they manage
+    const managed = await prisma.property.findMany({
+      where: { managerId: userId },
+      select: { id: true }
+    });
+
     const directAccess = await prisma.propertyAccess.findMany({
       where: {
         userId,
@@ -630,11 +672,6 @@ class PermissionService {
         }
       },
       select: { propertyId: true }
-    });
-
-    const managed = await prisma.property.findMany({
-      where: { managerId: userId },
-      select: { id: true }
     });
 
     const ids = Array.from(new Set([
