@@ -166,16 +166,13 @@ export const createProperty = async (req, res) => {
     
     const currentUser = req.user;
 
-    // Check CREATE_PROPERTY permission
-    const canCreate = await permissionService.checkPermission(
-      currentUser.id, 
-      'property', 
-      'create'
-    );
+    // Check role-based access for creating properties
+    // Only ADMIN and MANAGER can create properties
+    const canCreate = currentUser.role === 'ADMIN' || currentUser.role === 'MANAGER';
     
     if (!canCreate) {
       return res.status(403).json({ 
-        message: 'You do not have permission to create properties' 
+        message: 'You do not have permission to create properties. Only administrators and managers can create properties.' 
       });
     }
 
