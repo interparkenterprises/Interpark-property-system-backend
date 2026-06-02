@@ -942,7 +942,7 @@ export const createTenant = async (req, res) => {
       });
     }
 
-    // Validate escalationFrequency
+    // Validate escalation frequency
     let normalizedEscalationFrequency = null;
     if (escalationFrequency !== undefined && escalationFrequency !== null) {
       const validEscalations = ["ANNUALLY", "BI_ANNUALLY"];
@@ -1022,12 +1022,13 @@ export const createTenant = async (req, res) => {
       },
     });
 
-    // Handle service charge
+    // =============================================
+    // HANDLE SERVICE CHARGE - RECOMMENDED VERSION
+    // =============================================
     if (serviceCharge) {
-      const { type, fixedAmount, percentage, perSqFtRate } = serviceCharge;
-
+      // Extract and validate type
       const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
-      const normalizedType = type?.toUpperCase();
+      const normalizedType = serviceCharge.type?.toUpperCase();
 
       if (!normalizedType || !validTypes.includes(normalizedType)) {
         return res.status(400).json({
@@ -1035,14 +1036,17 @@ export const createTenant = async (req, res) => {
         });
       }
 
+      // Build data object with CORRECT field names for Prisma
+      const serviceChargeData = {
+        tenantId: tenant.id,
+        type: normalizedType,
+        fixedAmount: serviceCharge.fixedAmount ? parseFloat(serviceCharge.fixedAmount) : null,
+        percentage: serviceCharge.percentage ? parseFloat(serviceCharge.percentage) : null,
+        perSqftRate: serviceCharge.perSqFtRate ? parseFloat(serviceCharge.perSqFtRate) : null, // NOTE: perSqftRate (lowercase f)
+      };
+
       await prisma.serviceCharge.create({
-        data: {
-          tenantId: tenant.id,
-          type: normalizedType,
-          fixedAmount: fixedAmount ? parseFloat(fixedAmount) : null,
-          percentage: percentage ? parseFloat(percentage) : null,
-          perSqftRate: perSqftRate ? parseFloat(perSqftRate) : null,
-        },
+        data: serviceChargeData,
       });
     }
 
@@ -1242,14 +1246,15 @@ export const updateTenant = async (req, res) => {
       });
     }
 
-    // Handle service charge update
+    // =============================================
+    // HANDLE SERVICE CHARGE UPDATE - RECOMMENDED VERSION
+    // =============================================
     if (serviceCharge) {
-      const { type, fixedAmount, percentage, perSqFtRate } = serviceCharge;
-
+      // Validate type if provided
       let normalizedType = undefined;
-      if (type !== undefined) {
+      if (serviceCharge.type !== undefined) {
         const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
-        normalizedType = type.toUpperCase();
+        normalizedType = serviceCharge.type.toUpperCase();
         if (!validTypes.includes(normalizedType)) {
           return res.status(400).json({
             message: `Invalid service charge type. Must be: ${validTypes.join(", ")}`,
@@ -1257,43 +1262,48 @@ export const updateTenant = async (req, res) => {
         }
       }
 
-      const serviceChargeData = {
-        type: normalizedType,
-        fixedAmount: fixedAmount != null
-          ? fixedAmount === null
-            ? null
-            : parseFloat(fixedAmount)
-          : undefined,
-        percentage: percentage != null
-          ? percentage === null
-            ? null
-            : parseFloat(percentage)
-          : undefined,
-        perSqftRate: perSqftRate != null
-          ? perSqftRate === null
-            ? null
-            : parseFloat(perSqFtRate)
-          : undefined,
-      };
+      // Build update data with CORRECT field names
+      const serviceChargeUpdateData = {};
+      
+      if (normalizedType !== undefined) {
+        serviceChargeUpdateData.type = normalizedType;
+      }
+      
+      if (serviceCharge.fixedAmount !== undefined) {
+        serviceChargeUpdateData.fixedAmount = serviceCharge.fixedAmount !== null 
+          ? parseFloat(serviceCharge.fixedAmount) 
+          : null;
+      }
+      
+      if (serviceCharge.percentage !== undefined) {
+        serviceChargeUpdateData.percentage = serviceCharge.percentage !== null 
+          ? parseFloat(serviceCharge.percentage) 
+          : null;
+      }
+      
+      if (serviceCharge.perSqFtRate !== undefined) {
+        serviceChargeUpdateData.perSqftRate = serviceCharge.perSqFtRate !== null 
+          ? parseFloat(serviceCharge.perSqFtRate) 
+          : null;
+      }
 
-      Object.keys(serviceChargeData).forEach((k) => {
-        if (serviceChargeData[k] === undefined) delete serviceChargeData[k];
-      });
-
-      if (Object.keys(serviceChargeData).length > 0) {
+      // Update or create service charge
+      if (Object.keys(serviceChargeUpdateData).length > 0) {
         if (existingTenant.serviceCharge) {
+          // Update existing
           await prisma.serviceCharge.update({
             where: { tenantId: req.params.id },
-            data: serviceChargeData,
+            data: serviceChargeUpdateData,
           });
         } else if (normalizedType) {
+          // Create new with all required fields
           await prisma.serviceCharge.create({
             data: {
               tenantId: req.params.id,
               type: normalizedType,
-              fixedAmount: serviceChargeData.fixedAmount ?? null,
-              percentage: serviceChargeData.percentage ?? null,
-              perSqFtRate: serviceChargeData.perSqFtRate ?? null,
+              fixedAmount: serviceChargeUpdateData.fixedAmount ?? null,
+              percentage: serviceChargeUpdateData.percentage ?? null,
+              perSqftRate: serviceChargeUpdateData.perSqftRate ?? null,
             },
           });
         }
@@ -1314,7 +1324,6 @@ export const updateTenant = async (req, res) => {
     res.status(500).json({ message: "Server error", error: error.message });
   }
 };
-
 // @desc    Delete tenant
 // @route   DELETE /api/tenants/:id
 // @access  Private (ADMIN, MANAGER, and USER with DELETE_TENANT permission)

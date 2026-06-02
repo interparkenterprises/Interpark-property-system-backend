@@ -418,7 +418,7 @@ model ServiceCharge {
   type        ServiceChargeType
   fixedAmount Float?
   percentage  Float?
-  perSqftRate Float?            @map("perSqFtRate")
+  perSqFtRate Float?            @map("perSqFtRate")
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   tenant      Tenant            @relation(fields: [tenantId], references: [id])
