@@ -1041,7 +1041,7 @@ export const createTenant = async (req, res) => {
           type: normalizedType,
           fixedAmount: fixedAmount ? parseFloat(fixedAmount) : null,
           percentage: percentage ? parseFloat(percentage) : null,
-          perSqFtRate: perSqFtRate ? parseFloat(perSqFtRate) : null,
+          perSqftRate: perSqftRate ? parseFloat(perSqftRate) : null,
         },
       });
     }
@@ -1269,8 +1269,8 @@ export const updateTenant = async (req, res) => {
             ? null
             : parseFloat(percentage)
           : undefined,
-        perSqFtRate: perSqFtRate != null
-          ? perSqFtRate === null
+        perSqftRate: perSqftRate != null
+          ? perSqftRate === null
             ? null
             : parseFloat(perSqFtRate)
           : undefined,
