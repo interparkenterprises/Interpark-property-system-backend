@@ -48,6 +48,7 @@ class PermissionService {
         create: 'CREATE_BILLS',
         edit: 'EDIT_BILLS',
         delete: 'DELETE_BILLS',
+        pay: 'PAY_BILLS',
         recordMeterReading: 'RECORD_METER_READINGS'
       },
       // Bill Invoice permissions (add this new section)
