@@ -1023,7 +1023,7 @@ export const createTenant = async (req, res) => {
     });
 
     // =============================================
-    // HANDLE SERVICE CHARGE - RECOMMENDED VERSION
+    // HANDLE SERVICE CHARGE - CORRECTED VERSION
     // =============================================
     if (serviceCharge) {
       // Extract and validate type
@@ -1036,13 +1036,13 @@ export const createTenant = async (req, res) => {
         });
       }
 
-      // Build data object with CORRECT field names for Prisma
+      // Build data object with CORRECT Prisma field name: perSqFtRate (camelCase with capital F)
       const serviceChargeData = {
         tenantId: tenant.id,
         type: normalizedType,
         fixedAmount: serviceCharge.fixedAmount ? parseFloat(serviceCharge.fixedAmount) : null,
         percentage: serviceCharge.percentage ? parseFloat(serviceCharge.percentage) : null,
-        perSqftRate: serviceCharge.perSqFtRate ? parseFloat(serviceCharge.perSqFtRate) : null, // NOTE: perSqftRate (lowercase f)
+        perSqFtRate: serviceCharge.perSqFtRate ? parseFloat(serviceCharge.perSqFtRate) : null, // CORRECT: perSqFtRate (capital F)
       };
 
       await prisma.serviceCharge.create({
