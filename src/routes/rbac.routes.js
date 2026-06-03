@@ -72,11 +72,11 @@ router.delete('/permissions/:id',
 
 router.route('/roles')
   .get(authorize('ADMIN', 'MANAGER'), getCustomRoles)
-  .post(authorize('MANAGER'), createCustomRole);
+  .post(authorize('MANAGER', 'ADMIN'), createCustomRole);
 
 router.route('/roles/:roleId')
-  .put(authorize('MANAGER'), updateCustomRole)
-  .delete(authorize('MANAGER'), deleteCustomRole);
+  .put(authorize('MANAGER', 'ADMIN'), updateCustomRole)
+  .delete(authorize('MANAGER', 'ADMIN'), deleteCustomRole);
 
 // ======================================================
 // MANAGED USER ROUTES
@@ -85,55 +85,55 @@ router.route('/roles/:roleId')
 // Basic CRUD Operations
 // ------------------------------------------
 router.route('/users')
-  .get(authorize('MANAGER'), getManagedUsers)
-  .post(authorize('MANAGER'), createManagedUser);
+  .get(authorize('ADMIN', 'MANAGER'), getManagedUsers)
+  .post(authorize('MANAGER', 'ADMIN'), createManagedUser);
 
 router.route('/users/:userId')
-  .delete(authorize('MANAGER'), deleteManagedUser);
+  .delete(authorize('MANAGER', 'ADMIN'), deleteManagedUser);  //  Added ADMIN
 
 // Role & Basic Access Management
 // ------------------------------------------
 router.route('/users/:userId/access')
-  .put(authorize('MANAGER'), updateManagedUserAccess);
+  .put(authorize('MANAGER', 'ADMIN'), updateManagedUserAccess);  //  Added ADMIN
 
 // Granular Property Access Management
 // ------------------------------------------
 router.get('/users/:userId/access-details', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  //  Added ADMIN
   getUserAccessDetails
 );
 
 router.post('/users/:userId/property-access', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  //Added ADMIN
   grantAdditionalPropertyAccess
 );
 
 router.delete('/users/:userId/property-access/:propertyId', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  // Added ADMIN
   revokePropertyAccess
 );
 
 router.put('/users/:userId/property-access/:propertyId/permissions', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  // Added ADMIN
   updatePropertyPermissions
 );
 
 // User Status Management
 // ------------------------------------------
 router.post('/users/:userId/disable', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  //Added ADMIN
   disableManagedUser
 );
 
 router.post('/users/:userId/enable', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  // Added ADMIN
   enableManagedUser
 );
 
 // Bulk Operations
 // ------------------------------------------
 router.put('/users/:userId/bulk-access', 
-  authorize('MANAGER'), 
+  authorize('MANAGER', 'ADMIN'),  // Added ADMIN
   bulkUpdateUserAccess
 );
 
@@ -146,7 +146,7 @@ router.get('/audit-logs',
   getAuditLogs
 );
 
-//Cache Management Routes (for admin use)
+// Cache Management Routes (for admin use)
 router.get('/cache-stats', authorize('ADMIN'), getCacheStats);
 router.delete('/cache', authorize('ADMIN'), clearAllCache);
 

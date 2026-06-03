@@ -69,6 +69,12 @@ const invalidatePropertyAccessCaches = async (propertyId, userIds = []) => {
   }
 };
 
+// Helper to check if user is ADMIN or has permission
+const isAdminOrOwner = (userRole, userId, resourceOwnerId) => {
+  if (userRole === 'ADMIN') return true;
+  return resourceOwnerId === userId;
+};
+
 // ======================================================
 // PERMISSION MANAGEMENT
 // ======================================================
@@ -361,7 +367,7 @@ export const getPermissionById = async (req, res) => {
 // CUSTOM ROLE MANAGEMENT
 // ======================================================
 
-// @desc    Get all custom roles (for current manager)
+// @desc    Get all custom roles
 // @route   GET /api/rbac/roles
 // @access  Private/Manager/Admin
 export const getCustomRoles = async (req, res) => {
@@ -374,6 +380,7 @@ export const getCustomRoles = async (req, res) => {
     if (userRole === 'MANAGER') {
       whereClause = { createdById: userId };
     }
+    // ADMIN sees all roles (no filter)
     
     const roles = await prisma.customRole.findMany({
       where: whereClause,
@@ -398,12 +405,13 @@ export const getCustomRoles = async (req, res) => {
   }
 };
 
-// @desc    Create custom role (Manager only)
+// @desc    Create custom role
 // @route   POST /api/rbac/roles
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const createCustomRole = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { name, description, permissionIds, propertyIds } = req.body;
     
     // Validation
@@ -418,18 +426,21 @@ export const createCustomRole = async (req, res) => {
     const uniquePermissionIds = [...new Set(permissionIds)];
     const uniquePropertyIds = [...new Set(propertyIds)];
     
-    // Verify manager's properties (outside transaction)
-    const managerProperties = await prisma.property.findMany({
-      where: { managerId },
-      select: { id: true }
-    });
-    const managerPropertyIds = new Set(managerProperties.map(p => p.id));
-    
-    const invalidProperties = uniquePropertyIds.filter(id => !managerPropertyIds.has(id));
-    if (invalidProperties.length > 0) {
-      return res.status(400).json({ 
-        error: `You don't manage properties: ${invalidProperties.join(', ')}` 
+    // For MANAGERs, verify properties belong to them
+    // For ADMINs, allow any properties
+    if (userRole === 'MANAGER') {
+      const managerProperties = await prisma.property.findMany({
+        where: { managerId: userId },
+        select: { id: true }
       });
+      const managerPropertyIds = new Set(managerProperties.map(p => p.id));
+      
+      const invalidProperties = uniquePropertyIds.filter(id => !managerPropertyIds.has(id));
+      if (invalidProperties.length > 0) {
+        return res.status(400).json({ 
+          error: `You don't manage properties: ${invalidProperties.join(', ')}` 
+        });
+      }
     }
     
     // Step 1: Create the role
@@ -437,7 +448,7 @@ export const createCustomRole = async (req, res) => {
       data: {
         name,
         description,
-        createdById: managerId
+        createdById: userId
       }
     });
     
@@ -450,7 +461,7 @@ export const createCustomRole = async (req, res) => {
           data: uniquePermissionIds.map(permissionId => ({
             roleId: newRole.id,
             permissionId,
-            grantedById: managerId
+            grantedById: userId
           })),
           skipDuplicates: true
         })
@@ -463,7 +474,7 @@ export const createCustomRole = async (req, res) => {
           data: uniquePropertyIds.map(propertyId => ({
             roleId: newRole.id,
             propertyId,
-            createdBy: managerId
+            createdBy: userId
           })),
           skipDuplicates: true
         })
@@ -492,7 +503,7 @@ export const createCustomRole = async (req, res) => {
     prisma.rBACAuditLog.create({
       data: {
         action: 'CREATE_CUSTOM_ROLE',
-        performedBy: managerId,
+        performedBy: userId,
         targetRole: newRole.id,
         changes: { name, description, permissionIds: uniquePermissionIds, propertyIds: uniquePropertyIds }
       }
@@ -514,24 +525,38 @@ export const createCustomRole = async (req, res) => {
 
 // @desc    Update custom role
 // @route   PUT /api/rbac/roles/:roleId
-// @access  Private/Manager
+// @access  Private/Manager/Admin (with ownership check)
 export const updateCustomRole = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { roleId } = req.params;
     const { name, description, permissionIds, propertyIds, isActive } = req.body;
     
-    // Verify role belongs to manager
-    const existingRole = await prisma.customRole.findFirst({
-      where: { id: roleId, createdById: managerId },
-      include: {
-        permissions: { select: { permissionId: true } },
-        propertyAccess: { select: { propertyId: true } }
-      }
-    });
+    // Verify role exists and user has permission
+    let existingRole;
+    
+    if (userRole === 'ADMIN') {
+      existingRole = await prisma.customRole.findUnique({
+        where: { id: roleId },
+        include: {
+          permissions: { select: { permissionId: true } },
+          propertyAccess: { select: { propertyId: true } }
+        }
+      });
+    } else {
+      // MANAGER: only roles they created
+      existingRole = await prisma.customRole.findFirst({
+        where: { id: roleId, createdById: userId },
+        include: {
+          permissions: { select: { permissionId: true } },
+          propertyAccess: { select: { propertyId: true } }
+        }
+      });
+    }
     
     if (!existingRole) {
-      return res.status(404).json({ error: 'Role not found or not owned by you' });
+      return res.status(404).json({ error: 'Role not found or not accessible' });
     }
     
     // Update role with diff operations
@@ -570,7 +595,7 @@ export const updateCustomRole = async (req, res) => {
             data: toAdd.map(permissionId => ({
               roleId,
               permissionId,
-              grantedById: managerId
+              grantedById: userId
             }))
           });
         }
@@ -600,7 +625,7 @@ export const updateCustomRole = async (req, res) => {
             data: toAddProperties.map(propertyId => ({
               roleId,
               propertyId,
-              createdBy: managerId
+              createdBy: userId
             }))
           });
         }
@@ -617,7 +642,7 @@ export const updateCustomRole = async (req, res) => {
       await tx.rBACAuditLog.create({
         data: {
           action: 'UPDATE_CUSTOM_ROLE',
-          performedBy: managerId,
+          performedBy: userId,
           targetRole: roleId,
           changes: { name, description, permissionIds, propertyIds, isActive }
         }
@@ -641,25 +666,41 @@ export const updateCustomRole = async (req, res) => {
 
 // @desc    Delete custom role
 // @route   DELETE /api/rbac/roles/:roleId
-// @access  Private/Manager
+// @access  Private/Manager/Admin (with ownership check)
 export const deleteCustomRole = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { roleId } = req.params;
     
-    // Verify role belongs to manager
-    const existingRole = await prisma.customRole.findFirst({
-      where: { id: roleId, createdById: managerId },
-      include: { 
-        assignments: {
-          where: { isActive: true },
-          select: { userId: true }
+    // Verify role exists and user has permission
+    let existingRole;
+    
+    if (userRole === 'ADMIN') {
+      existingRole = await prisma.customRole.findUnique({
+        where: { id: roleId },
+        include: { 
+          assignments: {
+            where: { isActive: true },
+            select: { userId: true }
+          }
         }
-      }
-    });
+      });
+    } else {
+      // MANAGER: only roles they created
+      existingRole = await prisma.customRole.findFirst({
+        where: { id: roleId, createdById: userId },
+        include: { 
+          assignments: {
+            where: { isActive: true },
+            select: { userId: true }
+          }
+        }
+      });
+    }
     
     if (!existingRole) {
-      return res.status(404).json({ error: 'Role not found or not owned by you' });
+      return res.status(404).json({ error: 'Role not found or not accessible' });
     }
     
     if (existingRole.assignments.length > 0) {
@@ -679,7 +720,7 @@ export const deleteCustomRole = async (req, res) => {
       await tx.rBACAuditLog.create({
         data: {
           action: 'DELETE_CUSTOM_ROLE',
-          performedBy: managerId,
+          performedBy: userId,
           targetRole: roleId,
           changes: { name: existingRole.name }
         }
@@ -699,37 +740,58 @@ export const deleteCustomRole = async (req, res) => {
 // MANAGED USER MANAGEMENT
 // ======================================================
 
-// @desc    Create managed user with custom role (role already has property access)
+// @desc    Create managed user with custom role
 // @route   POST /api/rbac/users
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const createManagedUser = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { name, email, roleId, expiresAt } = req.body;
 
-    // OPTIMIZATION 1: Run parallel queries
-    const [role, existingUser] = await Promise.all([
-      prisma.customRole.findFirst({
-        where: { id: roleId, createdById: managerId },
+    // Verify role exists and user has permission to use it
+    let role;
+    
+    if (userRole === 'ADMIN') {
+      role = await prisma.customRole.findUnique({
+        where: { id: roleId },
         select: {
           id: true,
           name: true,
+          createdById: true,
           propertyAccess: {
             where: { isActive: true },
             select: { propertyId: true },
             take: 1000
           }
         }
-      }),
-      prisma.user.findUnique({ 
-        where: { email },
-        select: { id: true }
-      })
-    ]);
+      });
+    } else {
+      // MANAGER: only roles they created
+      role = await prisma.customRole.findFirst({
+        where: { id: roleId, createdById: userId },
+        select: {
+          id: true,
+          name: true,
+          createdById: true,
+          propertyAccess: {
+            where: { isActive: true },
+            select: { propertyId: true },
+            take: 1000
+          }
+        }
+      });
+    }
 
     if (!role) {
-      return res.status(400).json({ error: 'Invalid role - not created by you' });
+      return res.status(400).json({ error: 'Invalid role - not accessible' });
     }
+
+    // Check if user already exists
+    const existingUser = await prisma.user.findUnique({ 
+      where: { email },
+      select: { id: true }
+    });
 
     if (existingUser) {
       return res.status(400).json({ error: 'User with this email already exists' });
@@ -739,7 +801,7 @@ export const createManagedUser = async (req, res) => {
     const hashedPassword = await hashPassword(tempPassword);
     const rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
 
-    // OPTIMIZATION 2: Lighter transaction
+    // Create user
     const newUser = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
@@ -749,7 +811,7 @@ export const createManagedUser = async (req, res) => {
           role: 'USER',
           isApproved: true,
           isManagedUser: true,
-          createdByManagerId: managerId,
+          createdByManagerId: userRole === 'ADMIN' ? role.createdById : userId,
           canManagerLogin: true
         },
         select: { id: true, name: true, email: true }
@@ -759,7 +821,7 @@ export const createManagedUser = async (req, res) => {
         data: {
           userId: user.id,
           roleId,
-          assignedBy: managerId,
+          assignedBy: userId,
           isActive: true,
           expiresAt: expiresAt ? new Date(expiresAt) : null
         }
@@ -768,7 +830,7 @@ export const createManagedUser = async (req, res) => {
       return user;
     });
 
-    // IMMEDIATE RESPONSE
+    // Immediate response
     res.status(201).json({
       success: true,
       message: 'User created successfully',
@@ -785,34 +847,30 @@ export const createManagedUser = async (req, res) => {
       temporaryPassword: tempPassword
     });
 
-    // 🚀 BACKGROUND TASKS - Optimized for Resend
+    // Background tasks
     const backgroundTasks = async () => {
-      // Get manager info once (reused across tasks)
       const manager = await prisma.user.findUnique({
-        where: { id: managerId },
+        where: { id: userId },
         select: { name: true }
       }).catch(err => {
         console.error('Failed to fetch manager:', err.message);
-        return { name: 'Manager' };
+        return { name: userRole === 'ADMIN' ? 'Admin' : 'Manager' };
       });
 
-      // Prepare email data
       const emailData = {
         email: newUser.email,
         name: newUser.name,
         temporaryPassword: tempPassword,
         role: role.name,
         loginUrl: `${process.env.FRONTEND_URL}/login`,
-        createdBy: manager?.name || 'Manager'
+        createdBy: manager?.name || (userRole === 'ADMIN' ? 'Admin' : 'Manager')
       };
 
-      // Run all background tasks in parallel
       await Promise.allSettled([
-        // Audit log
         prisma.rBACAuditLog.create({
           data: {
             action: 'CREATE_MANAGED_USER',
-            performedBy: managerId,
+            performedBy: userId,
             targetUser: newUser.id,
             changes: {
               name,
@@ -824,19 +882,16 @@ export const createManagedUser = async (req, res) => {
           }
         }).catch(err => console.error('Audit log failed:', err.message)),
         
-        // Welcome email with Resend (faster and more reliable)
         sendWelcomeEmail(emailData).catch(err => 
           console.error('Welcome email failed:', err.message)
         ),
         
-        // Cache invalidation
         invalidateUserCaches([newUser.id]).catch(err => 
           console.error('Cache invalidation failed:', err.message)
         )
       ]);
     };
 
-    // Use queueMicrotask for faster response
     queueMicrotask(() => backgroundTasks());
 
   } catch (error) {
@@ -849,27 +904,44 @@ export const createManagedUser = async (req, res) => {
 
 // @desc    Get managed users
 // @route   GET /api/rbac/users
-// @access  Private/Manager
+// @access  Private/Manager or Admin
 export const getManagedUsers = async (req, res) => {
   try {
-    const managerId = req.user.id;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    
+    let whereClause = {};
+    
+    // ADMIN can see ALL managed users (across all managers)
+    if (userRole === 'ADMIN') {
+      whereClause = {
+        isManagedUser: true
+      };
+    } 
+    // MANAGER can only see users they created
+    else if (userRole === 'MANAGER') {
+      whereClause = {
+        createdByManagerId: userId,
+        isManagedUser: true
+      };
+    }
+    else {
+      return res.status(403).json({ error: 'Access denied. Only ADMIN or MANAGER can view users.' });
+    }
     
     const users = await prisma.user.findMany({
-      where: {
-        createdByManagerId: managerId,
-        isManagedUser: true
-      },
+      where: whereClause,
       include: {
         userAssignments: {
           where: { isActive: true },
           include: {
             role: {
               include: {
-                propertyAccess: {  // Include role's property access
+                propertyAccess: {
                   where: { isActive: true },
                   include: { property: true }
                 },
-                permissions: {  // Include role's permissions
+                permissions: {
                   include: { permission: true }
                 }
               }
@@ -886,36 +958,56 @@ export const getManagedUsers = async (req, res) => {
     
     res.json(users);
   } catch (error) {
+    console.error('Get managed users error:', error);
     res.status(400).json({ message: error.message });
   }
 };
 
 // @desc    Update managed user access (role-based, properties inherited from role)
 // @route   PUT /api/rbac/users/:userId/access
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const updateManagedUserAccess = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
     const { roleId, expiresAt, isActive } = req.body;
     
-    // Verify user belongs to manager
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true
-      },
-      include: {
-        userAssignments: {
-          where: { isActive: true },
-          select: { roleId: true }
+    // Verify user exists and is managed
+    let user;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true
+        },
+        include: {
+          userAssignments: {
+            where: { isActive: true },
+            select: { roleId: true }
+          }
         }
-      }
-    });
+      });
+    } else {
+      // MANAGER: only users they created
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true
+        },
+        include: {
+          userAssignments: {
+            where: { isActive: true },
+            select: { roleId: true }
+          }
+        }
+      });
+    }
     
     if (!user) {
-      return res.status(404).json({ error: 'User not found or not managed by you' });
+      return res.status(404).json({ error: 'User not found or not accessible' });
     }
     
     // Validate new role if provided
@@ -923,18 +1015,31 @@ export const updateManagedUserAccess = async (req, res) => {
     let rolePropertyIds = [];
     
     if (roleId) {
-      role = await prisma.customRole.findFirst({
-        where: { id: roleId, createdById: managerId },
-        include: {
-          propertyAccess: {
-            where: { isActive: true },
-            select: { propertyId: true }
+      if (userRole === 'ADMIN') {
+        role = await prisma.customRole.findUnique({
+          where: { id: roleId },
+          include: {
+            propertyAccess: {
+              where: { isActive: true },
+              select: { propertyId: true }
+            }
           }
-        }
-      });
+        });
+      } else {
+        // MANAGER: only roles they created
+        role = await prisma.customRole.findFirst({
+          where: { id: roleId, createdById: userId },
+          include: {
+            propertyAccess: {
+              where: { isActive: true },
+              select: { propertyId: true }
+            }
+          }
+        });
+      }
       
       if (!role) {
-        return res.status(400).json({ error: 'Invalid role - not created by you' });
+        return res.status(400).json({ error: 'Invalid role - not accessible' });
       }
       
       rolePropertyIds = role.propertyAccess.map(p => p.propertyId);
@@ -948,86 +1053,72 @@ export const updateManagedUserAccess = async (req, res) => {
       isActive 
     };
     
-    // Execute transaction - only role assignment updates
+    // Execute transaction
     await prisma.$transaction(async (tx) => {
-      // Update role assignment
       if (roleId) {
         // Deactivate current active roles
         await tx.userRoleAssignment.updateMany({
-          where: { userId, isActive: true },
+          where: { userId: targetUserId, isActive: true },
           data: { isActive: false }
         });
         
-        // Check if assignment already exists (including inactive)
+        // Check if assignment already exists
         const existingAssignment = await tx.userRoleAssignment.findUnique({
-          where: { userId_roleId: { userId, roleId } }
+          where: { userId_roleId: { userId: targetUserId, roleId } }
         });
         
         if (existingAssignment) {
-          // Reactivate existing assignment
           await tx.userRoleAssignment.update({
             where: { id: existingAssignment.id },
             data: {
               isActive: true,
-              assignedBy: managerId,
+              assignedBy: userId,
               expiresAt: expiresAt ? new Date(expiresAt) : null,
               assignedAt: new Date()
             }
           });
         } else {
-          // Create new assignment
           await tx.userRoleAssignment.create({
             data: {
-              userId,
+              userId: targetUserId,
               roleId,
-              assignedBy: managerId,
+              assignedBy: userId,
               isActive: true,
               expiresAt: expiresAt ? new Date(expiresAt) : null
             }
           });
         }
       } else if (expiresAt !== undefined) {
-        // Update expiry on current active role
         await tx.userRoleAssignment.updateMany({
-          where: { userId, isActive: true },
+          where: { userId: targetUserId, isActive: true },
           data: { expiresAt: expiresAt ? new Date(expiresAt) : null }
         });
       }
       
-      // Update user login status
       if (isActive !== undefined) {
         await tx.user.update({
-          where: { id: userId },
+          where: { id: targetUserId },
           data: { canManagerLogin: isActive }
         });
       }
-      
-      // NOTE: No direct property access management!
-      // Property access is always inherited from the assigned role
-      // If you need to grant additional properties beyond the role,
-      // use the grantAdditionalPropertyAccess endpoint
-    }, {
-      timeout: 15000
-    });
+    }, { timeout: 15000 });
     
     // Log audit
     await prisma.rBACAuditLog.create({
       data: {
         action: 'UPDATE_MANAGED_USER_ACCESS',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         changes: {
           ...changes,
           inheritedProperties: rolePropertyIds,
           note: 'Property access is inherited from role'
         }
       }
-    }).catch(err => {
-      console.error('Audit log failed:', err.message);
-    });
+    }).catch(err => console.error('Audit log failed:', err.message));
     
     // Invalidate cache
-    await invalidateUserCaches([userId]);
+    await invalidateUserCaches([targetUserId]);
     
     res.json({ 
       success: true, 
@@ -1046,44 +1137,56 @@ export const updateManagedUserAccess = async (req, res) => {
     res.status(400).json({ message: error.message });
   }
 };
+
 // @desc    Delete managed user
 // @route   DELETE /api/rbac/users/:userId
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const deleteManagedUser = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
     
-    // Verify user belongs to manager
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true
-      }
-    });
+    // Verify user exists and is accessible
+    let user;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true
+        }
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true
+        }
+      });
+    }
     
     if (!user) {
-      return res.status(404).json({ error: 'User not found or not managed by you' });
+      return res.status(404).json({ error: 'User not found or not accessible' });
     }
     
     await prisma.$transaction(async (tx) => {
-      await tx.userRoleAssignment.deleteMany({ where: { userId } });
-      await tx.propertyAccess.deleteMany({ where: { userId } });
-      await tx.user.delete({ where: { id: userId } });
+      await tx.userRoleAssignment.deleteMany({ where: { userId: targetUserId } });
+      await tx.propertyAccess.deleteMany({ where: { userId: targetUserId } });
+      await tx.user.delete({ where: { id: targetUserId } });
       
       await tx.rBACAuditLog.create({
         data: {
           action: 'DELETE_MANAGED_USER',
-          performedBy: managerId,
-          targetUser: userId,
+          performedBy: userId,
+          targetUser: targetUserId,
           changes: { name: user.name, email: user.email }
         }
       });
     });
     
-    // Invalidate cache for the deleted user
-    await invalidateUserCaches([userId]);
+    await invalidateUserCaches([targetUserId]);
     
     res.json({ success: true, message: 'User deleted successfully' });
   } catch (error) {
@@ -1097,66 +1200,77 @@ export const deleteManagedUser = async (req, res) => {
 
 // @desc    Revoke specific property access from a managed user
 // @route   DELETE /api/rbac/users/:userId/property-access/:propertyId
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const revokePropertyAccess = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId, propertyId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId, propertyId } = req.params;
     
-    // Verify user belongs to manager
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true
-      }
-    });
+    // Verify user exists and is accessible
+    let user;
+    let property;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true
+        }
+      });
+      
+      property = await prisma.property.findFirst({
+        where: { id: propertyId }
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true
+        }
+      });
+      
+      property = await prisma.property.findFirst({
+        where: {
+          id: propertyId,
+          managerId: userId
+        }
+      });
+    }
     
     if (!user) {
-      return res.status(404).json({ error: 'User not found or not managed by you' });
+      return res.status(404).json({ error: 'User not found or not accessible' });
     }
-    
-    // Verify property belongs to manager
-    const property = await prisma.property.findFirst({
-      where: {
-        id: propertyId,
-        managerId: managerId
-      }
-    });
     
     if (!property) {
-      return res.status(404).json({ error: 'Property not found or not managed by you' });
+      return res.status(404).json({ error: 'Property not found or not accessible' });
     }
     
-    // Revoke access by deactivating the property access record
     const revokedAccess = await prisma.propertyAccess.updateMany({
       where: {
-        userId: userId,
+        userId: targetUserId,
         propertyId: propertyId,
         isActive: true
       },
-      data: {
-        isActive: false
-      }
+      data: { isActive: false }
     });
     
     if (revokedAccess.count === 0) {
       return res.status(404).json({ error: 'No active access found for this property' });
     }
     
-    // Log audit
     await prisma.rBACAuditLog.create({
       data: {
         action: 'REVOKE_PROPERTY_ACCESS',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         targetProperty: propertyId,
         changes: { action: 'revoked', propertyId, propertyName: property.name }
       }
     });
     
-    // Invalidate caches for the user and property
-    await invalidatePropertyAccessCaches(propertyId, [userId]);
+    await invalidatePropertyAccessCaches(propertyId, [targetUserId]);
     
     res.json({
       success: true,
@@ -1170,47 +1284,65 @@ export const revokePropertyAccess = async (req, res) => {
 
 // @desc    Grant additional property access to a managed user
 // @route   POST /api/rbac/users/:userId/property-access
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const grantAdditionalPropertyAccess = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
     const { propertyIds, canEdit, canExport, expiresAt } = req.body;
     
     if (!propertyIds || !Array.isArray(propertyIds) || propertyIds.length === 0) {
       return res.status(400).json({ error: 'propertyIds array is required' });
     }
     
-    // Verify user belongs to manager
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true,
-        canManagerLogin: true
-      }
-    });
+    // Verify user exists and is accessible
+    let user;
+    let managerProperties;
     
-    if (!user) {
-      return res.status(404).json({ error: 'User not found, not managed by you, or is disabled' });
-    }
-    
-    // Verify all properties belong to manager
-    const managerProperties = await prisma.property.findMany({
-      where: { managerId }
-    });
-    const managerPropertyIds = managerProperties.map(p => p.id);
-    
-    const invalidProperties = propertyIds.filter(id => !managerPropertyIds.includes(id));
-    if (invalidProperties.length > 0) {
-      return res.status(400).json({ 
-        error: `You don't manage properties: ${invalidProperties.join(', ')}` 
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true,
+          canManagerLogin: true
+        }
+      });
+      
+      // For ADMIN, verify properties exist (any property)
+      managerProperties = await prisma.property.findMany({
+        where: { id: { in: propertyIds } }
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true,
+          canManagerLogin: true
+        }
+      });
+      
+      managerProperties = await prisma.property.findMany({
+        where: { managerId: userId, id: { in: propertyIds } }
       });
     }
     
-    // Get user's current role permissions
+    if (!user) {
+      return res.status(404).json({ error: 'User not found, not accessible, or is disabled' });
+    }
+    
+    const managerPropertyIds = managerProperties.map(p => p.id);
+    const invalidProperties = propertyIds.filter(id => !managerPropertyIds.includes(id));
+    
+    if (invalidProperties.length > 0) {
+      return res.status(400).json({ 
+        error: `Properties not accessible: ${invalidProperties.join(', ')}` 
+      });
+    }
+    
     const currentRoleAssignment = await prisma.userRoleAssignment.findFirst({
-      where: { userId, isActive: true },
+      where: { userId: targetUserId, isActive: true },
       include: {
         role: {
           include: {
@@ -1224,18 +1356,15 @@ export const grantAdditionalPropertyAccess = async (req, res) => {
     
     const grantedAccess = [];
     
-    // Grant access to each property
     for (const propertyId of propertyIds) {
-      // Check if access already exists
       const existingAccess = await prisma.propertyAccess.findFirst({
         where: {
-          userId: userId,
+          userId: targetUserId,
           propertyId: propertyId
         }
       });
       
       if (existingAccess) {
-        // Reactivate and update existing access
         const updated = await prisma.propertyAccess.update({
           where: { id: existingAccess.id },
           data: {
@@ -1244,18 +1373,17 @@ export const grantAdditionalPropertyAccess = async (req, res) => {
             canEdit: canEdit || existingAccess.canEdit,
             canExport: canExport || existingAccess.canExport,
             expiresAt: expiresAt ? new Date(expiresAt) : existingAccess.expiresAt,
-            grantedBy: managerId,
+            grantedBy: userId,
             grantedAt: new Date()
           }
         });
         grantedAccess.push(updated);
       } else {
-        // Create new access
         const created = await prisma.propertyAccess.create({
           data: {
-            userId: userId,
+            userId: targetUserId,
             propertyId: propertyId,
-            grantedBy: managerId,
+            grantedBy: userId,
             isActive: true,
             canView: true,
             canEdit: canEdit || false,
@@ -1268,27 +1396,23 @@ export const grantAdditionalPropertyAccess = async (req, res) => {
       }
     }
     
-    // Log audit
     await prisma.rBACAuditLog.create({
       data: {
         action: 'GRANT_ADDITIONAL_PROPERTY_ACCESS',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         changes: { 
           propertyIds, 
           canEdit, 
           canExport, 
           expiresAt,
-          propertyNames: managerProperties
-            .filter(p => propertyIds.includes(p.id))
-            .map(p => p.name)
+          propertyNames: managerProperties.map(p => p.name)
         }
       }
     });
     
-    // Invalidate caches for the user and all affected properties
     for (const propertyId of propertyIds) {
-      await invalidatePropertyAccessCaches(propertyId, [userId]);
+      await invalidatePropertyAccessCaches(propertyId, [targetUserId]);
     }
     
     res.json({
@@ -1304,42 +1428,57 @@ export const grantAdditionalPropertyAccess = async (req, res) => {
 
 // @desc    Update user's permission levels for specific property
 // @route   PUT /api/rbac/users/:userId/property-access/:propertyId/permissions
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const updatePropertyPermissions = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId, propertyId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId, propertyId } = req.params;
     const { canView, canEdit, canDelete, canExport, customPermissions } = req.body;
     
-    // Verify user belongs to manager
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true
-      }
-    });
+    // Verify user exists and is accessible
+    let user;
+    let property;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true
+        }
+      });
+      
+      property = await prisma.property.findFirst({
+        where: { id: propertyId }
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true
+        }
+      });
+      
+      property = await prisma.property.findFirst({
+        where: {
+          id: propertyId,
+          managerId: userId
+        }
+      });
+    }
     
     if (!user) {
-      return res.status(404).json({ error: 'User not found or not managed by you' });
+      return res.status(404).json({ error: 'User not found or not accessible' });
     }
-    
-    // Verify property belongs to manager
-    const property = await prisma.property.findFirst({
-      where: {
-        id: propertyId,
-        managerId: managerId
-      }
-    });
     
     if (!property) {
-      return res.status(404).json({ error: 'Property not found or not managed by you' });
+      return res.status(404).json({ error: 'Property not found or not accessible' });
     }
     
-    // Update permissions
     const updatedAccess = await prisma.propertyAccess.updateMany({
       where: {
-        userId: userId,
+        userId: targetUserId,
         propertyId: propertyId,
         isActive: true
       },
@@ -1356,19 +1495,17 @@ export const updatePropertyPermissions = async (req, res) => {
       return res.status(404).json({ error: 'No active access found for this property' });
     }
     
-    // Log audit
     await prisma.rBACAuditLog.create({
       data: {
         action: 'UPDATE_PROPERTY_PERMISSIONS',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         targetProperty: propertyId,
         changes: { canView, canEdit, canDelete, canExport, customPermissions }
       }
     });
     
-    // Invalidate caches for the user and property
-    await invalidatePropertyAccessCaches(propertyId, [userId]);
+    await invalidatePropertyAccessCaches(propertyId, [targetUserId]);
     
     res.json({
       success: true,
@@ -1382,87 +1519,91 @@ export const updatePropertyPermissions = async (req, res) => {
 
 // @desc    Disable managed user (revoke all access)
 // @route   POST /api/rbac/users/:userId/disable
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const disableManagedUser = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
     const { reason } = req.body;
 
-    // --------------------------------------------------
-    // 1. VERIFY USER (OUTSIDE TRANSACTION)
-    // --------------------------------------------------
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true,
-        canManagerLogin: true
-      },
-      include: {
-        userPropertyAccess: {
-          where: { isActive: true },
-          select: { propertyId: true }
+    let user;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true,
+          canManagerLogin: true
         },
-        userAssignments: {
-          where: { isActive: true },
-          select: { roleId: true }
+        include: {
+          userPropertyAccess: {
+            where: { isActive: true },
+            select: { propertyId: true }
+          },
+          userAssignments: {
+            where: { isActive: true },
+            select: { roleId: true }
+          }
         }
-      }
-    });
-
-    if (!user) {
-      return res.status(404).json({
-        error: 'User not found, not managed by you, or already disabled'
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true,
+          canManagerLogin: true
+        },
+        include: {
+          userPropertyAccess: {
+            where: { isActive: true },
+            select: { propertyId: true }
+          },
+          userAssignments: {
+            where: { isActive: true },
+            select: { roleId: true }
+          }
+        }
       });
     }
 
-    // --------------------------------------------------
-    // 2. FAST TRANSACTION (NO CALLBACK → NO TIMEOUT ISSUE)
-    // --------------------------------------------------
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found, not accessible, or already disabled'
+      });
+    }
+
     await prisma.$transaction([
       prisma.user.update({
-        where: { id: userId },
+        where: { id: targetUserId },
         data: { canManagerLogin: false }
       }),
-
       prisma.propertyAccess.updateMany({
-        where: { userId, isActive: true },
+        where: { userId: targetUserId, isActive: true },
         data: { isActive: false }
       }),
-
       prisma.userRoleAssignment.updateMany({
-        where: { userId, isActive: true },
+        where: { userId: targetUserId, isActive: true },
         data: { isActive: false }
       })
     ]);
 
-    // --------------------------------------------------
-    // 3. AUDIT LOG (NON-CRITICAL → OUTSIDE TRANSACTION)
-    // --------------------------------------------------
     await prisma.rBACAuditLog.create({
       data: {
         action: 'DISABLE_MANAGED_USER',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         changes: {
           reason: reason || 'No reason provided',
           disabledProperties: user.userPropertyAccess.map(p => p.propertyId),
           disabledRole: user.userAssignments[0]?.roleId || null
         }
       }
-    }).catch(err => {
-      console.error('Audit log failed:', err.message);
-    });
+    }).catch(err => console.error('Audit log failed:', err.message));
 
-    // --------------------------------------------------
-    // 4. CACHE INVALIDATION
-    // --------------------------------------------------
-    permissionService.invalidateUserCache(userId);
+    permissionService.invalidateUserCache(targetUserId);
 
-    // --------------------------------------------------
-    // 5. RESPONSE
-    // --------------------------------------------------
     res.json({
       success: true,
       message: `User ${user.name} has been disabled and all access revoked`
@@ -1473,40 +1614,62 @@ export const disableManagedUser = async (req, res) => {
     res.status(400).json({ message: error.message });
   }
 };
+
 // @desc    Enable/re-enable managed user
 // @route   POST /api/rbac/users/:userId/enable
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const enableManagedUser = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
 
-    // --------------------------------------------------
-    // 1. VERIFY USER (OUTSIDE TRANSACTION)
-    // --------------------------------------------------
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true,
-        canManagerLogin: false
-      },
-      include: {
-        userPropertyAccess: {
-          where: { isActive: false },
-          select: { id: true, propertyId: true }
+    let user;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true,
+          canManagerLogin: false
         },
-        userAssignments: {
-          where: { isActive: false },
-          orderBy: { assignedAt: 'desc' }, // ✅ FIXED FIELD
-          select: { id: true, roleId: true }
+        include: {
+          userPropertyAccess: {
+            where: { isActive: false },
+            select: { id: true, propertyId: true }
+          },
+          userAssignments: {
+            where: { isActive: false },
+            orderBy: { assignedAt: 'desc' },
+            select: { id: true, roleId: true }
+          }
         }
-      }
-    });
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true,
+          canManagerLogin: false
+        },
+        include: {
+          userPropertyAccess: {
+            where: { isActive: false },
+            select: { id: true, propertyId: true }
+          },
+          userAssignments: {
+            where: { isActive: false },
+            orderBy: { assignedAt: 'desc' },
+            select: { id: true, roleId: true }
+          }
+        }
+      });
+    }
 
     if (!user) {
       return res.status(404).json({
-        error: 'User not found, not managed by you, or already enabled'
+        error: 'User not found, not accessible, or already enabled'
       });
     }
 
@@ -1518,15 +1681,11 @@ export const enableManagedUser = async (req, res) => {
 
     const latestRoleAssignment = user.userAssignments[0];
 
-    // --------------------------------------------------
-    // 2. FAST TRANSACTION (ARRAY-BASED)
-    // --------------------------------------------------
     const queries = [
       prisma.user.update({
-        where: { id: userId },
+        where: { id: targetUserId },
         data: { canManagerLogin: true }
       }),
-
       prisma.userRoleAssignment.update({
         where: { id: latestRoleAssignment.id },
         data: { isActive: true }
@@ -1546,31 +1705,20 @@ export const enableManagedUser = async (req, res) => {
 
     await prisma.$transaction(queries);
 
-    // --------------------------------------------------
-    // 3. AUDIT LOG (OUTSIDE TRANSACTION)
-    // --------------------------------------------------
     await prisma.rBACAuditLog.create({
       data: {
         action: 'ENABLE_MANAGED_USER',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         changes: {
           restoredRole: latestRoleAssignment.roleId,
           restoredProperties: user.userPropertyAccess.map(p => p.propertyId)
         }
       }
-    }).catch(err => {
-      console.error('Audit log failed:', err.message);
-    });
+    }).catch(err => console.error('Audit log failed:', err.message));
 
-    // --------------------------------------------------
-    // 4. CACHE INVALIDATION
-    // --------------------------------------------------
-    permissionService.invalidateUserCache(userId);
+    permissionService.invalidateUserCache(targetUserId);
 
-    // --------------------------------------------------
-    // 5. RESPONSE
-    // --------------------------------------------------
     res.json({
       success: true,
       message: `User has been re-enabled with previous access restored`,
@@ -1588,37 +1736,56 @@ export const enableManagedUser = async (req, res) => {
 
 // @desc    Get user's current access details
 // @route   GET /api/rbac/users/:userId/access-details
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const getUserAccessDetails = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
     
-    // Verify user belongs to manager
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true
-      },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        canManagerLogin: true,
-        isManagedUser: true,
-        createdAt: true,
-        lastLoginAt: true
-      }
-    });
+    let user;
     
-    if (!user) {
-      return res.status(404).json({ error: 'User not found or not managed by you' });
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true
+        },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          canManagerLogin: true,
+          isManagedUser: true,
+          createdAt: true,
+          lastLoginAt: true
+        }
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true
+        },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          canManagerLogin: true,
+          isManagedUser: true,
+          createdAt: true,
+          lastLoginAt: true
+        }
+      });
     }
     
-    // Get current role assignment
+    if (!user) {
+      return res.status(404).json({ error: 'User not found or not accessible' });
+    }
+    
     const roleAssignment = await prisma.userRoleAssignment.findFirst({
-      where: { userId, isActive: true },
+      where: { userId: targetUserId, isActive: true },
       include: {
         role: {
           include: {
@@ -1634,16 +1801,14 @@ export const getUserAccessDetails = async (req, res) => {
       }
     });
     
-    // Get all property access (including inactive)
     const propertyAccess = await prisma.propertyAccess.findMany({
-      where: { userId },
+      where: { userId: targetUserId },
       include: { property: true },
       orderBy: { grantedAt: 'desc' }
     });
     
-    // Get audit history for this user
     const auditLogs = await prisma.rBACAuditLog.findMany({
-      where: { targetUser: userId },
+      where: { targetUser: targetUserId },
       orderBy: { createdAt: 'desc' },
       take: 20,
       include: {
@@ -1694,112 +1859,120 @@ export const getUserAccessDetails = async (req, res) => {
 
 // @desc    Bulk update user access (replace all access)
 // @route   PUT /api/rbac/users/:userId/bulk-access
-// @access  Private/Manager
+// @access  Private/Manager/Admin
 export const bulkUpdateUserAccess = async (req, res) => {
   try {
-    const managerId = req.user.id;
-    const { userId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { userId: targetUserId } = req.params;
     const { roleId, propertyIds, canEdit, canExport, expiresAt, enableUser } = req.body;
 
-    // --------------------------------------------------
-    // 1. VERIFY USER
-    // --------------------------------------------------
-    const user = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        createdByManagerId: managerId,
-        isManagedUser: true
-      }
-    });
+    let user;
+    
+    if (userRole === 'ADMIN') {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          isManagedUser: true
+        }
+      });
+    } else {
+      user = await prisma.user.findFirst({
+        where: {
+          id: targetUserId,
+          createdByManagerId: userId,
+          isManagedUser: true
+        }
+      });
+    }
 
     if (!user) {
       return res.status(404).json({
-        error: 'User not found or not managed by you'
+        error: 'User not found or not accessible'
       });
     }
 
-    // --------------------------------------------------
-    // 2. VERIFY ROLE
-    // --------------------------------------------------
     let role = null;
     if (roleId) {
-      role = await prisma.customRole.findFirst({
-        where: { id: roleId, createdById: managerId }
-      });
+      if (userRole === 'ADMIN') {
+        role = await prisma.customRole.findUnique({
+          where: { id: roleId }
+        });
+      } else {
+        role = await prisma.customRole.findFirst({
+          where: { id: roleId, createdById: userId }
+        });
+      }
 
       if (!role) {
         return res.status(400).json({
-          error: 'Invalid role - not created by you'
+          error: 'Invalid role - not accessible'
         });
       }
     }
 
-    // --------------------------------------------------
-    // 3. VERIFY PROPERTIES
-    // --------------------------------------------------
     if (propertyIds && propertyIds.length > 0) {
-      const managerProperties = await prisma.property.findMany({
-        where: { managerId },
-        select: { id: true }
-      });
+      let managerProperties;
+      
+      if (userRole === 'ADMIN') {
+        managerProperties = await prisma.property.findMany({
+          where: { id: { in: propertyIds } },
+          select: { id: true }
+        });
+      } else {
+        managerProperties = await prisma.property.findMany({
+          where: { managerId: userId, id: { in: propertyIds } },
+          select: { id: true }
+        });
+      }
 
       const managerPropertyIds = managerProperties.map(p => p.id);
-
-      const invalidProperties = propertyIds.filter(
-        id => !managerPropertyIds.includes(id)
-      );
+      const invalidProperties = propertyIds.filter(id => !managerPropertyIds.includes(id));
 
       if (invalidProperties.length > 0) {
         return res.status(400).json({
-          error: `You don't manage properties: ${invalidProperties.join(', ')}`
+          error: `Properties not accessible: ${invalidProperties.join(', ')}`
         });
       }
     }
 
-    // --------------------------------------------------
-    // 4. BUILD TRANSACTION QUERIES (FAST)
-    // --------------------------------------------------
     const queries = [];
 
-    // Enable/Disable user
     if (enableUser !== undefined) {
       queries.push(
         prisma.user.update({
-          where: { id: userId },
+          where: { id: targetUserId },
           data: { canManagerLogin: enableUser }
         })
       );
     }
 
-    // Role update (SAFE UPSERT)
     if (roleId) {
-      // Deactivate other roles
       queries.push(
         prisma.userRoleAssignment.updateMany({
           where: {
-            userId,
+            userId: targetUserId,
             roleId: { not: roleId }
           },
           data: { isActive: false }
         })
       );
 
-      // Upsert role (fixes unique constraint)
       queries.push(
         prisma.userRoleAssignment.upsert({
           where: {
-            userId_roleId: { userId, roleId }
+            userId_roleId: { userId: targetUserId, roleId }
           },
           update: {
             isActive: enableUser !== false,
-            assignedBy: managerId,
+            assignedBy: userId,
             assignedAt: new Date(),
             expiresAt: expiresAt ? new Date(expiresAt) : null
           },
           create: {
-            userId,
+            userId: targetUserId,
             roleId,
-            assignedBy: managerId,
+            assignedBy: userId,
             isActive: enableUser !== false,
             expiresAt: expiresAt ? new Date(expiresAt) : null
           }
@@ -1807,24 +1980,21 @@ export const bulkUpdateUserAccess = async (req, res) => {
       );
     }
 
-    // Property access update
     if (propertyIds) {
-      // Deactivate all existing
       queries.push(
         prisma.propertyAccess.updateMany({
-          where: { userId },
+          where: { userId: targetUserId },
           data: { isActive: false }
         })
       );
 
-      // Bulk create new access
       if (propertyIds.length > 0) {
         queries.push(
           prisma.propertyAccess.createMany({
             data: propertyIds.map(propertyId => ({
-              userId,
+              userId: targetUserId,
               propertyId,
-              grantedBy: managerId,
+              grantedBy: userId,
               isActive: enableUser !== false,
               canView: true,
               canEdit: canEdit || false,
@@ -1832,25 +2002,19 @@ export const bulkUpdateUserAccess = async (req, res) => {
               expiresAt: expiresAt ? new Date(expiresAt) : null,
               roleId: roleId || null
             })),
-            skipDuplicates: true // 🔥 safety
+            skipDuplicates: true
           })
         );
       }
     }
 
-    // --------------------------------------------------
-    // 5. EXECUTE TRANSACTION
-    // --------------------------------------------------
     await prisma.$transaction(queries);
 
-    // --------------------------------------------------
-    // 6. AUDIT LOG (OUTSIDE TRANSACTION)
-    // --------------------------------------------------
     await prisma.rBACAuditLog.create({
       data: {
         action: 'BULK_UPDATE_USER_ACCESS',
-        performedBy: managerId,
-        targetUser: userId,
+        performedBy: userId,
+        targetUser: targetUserId,
         changes: {
           roleId,
           propertyIds,
@@ -1860,18 +2024,10 @@ export const bulkUpdateUserAccess = async (req, res) => {
           enableUser
         }
       }
-    }).catch(err => {
-      console.error('Audit log failed:', err.message);
-    });
+    }).catch(err => console.error('Audit log failed:', err.message));
 
-    // --------------------------------------------------
-    // 7. CACHE INVALIDATION
-    // --------------------------------------------------
-    permissionService.invalidateUserCache(userId);
+    permissionService.invalidateUserCache(targetUserId);
 
-    // --------------------------------------------------
-    // 8. RESPONSE
-    // --------------------------------------------------
     res.json({
       success: true,
       message: 'User access updated successfully'
@@ -1898,7 +2054,6 @@ export const getAuditLogs = async (req, res) => {
     let whereClause = {};
 
     if (userRole === 'MANAGER') {
-      // First fetch users under this manager
       const managedUsers = await prisma.user.findMany({
         where: { createdByManagerId: userId },
         select: { id: true }
@@ -1913,6 +2068,7 @@ export const getAuditLogs = async (req, res) => {
         ]
       };
     }
+    // ADMIN sees all audit logs (no filter)
 
     const logs = await prisma.rBACAuditLog.findMany({
       where: whereClause,
