@@ -752,7 +752,7 @@ export const downloadInvoice = async (req, res) => {
       
       const hasViewPermission = await permissionService.hasPermission(
         userId, 
-        'VIEW_INVOICES'
+        'DOWNLOAD_INVOICES'
       );
       
       if (!hasViewPermission && userRole !== 'MANAGER') {
