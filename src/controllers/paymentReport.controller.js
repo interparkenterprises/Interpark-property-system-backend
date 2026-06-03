@@ -5,10 +5,10 @@ import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 import { generateReceiptHTML } from '../utils/receiptTemplate.js';
 import { uploadToStorage } from '../utils/storage.js';
 import { getPolicyMonths, addBillingPeriod } from '../services/rentCalculation.js';
-import path from 'path';  // ADD THIS
-import fs from 'fs/promises';  // ADD THIS
-import { existsSync } from 'fs';           // For synchronous methods like existsSync
-//const prisma = new PrismaClient();
+import path from 'path';
+import fs from 'fs/promises';
+import { existsSync } from 'fs';
+import permissionService from "../services/permissionService.js";
 
 // Helper: Compute expected rent & service charge for a tenant at a given period
 async function computeExpectedCharges(tenantId, periodStart = null) {
@@ -190,855 +190,12 @@ function getPaginationParams(query) {
   return { page, limit, skip };
 }
 
-// @desc    Get all payment reports (with pagination & filtering)
-// @route   GET /api/payments
-// @access  Private
-export const getPaymentReports = async (req, res) => {
-  try {
-    const { 
-      status, 
-      propertyId, 
-      dateFrom, 
-      dateTo,
-      page = 1,
-      limit = 10 
-    } = req.query;
-
-    const { skip, limit: take } = getPaginationParams(req.query);
-
-    // Build dynamic WHERE clause
-    const where = {};
-
-    // Filter by status (enum-safe)
-    if (status && ['PAID', 'PARTIAL', 'UNPAID'].includes(status)) {
-      where.status = status;
-    }
-
-    // Filter by property (via tenant → unit → property)
-    if (propertyId) {
-      where.tenant = {
-        unit: {
-          propertyId
-        }
-      };
-    }
-
-    // Filter by payment period range
-    if (dateFrom || dateTo) {
-      where.paymentPeriod = {};
-      if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
-      if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
-    }
-
-    // Count total matching records
-    const total = await prisma.paymentReport.count({ where });
-
-    // Fetch paginated data
-    const payments = await prisma.paymentReport.findMany({
-      where,
-      include: {
-        tenant: {
-          select: {
-            id: true,
-            fullName: true,
-            contact: true,
-            vatType: true,
-            vatRate: true,
-            escalationRate: true,
-            escalationFrequency: true,
-            unit: {
-              include: {
-                property: {
-                  select: { id: true, name: true, address: true }
-                }
-              }
-            }
-          }
-        },
-        invoices: {
-          select: {
-            id: true,
-            invoiceNumber: true,
-            totalDue: true,
-            amountPaid: true,
-            status: true,
-            issueDate: true,
-            dueDate: true
-          }
-        }
-      },
-      orderBy: { paymentPeriod: 'desc' },
-      skip,
-      take: parseInt(take)
-    });
-
-    res.json({
-      success: true,
-      data: payments,
-      meta: {
-        page: parseInt(page),
-        limit: parseInt(take),
-        total,
-        totalPages: Math.ceil(total / take)
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching payment reports:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
-
-// @desc    Get payments by tenant
-// @route   GET /api/payments/tenant/:tenantId
-// @access  Private
-export const getPaymentsByTenant = async (req, res) => {
-  try {
-    const { tenantId } = req.params;
-    const { page = 1, limit = 10 } = req.query;
-    const { skip, limit: take } = getPaginationParams(req.query);
-
-    const total = await prisma.paymentReport.count({
-      where: { tenantId }
-    });
-
-    const payments = await prisma.paymentReport.findMany({
-      where: { tenantId },
-      include: {
-        tenant: {
-          select: {
-            id: true,
-            fullName: true,
-            vatType: true,
-            vatRate: true,
-            escalationRate: true,
-            escalationFrequency: true,
-            unit: {
-              include: {
-                property: {
-                  select: { id: true, name: true }
-                }
-              }
-            }
-          }
-        },
-        invoices: {
-          select: {
-            id: true,
-            invoiceNumber: true,
-            totalDue: true,
-            amountPaid: true,
-            status: true,
-            issueDate: true,
-            dueDate: true
-          }
-        }
-      },
-      orderBy: { paymentPeriod: 'desc' },
-      skip,
-      take: parseInt(take)
-    });
-
-    res.json({
-      success: true,
-      data: payments,
-      meta: {
-        page: parseInt(page),
-        limit: parseInt(take),
-        total,
-        totalPages: Math.ceil(total / take)
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching tenant payments:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
-
-// @desc    Get payment report for a whole property (Rent only)
-// @route   GET /api/payments/property/:propertyId/rent-report
-// @access  Private
-export const getPropertyRentPaymentReport = async (req, res) => {
-  try {
-    const { propertyId } = req.params;
-    const { 
-      dateFrom, 
-      dateTo,
-      status,
-      page = 1,
-      limit = 50
-    } = req.query;
-
-    const { skip, limit: take } = getPaginationParams({ page, limit });
-
-    // Validate property exists
-    const property = await prisma.property.findUnique({
-      where: { id: propertyId },
-      select: { id: true, name: true, address: true }
-    });
-
-    if (!property) {
-      return res.status(404).json({
-        success: false,
-        message: 'Property not found'
-      });
-    }
-
-    // Build where clause for payment reports
-    const where = {
-      tenant: {
-        unit: {
-          propertyId: propertyId
-        }
-      }
-    };
-
-    // Filter by payment status
-    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'PREPAID', 'CREDIT'].includes(status)) {
-      where.status = status;
-    }
-
-    // Filter by date range
-    if (dateFrom || dateTo) {
-      where.paymentPeriod = {};
-      if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
-      if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
-    }
-
-    // Get all tenants in this property for summary
-    const tenants = await prisma.tenant.findMany({
-      where: {
-        unit: {
-          propertyId: propertyId
-        }
-      },
-      include: {
-        unit: {
-          select: {
-            id: true,
-            type: true,
-            unitNo: true,
-            floor: true,
-            sizeSqFt: true
-          }
-        },
-        paymentReports: {
-          where: {
-            status: { notIn: ['CREDIT', 'PREPAID'] }
-          },
-          select: {
-            amountPaid: true,
-            totalDue: true,
-            arrears: true,
-            status: true,
-            paymentPeriod: true
-          }
-        }
-      }
-    });
-
-    // Get paginated payment reports
-    const total = await prisma.paymentReport.count({ where });
-
-    const paymentReports = await prisma.paymentReport.findMany({
-      where,
-      include: {
-        tenant: {
-          select: {
-            id: true,
-            fullName: true,
-            contact: true,
-            email: true,
-            vatType: true,
-            paymentPolicy: true,
-            rent: true,
-            unit: {
-              select: {
-                id: true,
-                type: true,
-                unitNo: true,
-                floor: true,
-                sizeSqFt: true
-              }
-            }
-          }
-        },
-        invoices: {
-          select: {
-            id: true,
-            invoiceNumber: true,
-            totalDue: true,
-            amountPaid: true,
-            balance: true,
-            status: true,
-            issueDate: true,
-            dueDate: true
-          }
-        }
-      },
-      orderBy: { paymentPeriod: 'desc' },
-      skip,
-      take: parseInt(take)
-    });
-
-    // Calculate property-wide summaries
-    let totalRentCollected = 0;
-    let totalRentExpected = 0;
-    let totalArrears = 0;
-    let totalOverdueCount = 0;
-    let fullyPaidCount = 0;
-    let partialPaidCount = 0;
-    let unpaidCount = 0;
-
-    // Process all tenants for summary
-    for (const tenant of tenants) {
-      const tenantReports = tenant.paymentReports;
-      
-      // Calculate total paid for this tenant
-      const tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
-      const tenantExpected = tenantReports.reduce((sum, report) => sum + report.totalDue, 0);
-      const tenantArrears = tenantReports.reduce((sum, report) => sum + report.arrears, 0);
-      
-      totalRentCollected += tenantPaid;
-      totalRentExpected += tenantExpected;
-      totalArrears += tenantArrears;
-      
-      // Count payment statuses
-      const latestReport = tenantReports[0];
-      if (latestReport) {
-        if (latestReport.status === 'PAID') fullyPaidCount++;
-        else if (latestReport.status === 'PARTIAL') partialPaidCount++;
-        else if (latestReport.status === 'UNPAID') unpaidCount++;
-      }
-      
-      // Check for overdue payments
-      const hasOverdue = tenantReports.some(report => 
-        report.status === 'UNPAID' && new Date(report.paymentPeriod) < new Date()
-      );
-      if (hasOverdue) totalOverdueCount++;
-    }
-
-    // Calculate collection rate
-    const collectionRate = totalRentExpected > 0 
-      ? (totalRentCollected / totalRentExpected) * 100 
-      : 0;
-
-    // Group by month for trend analysis
-    const monthlyTrends = {};
-    paymentReports.forEach(report => {
-      const monthKey = new Date(report.paymentPeriod).toLocaleDateString('en-US', { 
-        year: 'numeric', 
-        month: 'short' 
-      });
-      
-      if (!monthlyTrends[monthKey]) {
-        monthlyTrends[monthKey] = {
-          month: monthKey,
-          expected: 0,
-          collected: 0,
-          arrears: 0,
-          reportCount: 0
-        };
-      }
-      
-      monthlyTrends[monthKey].expected += report.totalDue;
-      monthlyTrends[monthKey].collected += report.amountPaid;
-      monthlyTrends[monthKey].arrears += report.arrears;
-      monthlyTrends[monthKey].reportCount++;
-    });
-
-    // Calculate outstanding balances per tenant
-    const tenantOutstanding = tenants.map(tenant => {
-      const totalDue = tenant.paymentReports.reduce((sum, r) => sum + r.totalDue, 0);
-      const totalPaid = tenant.paymentReports.reduce((sum, r) => sum + r.amountPaid, 0);
-      const tenantArrears = tenant.paymentReports.reduce((sum, r) => sum + r.arrears, 0);
-      
-      return {
-        tenantId: tenant.id,
-        tenantName: tenant.fullName,
-        unitNo: tenant.unit?.unitNo || 'N/A',
-        unitType: tenant.unit?.type || 'N/A',
-        expectedTotal: totalDue,
-        paidTotal: totalPaid,
-        outstandingBalance: totalDue - totalPaid,
-        arrears: tenantArrears,
-        lastPaymentDate: tenant.paymentReports[0]?.paymentPeriod || null,
-        paymentStatus: tenant.paymentReports[0]?.status || 'UNPAID'
-      };
-    }).filter(t => t.outstandingBalance > 0 || t.arrears > 0);
-
-    res.json({
-      success: true,
-      data: {
-        property: {
-          id: property.id,
-          name: property.name,
-          address: property.address
-        },
-        summary: {
-          totalTenants: tenants.length,
-          totalRentCollected,
-          totalRentExpected,
-          totalArrears,
-          collectionRate: parseFloat(collectionRate.toFixed(2)),
-          collectionRateStatus: collectionRate >= 90 ? 'EXCELLENT' : collectionRate >= 75 ? 'GOOD' : collectionRate >= 50 ? 'AVERAGE' : 'POOR',
-          paymentBreakdown: {
-            fullyPaid: fullyPaidCount,
-            partiallyPaid: partialPaidCount,
-            unpaid: unpaidCount,
-            overdue: totalOverdueCount
-          }
-        },
-        monthlyTrends: Object.values(monthlyTrends),
-        tenantOutstanding,
-        paymentReports: paymentReports.map(report => ({
-          id: report.id,
-          tenantName: report.tenant.fullName,
-          unitNo: report.tenant.unit?.unitNo || 'N/A',
-          paymentPeriod: report.paymentPeriod,
-          expectedAmount: report.totalDue,
-          amountPaid: report.amountPaid,
-          arrears: report.arrears,
-          status: report.status,
-          invoiceCount: report.invoices.length,
-          datePaid: report.datePaid
-        })),
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(take),
-          total,
-          totalPages: Math.ceil(total / take)
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching property rent payment report:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to generate property rent payment report',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Get payment report for a whole property (Bills - Water & Electricity)
-// @route   GET /api/payments/property/:propertyId/bills-report
-// @access  Private
-export const getPropertyBillsPaymentReport = async (req, res) => {
-  try {
-    const { propertyId } = req.params;
-    const { 
-      dateFrom, 
-      dateTo,
-      billType,
-      status,
-      page = 1,
-      limit = 50
-    } = req.query;
-
-    const { skip, limit: take } = getPaginationParams({ page, limit });
-
-    // Validate property exists
-    const property = await prisma.property.findUnique({
-      where: { id: propertyId },
-      select: { id: true, name: true, address: true }
-    });
-
-    if (!property) {
-      return res.status(404).json({
-        success: false,
-        message: 'Property not found'
-      });
-    }
-
-    // Build where clause for bill invoices
-    const where = {
-      tenant: {
-        unit: {
-          propertyId: propertyId
-        }
-      }
-    };
-
-    // Filter by bill type (Water or Electricity)
-    if (billType && ['WATER', 'ELECTRICITY'].includes(billType.toUpperCase())) {
-      where.billType = billType.toUpperCase();
-    }
-
-    // Filter by status
-    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'OVERDUE', 'CANCELLED'].includes(status)) {
-      where.status = status;
-    }
-
-    // Filter by date range - using issueDate
-    if (dateFrom || dateTo) {
-      where.issueDate = {};
-      if (dateFrom) where.issueDate.gte = new Date(dateFrom);
-      if (dateTo) where.issueDate.lte = new Date(dateTo);
-    }
-
-    // Get all tenants in this property with their bill invoices
-    const tenants = await prisma.tenant.findMany({
-      where: {
-        unit: {
-          propertyId: propertyId
-        }
-      },
-      include: {
-        unit: {
-          select: {
-            id: true,
-            type: true,
-            unitNo: true,
-            floor: true,
-            sizeSqFt: true
-          }
-        },
-        billInvoices: {
-          where: {
-            ...(billType ? { billType: billType.toUpperCase() } : {}),
-            ...(status ? { status } : {}),
-            ...(dateFrom || dateTo ? {
-              issueDate: {
-                ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
-                ...(dateTo ? { lte: new Date(dateTo) } : {})
-              }
-            } : {})
-          },
-          orderBy: { issueDate: 'desc' }
-          // Removed the 'items' include since it doesn't exist in the schema
-        }
-      }
-    });
-
-    // Get paginated bill invoices
-    const total = await prisma.billInvoice.count({ where });
-
-    const billInvoices = await prisma.billInvoice.findMany({
-      where,
-      include: {
-        tenant: {
-          select: {
-            id: true,
-            fullName: true,
-            contact: true,
-            email: true,
-            unit: {
-              select: {
-                id: true,
-                type: true,
-                unitNo: true,
-                floor: true
-              }
-            }
-          }
-        }
-        // Removed the 'items' include since it doesn't exist in the schema
-      },
-      orderBy: { issueDate: 'desc' },
-      skip,
-      take: parseInt(take)
-    });
-
-    // Calculate summaries
-    let totalWaterBills = 0;
-    let totalWaterCollected = 0;
-    let totalWaterArrears = 0;
-    let totalElectricityBills = 0;
-    let totalElectricityCollected = 0;
-    let totalElectricityArrears = 0;
-    let totalBillsExpected = 0;
-    let totalBillsCollected = 0;
-    let totalBillsArrears = 0;
-
-    // Track paid/unpaid counts
-    let paidBillsCount = 0;
-    let partialBillsCount = 0;
-    let unpaidBillsCount = 0;
-    let overdueBillsCount = 0;
-
-    // Process all bill invoices
-    for (const tenant of tenants) {
-      for (const invoice of tenant.billInvoices) {
-        const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
-        const amountPaid = invoice.amountPaid || 0;
-        const balance = invoice.balance || (grandTotal - amountPaid);
-        
-        if (invoice.billType === 'WATER') {
-          totalWaterBills += grandTotal;
-          totalWaterCollected += amountPaid;
-          totalWaterArrears += balance;
-        } else if (invoice.billType === 'ELECTRICITY') {
-          totalElectricityBills += grandTotal;
-          totalElectricityCollected += amountPaid;
-          totalElectricityArrears += balance;
-        }
-        
-        totalBillsExpected += grandTotal;
-        totalBillsCollected += amountPaid;
-        totalBillsArrears += balance;
-        
-        // Count by status
-        if (invoice.status === 'PAID') paidBillsCount++;
-        else if (invoice.status === 'PARTIAL') partialBillsCount++;
-        else if (invoice.status === 'UNPAID') unpaidBillsCount++;
-        else if (invoice.status === 'OVERDUE') overdueBillsCount++;
-      }
-    }
-
-    // Calculate collection rates
-    const waterCollectionRate = totalWaterBills > 0 ? (totalWaterCollected / totalWaterBills) * 100 : 0;
-    const electricityCollectionRate = totalElectricityBills > 0 ? (totalElectricityCollected / totalElectricityBills) * 100 : 0;
-    const overallCollectionRate = totalBillsExpected > 0 ? (totalBillsCollected / totalBillsExpected) * 100 : 0;
-
-    // Group by bill type and month for trends - using issueDate
-    const monthlyTrends = {};
-    billInvoices.forEach(invoice => {
-      const monthKey = new Date(invoice.issueDate).toLocaleDateString('en-US', { 
-        year: 'numeric', 
-        month: 'short' 
-      });
-      const billType = invoice.billType;
-      
-      if (!monthlyTrends[monthKey]) {
-        monthlyTrends[monthKey] = {
-          month: monthKey,
-          water: { expected: 0, collected: 0, arrears: 0 },
-          electricity: { expected: 0, collected: 0, arrears: 0 },
-          total: { expected: 0, collected: 0, arrears: 0 }
-        };
-      }
-      
-      const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
-      const amountPaid = invoice.amountPaid || 0;
-      const balance = invoice.balance || (grandTotal - amountPaid);
-      
-      if (billType === 'WATER') {
-        monthlyTrends[monthKey].water.expected += grandTotal;
-        monthlyTrends[monthKey].water.collected += amountPaid;
-        monthlyTrends[monthKey].water.arrears += balance;
-      } else if (billType === 'ELECTRICITY') {
-        monthlyTrends[monthKey].electricity.expected += grandTotal;
-        monthlyTrends[monthKey].electricity.collected += amountPaid;
-        monthlyTrends[monthKey].electricity.arrears += balance;
-      }
-      
-      monthlyTrends[monthKey].total.expected += grandTotal;
-      monthlyTrends[monthKey].total.collected += amountPaid;
-      monthlyTrends[monthKey].total.arrears += balance;
-    });
-
-    // Calculate tenant-wise bill summary
-    const tenantBillSummary = tenants.map(tenant => {
-      let waterTotal = 0, waterPaid = 0, waterBalance = 0;
-      let electricityTotal = 0, electricityPaid = 0, electricityBalance = 0;
-      
-      tenant.billInvoices.forEach(invoice => {
-        const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
-        const amountPaid = invoice.amountPaid || 0;
-        const balance = invoice.balance || (grandTotal - amountPaid);
-        
-        if (invoice.billType === 'WATER') {
-          waterTotal += grandTotal;
-          waterPaid += amountPaid;
-          waterBalance += balance;
-        } else if (invoice.billType === 'ELECTRICITY') {
-          electricityTotal += grandTotal;
-          electricityPaid += amountPaid;
-          electricityBalance += balance;
-        }
-      });
-      
-      return {
-        tenantId: tenant.id,
-        tenantName: tenant.fullName,
-        unitNo: tenant.unit?.unitNo || 'N/A',
-        unitType: tenant.unit?.type || 'N/A',
-        water: {
-          total: waterTotal,
-          paid: waterPaid,
-          outstanding: waterBalance,
-          status: waterBalance === 0 ? 'PAID' : waterPaid > 0 ? 'PARTIAL' : 'UNPAID'
-        },
-        electricity: {
-          total: electricityTotal,
-          paid: electricityPaid,
-          outstanding: electricityBalance,
-          status: electricityBalance === 0 ? 'PAID' : electricityPaid > 0 ? 'PARTIAL' : 'UNPAID'
-        },
-        totalOutstanding: waterBalance + electricityBalance
-      };
-    }).filter(t => t.totalOutstanding > 0);
-
-    // Calculate delinquency report (bills overdue by more than 30 days)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    
-    const delinquentBills = billInvoices.filter(invoice => 
-      invoice.status === 'OVERDUE' || 
-      (invoice.status === 'UNPAID' && new Date(invoice.dueDate) < thirtyDaysAgo)
-    );
-
-    res.json({
-      success: true,
-      data: {
-        property: {
-          id: property.id,
-          name: property.name,
-          address: property.address
-        },
-        summary: {
-          totalTenants: tenants.length,
-          totalBillInvoices: billInvoices.length,
-          water: {
-            totalBilled: totalWaterBills,
-            totalCollected: totalWaterCollected,
-            totalArrears: totalWaterArrears,
-            collectionRate: parseFloat(waterCollectionRate.toFixed(2)),
-            status: waterCollectionRate >= 90 ? 'EXCELLENT' : waterCollectionRate >= 75 ? 'GOOD' : waterCollectionRate >= 50 ? 'AVERAGE' : 'POOR'
-          },
-          electricity: {
-            totalBilled: totalElectricityBills,
-            totalCollected: totalElectricityCollected,
-            totalArrears: totalElectricityArrears,
-            collectionRate: parseFloat(electricityCollectionRate.toFixed(2)),
-            status: electricityCollectionRate >= 90 ? 'EXCELLENT' : electricityCollectionRate >= 75 ? 'GOOD' : electricityCollectionRate >= 50 ? 'AVERAGE' : 'POOR'
-          },
-          overall: {
-            totalBilled: totalBillsExpected,
-            totalCollected: totalBillsCollected,
-            totalArrears: totalBillsArrears,
-            collectionRate: parseFloat(overallCollectionRate.toFixed(2)),
-            delinquentBillsCount: delinquentBills.length,
-            paymentBreakdown: {
-              paid: paidBillsCount,
-              partial: partialBillsCount,
-              unpaid: unpaidBillsCount,
-              overdue: overdueBillsCount
-            }
-          }
-        },
-        monthlyTrends: Object.values(monthlyTrends),
-        tenantOutstanding: tenantBillSummary,
-        delinquentBills: delinquentBills.map(invoice => ({
-          id: invoice.id,
-          invoiceNumber: invoice.invoiceNumber,
-          tenantName: invoice.tenant.fullName,
-          unitNo: invoice.tenant.unit?.unitNo || 'N/A',
-          billType: invoice.billType,
-          amount: invoice.grandTotal || invoice.totalAmount,
-          amountPaid: invoice.amountPaid || 0,
-          balance: invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0)),
-          issueDate: invoice.issueDate,
-          dueDate: invoice.dueDate,
-          daysOverdue: Math.floor((new Date() - new Date(invoice.dueDate)) / (1000 * 60 * 60 * 24)),
-          status: invoice.status
-        })),
-        billInvoices: billInvoices.map(invoice => ({
-          id: invoice.id,
-          invoiceNumber: invoice.invoiceNumber,
-          tenantName: invoice.tenant.fullName,
-          unitNo: invoice.tenant.unit?.unitNo || 'N/A',
-          billType: invoice.billType,
-          billReferenceNumber: invoice.billReferenceNumber,
-          billReferenceDate: invoice.billReferenceDate,
-          issueDate: invoice.issueDate,
-          dueDate: invoice.dueDate,
-          totalAmount: invoice.grandTotal || invoice.totalAmount,
-          amountPaid: invoice.amountPaid || 0,
-          balance: invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0)),
-          status: invoice.status,
-          unitsConsumed: invoice.units,
-          chargePerUnit: invoice.chargePerUnit,
-          previousReading: invoice.previousReading,
-          currentReading: invoice.currentReading,
-          vatRate: invoice.vatRate,
-          vatAmount: invoice.vatAmount
-        })),
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(take),
-          total,
-          totalPages: Math.ceil(total / take)
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching property bills payment report:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to generate property bills payment report',
-      error: error.message
-    });
-  }
-};
-
-// @desc    Get outstanding invoices for a tenant
-// @route   GET /api/payments/outstanding/:tenantId
-// @access  Private
-export const getOutstandingInvoices = async (req, res) => {
-  try {
-    const { tenantId } = req.params;
-
-    // Get unpaid/partial rent invoices only
-    const rentInvoices = await prisma.invoice.findMany({
-      where: {
-        tenantId,
-        status: {
-          in: ['UNPAID', 'PARTIAL', 'OVERDUE']
-        }
-      },
-      orderBy: { dueDate: 'asc' },
-      select: {
-        id: true,
-        invoiceNumber: true,
-        issueDate: true,
-        dueDate: true,
-        paymentPeriod: true,
-        paymentPolicy: true,
-        rent: true,
-        serviceCharge: true,
-        vat: true,
-        totalDue: true,
-        amountPaid: true,
-        balance: true,
-        status: true,
-        pdfUrl: true
-      }
-    });
-
-    // Calculate totals
-    const totalRentBalance = rentInvoices.reduce((sum, inv) => sum + inv.balance, 0);
-
-    res.json({
-      success: true,
-      data: {
-        rentInvoices,
-        totals: {
-          totalRentBalance,
-          totalOutstanding: totalRentBalance,
-          invoiceCount: rentInvoices.length
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching outstanding invoices:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to fetch outstanding invoices' 
-    });
-  }
-};
-
 // Helper: Get or create tenant credit balance for overpayments
 async function getTenantCreditBalance(tx, tenantId) {
-  // Look for existing credit balance (stored as a special payment report with status 'CREDIT')
   const creditBalance = await tx.paymentReport.findFirst({
     where: {
       tenantId,
-      status: 'CREDIT' // We'll add this to PaymentStatus enum
+      status: 'CREDIT'
     },
     orderBy: { createdAt: 'desc' }
   });
@@ -1148,14 +305,13 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
     const receiptHTML = generateReceiptHTML(receiptData);
     const pdfBuffer = await generatePDF(receiptHTML);
 
-    // Update with new receipt URL - store in receipts subdirectory
     const receiptFileName = `${receiptData.receiptNumber}.pdf`;
     const receiptUrl = await uploadToStorage(pdfBuffer, receiptFileName, 'receipts');
     
     return {
       receiptUrl,
       receiptNumber: receiptData.receiptNumber,
-      pdfBuffer // Return buffer for immediate download if needed
+      pdfBuffer
     };
   } catch (error) {
     console.error('Error generating receipt:', error);
@@ -1163,17 +319,1143 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
   }
 }
 
+// Helper function to update existing invoices when payment is made
+async function updateExistingInvoicesForPayment(tx, tenantId, paymentPeriodStr, parsedAmountPaid, paymentReportId, periodStartDate, paymentStatus) {
+  try {
+    const existingInvoices = await tx.invoice.findMany({
+      where: {
+        tenantId,
+        paymentPeriod: paymentPeriodStr,
+        status: {
+          in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+        },
+        paymentReportId: null
+      },
+      orderBy: {
+        dueDate: 'asc'
+      }
+    });
+
+    if (existingInvoices.length === 0) {
+      return {
+        updatedInvoices: [],
+        remainingPayment: parsedAmountPaid,
+        totalApplied: 0
+      };
+    }
+
+    let remainingPayment = parsedAmountPaid;
+    const updatedInvoices = [];
+
+    for (const invoice of existingInvoices) {
+      if (remainingPayment <= 0) break;
+
+      if (invoice.paymentPeriod === paymentPeriodStr) {
+        if (invoice.balance > 0) {
+          const paymentToApply = Math.min(invoice.balance, remainingPayment);
+          const newAmountPaid = invoice.amountPaid + paymentToApply;
+          const newBalance = invoice.balance - paymentToApply;
+          
+          let newStatus = invoice.status;
+          if (newBalance <= 0) {
+            newStatus = 'PAID';
+          } else if (paymentToApply > 0 && invoice.status === 'UNPAID') {
+            newStatus = 'PARTIAL';
+          }
+
+          await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+              amountPaid: newAmountPaid,
+              balance: newBalance,
+              status: newStatus,
+              paymentReportId: paymentReportId,
+              updatedAt: new Date()
+            }
+          });
+
+          remainingPayment -= paymentToApply;
+          updatedInvoices.push({
+            id: invoice.id,
+            invoiceNumber: invoice.invoiceNumber,
+            previousBalance: invoice.balance,
+            previousAmountPaid: invoice.amountPaid,
+            paymentApplied: paymentToApply,
+            newAmountPaid,
+            newBalance,
+            newStatus,
+            previousStatus: invoice.status,
+            paymentPolicy: invoice.paymentPolicy,
+            wasAutoPaid: true
+          });
+        }
+      }
+    }
+
+    if (paymentStatus === 'PAID' && updatedInvoices.length > 0 && remainingPayment > 0) {
+      const remainingUnpaidInvoices = await tx.invoice.findMany({
+        where: {
+          tenantId,
+          paymentPeriod: paymentPeriodStr,
+          status: {
+            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+          },
+          id: {
+            notIn: updatedInvoices.map(i => i.id)
+          },
+          paymentReportId: null
+        }
+      });
+
+      for (const invoice of remainingUnpaidInvoices) {
+        await tx.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            amountPaid: invoice.totalDue,
+            balance: 0,
+            status: 'PAID',
+            paymentReportId: paymentReportId,
+            updatedAt: new Date()
+          }
+        });
+
+        updatedInvoices.push({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          previousBalance: invoice.balance,
+          previousAmountPaid: invoice.amountPaid,
+          paymentApplied: invoice.balance,
+          newAmountPaid: invoice.totalDue,
+          newBalance: 0,
+          newStatus: 'PAID',
+          previousStatus: invoice.status,
+          paymentPolicy: invoice.paymentPolicy,
+          wasAutoPaid: true
+        });
+      }
+    }
+
+    return {
+      updatedInvoices,
+      remainingPayment,
+      totalApplied: parsedAmountPaid - remainingPayment
+    };
+  } catch (error) {
+    console.error('Error in updateExistingInvoicesForPayment:', error);
+    throw error;
+  }
+}
+
+// ======================================================
+// PERMISSION MIDDLEWARE HELPERS
+// ======================================================
+
+// Helper to check if user can access a payment report based on property
+async function canAccessPaymentReport(userId, userRole, paymentReportId) {
+  if (userRole === 'ADMIN') return true;
+  
+  const paymentReport = await prisma.paymentReport.findUnique({
+    where: { id: paymentReportId },
+    include: {
+      tenant: {
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          }
+        }
+      }
+    }
+  });
+  
+  if (!paymentReport) return false;
+  
+  const propertyId = paymentReport.tenant?.unit?.propertyId;
+  
+  if (!propertyId) return false;
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+    return property?.managerId === userId;
+  }
+  
+  return permissionService.checkPropertyAccess(userId, propertyId, 'canView');
+}
+
+// Helper to check if user can manage payments for a property
+async function canManagePaymentForProperty(userId, userRole, propertyId) {
+  if (userRole === 'ADMIN') return true;
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+    return property?.managerId === userId;
+  }
+  
+  return permissionService.checkPermission(userId, 'paymentReport', 'create', propertyId);
+}
+
+// Helper to check if user can view payments for a property
+async function canViewPaymentsForProperty(userId, userRole, propertyId) {
+  if (userRole === 'ADMIN') return true;
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+    return property?.managerId === userId;
+  }
+  
+  return permissionService.checkPermission(userId, 'paymentReport', 'view', propertyId);
+}
+
+// ======================================================
+// PAYMENT REPORT CRUD OPERATIONS WITH PERMISSIONS
+// ======================================================
+
+// @desc    Get all payment reports (with pagination & filtering)
+// @route   GET /api/payments
+// @access  Private (ADMIN, MANAGER, USER with VIEW_PAYMENT_REPORTS)
+export const getPaymentReports = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { 
+      status, 
+      propertyId, 
+      dateFrom, 
+      dateTo,
+      page = 1,
+      limit = 10 
+    } = req.query;
+
+    const { skip, limit: take } = getPaginationParams(req.query);
+
+    // Check permission
+    if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
+      const hasPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_PAYMENT_REPORTS'
+      );
+      if (!hasPermission) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view payment reports' 
+        });
+      }
+    }
+
+    // Build dynamic WHERE clause
+    const where = {};
+
+    if (status && ['PAID', 'PARTIAL', 'UNPAID'].includes(status)) {
+      where.status = status;
+    }
+
+    if (propertyId) {
+      const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view payments for this property' 
+        });
+      }
+      
+      where.tenant = {
+        unit: {
+          propertyId
+        }
+      };
+    } else if (userRole === 'MANAGER') {
+      const managedProperties = await prisma.property.findMany({
+        where: { managerId: userId },
+        select: { id: true }
+      });
+      const managedPropertyIds = managedProperties.map(p => p.id);
+      
+      where.tenant = {
+        unit: {
+          propertyId: { in: managedPropertyIds }
+        }
+      };
+    } else if (userRole !== 'ADMIN') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      where.tenant = {
+        unit: {
+          propertyId: { in: accessiblePropertyIds }
+        }
+      };
+    }
+
+    if (dateFrom || dateTo) {
+      where.paymentPeriod = {};
+      if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
+      if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
+    }
+
+    const total = await prisma.paymentReport.count({ where });
+
+    const payments = await prisma.paymentReport.findMany({
+      where,
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            vatType: true,
+            vatRate: true,
+            escalationRate: true,
+            escalationFrequency: true,
+            unit: {
+              include: {
+                property: {
+                  select: { id: true, name: true, address: true }
+                }
+              }
+            }
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
+          }
+        }
+      },
+      orderBy: { paymentPeriod: 'desc' },
+      skip,
+      take: parseInt(take)
+    });
+
+    res.json({
+      success: true,
+      data: payments,
+      meta: {
+        page: parseInt(page),
+        limit: parseInt(take),
+        total,
+        totalPages: Math.ceil(total / take)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching payment reports:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Get payments by tenant
+// @route   GET /api/payments/tenant/:tenantId
+// @access  Private
+export const getPaymentsByTenant = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { tenantId } = req.params;
+    const { page = 1, limit = 10 } = req.query;
+    const { skip, limit: take } = getPaginationParams(req.query);
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      include: {
+        unit: {
+          include: { property: true }
+        }
+      }
+    });
+
+    if (!tenant) {
+      return res.status(404).json({ success: false, message: 'Tenant not found' });
+    }
+
+    const propertyId = tenant.unit?.propertyId;
+    
+    if (userRole !== 'ADMIN') {
+      const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view payments for this tenant' 
+        });
+      }
+    }
+
+    const total = await prisma.paymentReport.count({
+      where: { tenantId }
+    });
+
+    const payments = await prisma.paymentReport.findMany({
+      where: { tenantId },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            vatType: true,
+            vatRate: true,
+            escalationRate: true,
+            escalationFrequency: true,
+            unit: {
+              include: {
+                property: {
+                  select: { id: true, name: true }
+                }
+              }
+            }
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
+          }
+        }
+      },
+      orderBy: { paymentPeriod: 'desc' },
+      skip,
+      take: parseInt(take)
+    });
+
+    res.json({
+      success: true,
+      data: payments,
+      meta: {
+        page: parseInt(page),
+        limit: parseInt(take),
+        total,
+        totalPages: Math.ceil(total / take)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching tenant payments:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Get payment report for a whole property (Rent only)
+// @route   GET /api/payments/property/:propertyId/rent-report
+// @access  Private
+export const getPropertyRentPaymentReport = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { propertyId } = req.params;
+    const { 
+      dateFrom, 
+      dateTo,
+      status,
+      page = 1,
+      limit = 50
+    } = req.query;
+
+    const { skip, limit: take } = getPaginationParams({ page, limit });
+
+    const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+    if (!canView) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'You do not have permission to view payments for this property' 
+      });
+    }
+
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { id: true, name: true, address: true, managerId: true }
+    });
+
+    if (!property) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+
+    const where = {
+      tenant: {
+        unit: {
+          propertyId: propertyId
+        }
+      }
+    };
+
+    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'PREPAID', 'CREDIT'].includes(status)) {
+      where.status = status;
+    }
+
+    if (dateFrom || dateTo) {
+      where.paymentPeriod = {};
+      if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
+      if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
+    }
+
+    const tenants = await prisma.tenant.findMany({
+      where: {
+        unit: {
+          propertyId: propertyId
+        }
+      },
+      include: {
+        unit: {
+          select: {
+            id: true,
+            type: true,
+            unitNo: true,
+            floor: true,
+            sizeSqFt: true
+          }
+        },
+        paymentReports: {
+          where: {
+            status: { notIn: ['CREDIT', 'PREPAID'] }
+          },
+          select: {
+            amountPaid: true,
+            totalDue: true,
+            arrears: true,
+            status: true,
+            paymentPeriod: true
+          }
+        }
+      }
+    });
+
+    const total = await prisma.paymentReport.count({ where });
+
+    const paymentReports = await prisma.paymentReport.findMany({
+      where,
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            email: true,
+            vatType: true,
+            paymentPolicy: true,
+            rent: true,
+            unit: {
+              select: {
+                id: true,
+                type: true,
+                unitNo: true,
+                floor: true,
+                sizeSqFt: true
+              }
+            }
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            balance: true,
+            status: true,
+            issueDate: true,
+            dueDate: true
+          }
+        }
+      },
+      orderBy: { paymentPeriod: 'desc' },
+      skip,
+      take: parseInt(take)
+    });
+
+    let totalRentCollected = 0;
+    let totalRentExpected = 0;
+    let totalArrears = 0;
+    let totalOverdueCount = 0;
+    let fullyPaidCount = 0;
+    let partialPaidCount = 0;
+    let unpaidCount = 0;
+
+    for (const tenant of tenants) {
+      const tenantReports = tenant.paymentReports;
+      
+      const tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
+      const tenantExpected = tenantReports.reduce((sum, report) => sum + report.totalDue, 0);
+      const tenantArrears = tenantReports.reduce((sum, report) => sum + report.arrears, 0);
+      
+      totalRentCollected += tenantPaid;
+      totalRentExpected += tenantExpected;
+      totalArrears += tenantArrears;
+      
+      const latestReport = tenantReports[0];
+      if (latestReport) {
+        if (latestReport.status === 'PAID') fullyPaidCount++;
+        else if (latestReport.status === 'PARTIAL') partialPaidCount++;
+        else if (latestReport.status === 'UNPAID') unpaidCount++;
+      }
+      
+      const hasOverdue = tenantReports.some(report => 
+        report.status === 'UNPAID' && new Date(report.paymentPeriod) < new Date()
+      );
+      if (hasOverdue) totalOverdueCount++;
+    }
+
+    const collectionRate = totalRentExpected > 0 
+      ? (totalRentCollected / totalRentExpected) * 100 
+      : 0;
+
+    const monthlyTrends = {};
+    paymentReports.forEach(report => {
+      const monthKey = new Date(report.paymentPeriod).toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short' 
+      });
+      
+      if (!monthlyTrends[monthKey]) {
+        monthlyTrends[monthKey] = {
+          month: monthKey,
+          expected: 0,
+          collected: 0,
+          arrears: 0,
+          reportCount: 0
+        };
+      }
+      
+      monthlyTrends[monthKey].expected += report.totalDue;
+      monthlyTrends[monthKey].collected += report.amountPaid;
+      monthlyTrends[monthKey].arrears += report.arrears;
+      monthlyTrends[monthKey].reportCount++;
+    });
+
+    const tenantOutstanding = tenants.map(tenant => {
+      const totalDue = tenant.paymentReports.reduce((sum, r) => sum + r.totalDue, 0);
+      const totalPaid = tenant.paymentReports.reduce((sum, r) => sum + r.amountPaid, 0);
+      const tenantArrears = tenant.paymentReports.reduce((sum, r) => sum + r.arrears, 0);
+      
+      return {
+        tenantId: tenant.id,
+        tenantName: tenant.fullName,
+        unitNo: tenant.unit?.unitNo || 'N/A',
+        unitType: tenant.unit?.type || 'N/A',
+        expectedTotal: totalDue,
+        paidTotal: totalPaid,
+        outstandingBalance: totalDue - totalPaid,
+        arrears: tenantArrears,
+        lastPaymentDate: tenant.paymentReports[0]?.paymentPeriod || null,
+        paymentStatus: tenant.paymentReports[0]?.status || 'UNPAID'
+      };
+    }).filter(t => t.outstandingBalance > 0 || t.arrears > 0);
+
+    res.json({
+      success: true,
+      data: {
+        property: {
+          id: property.id,
+          name: property.name,
+          address: property.address
+        },
+        summary: {
+          totalTenants: tenants.length,
+          totalRentCollected,
+          totalRentExpected,
+          totalArrears,
+          collectionRate: parseFloat(collectionRate.toFixed(2)),
+          collectionRateStatus: collectionRate >= 90 ? 'EXCELLENT' : collectionRate >= 75 ? 'GOOD' : collectionRate >= 50 ? 'AVERAGE' : 'POOR',
+          paymentBreakdown: {
+            fullyPaid: fullyPaidCount,
+            partiallyPaid: partialPaidCount,
+            unpaid: unpaidCount,
+            overdue: totalOverdueCount
+          }
+        },
+        monthlyTrends: Object.values(monthlyTrends),
+        tenantOutstanding,
+        paymentReports: paymentReports.map(report => ({
+          id: report.id,
+          tenantName: report.tenant.fullName,
+          unitNo: report.tenant.unit?.unitNo || 'N/A',
+          paymentPeriod: report.paymentPeriod,
+          expectedAmount: report.totalDue,
+          amountPaid: report.amountPaid,
+          arrears: report.arrears,
+          status: report.status,
+          invoiceCount: report.invoices.length,
+          datePaid: report.datePaid
+        })),
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(take),
+          total,
+          totalPages: Math.ceil(total / take)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property rent payment report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate property rent payment report',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Get payment report for a whole property (Bills - Water & Electricity)
+// @route   GET /api/payments/property/:propertyId/bills-report
+// @access  Private
+export const getPropertyBillsPaymentReport = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { propertyId } = req.params;
+    const { 
+      dateFrom, 
+      dateTo,
+      billType,
+      status,
+      page = 1,
+      limit = 50
+    } = req.query;
+
+    const { skip, limit: take } = getPaginationParams({ page, limit });
+
+    const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+    if (!canView) {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'You do not have permission to view bills for this property' 
+      });
+    }
+
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { id: true, name: true, address: true }
+    });
+
+    if (!property) {
+      return res.status(404).json({
+        success: false,
+        message: 'Property not found'
+      });
+    }
+
+    const where = {
+      tenant: {
+        unit: {
+          propertyId: propertyId
+        }
+      }
+    };
+
+    if (billType && ['WATER', 'ELECTRICITY'].includes(billType.toUpperCase())) {
+      where.billType = billType.toUpperCase();
+    }
+
+    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'OVERDUE', 'CANCELLED'].includes(status)) {
+      where.status = status;
+    }
+
+    if (dateFrom || dateTo) {
+      where.issueDate = {};
+      if (dateFrom) where.issueDate.gte = new Date(dateFrom);
+      if (dateTo) where.issueDate.lte = new Date(dateTo);
+    }
+
+    const tenants = await prisma.tenant.findMany({
+      where: {
+        unit: {
+          propertyId: propertyId
+        }
+      },
+      include: {
+        unit: {
+          select: {
+            id: true,
+            type: true,
+            unitNo: true,
+            floor: true,
+            sizeSqFt: true
+          }
+        },
+        billInvoices: {
+          where: {
+            ...(billType ? { billType: billType.toUpperCase() } : {}),
+            ...(status ? { status } : {}),
+            ...(dateFrom || dateTo ? {
+              issueDate: {
+                ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
+                ...(dateTo ? { lte: new Date(dateTo) } : {})
+              }
+            } : {})
+          },
+          orderBy: { issueDate: 'desc' }
+        }
+      }
+    });
+
+    const total = await prisma.billInvoice.count({ where });
+
+    const billInvoices = await prisma.billInvoice.findMany({
+      where,
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            email: true,
+            unit: {
+              select: {
+                id: true,
+                type: true,
+                unitNo: true,
+                floor: true
+              }
+            }
+          }
+        }
+      },
+      orderBy: { issueDate: 'desc' },
+      skip,
+      take: parseInt(take)
+    });
+
+    let totalWaterBills = 0;
+    let totalWaterCollected = 0;
+    let totalWaterArrears = 0;
+    let totalElectricityBills = 0;
+    let totalElectricityCollected = 0;
+    let totalElectricityArrears = 0;
+    let totalBillsExpected = 0;
+    let totalBillsCollected = 0;
+    let totalBillsArrears = 0;
+    let paidBillsCount = 0;
+    let partialBillsCount = 0;
+    let unpaidBillsCount = 0;
+    let overdueBillsCount = 0;
+
+    for (const tenant of tenants) {
+      for (const invoice of tenant.billInvoices) {
+        const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
+        const amountPaid = invoice.amountPaid || 0;
+        const balance = invoice.balance || (grandTotal - amountPaid);
+        
+        if (invoice.billType === 'WATER') {
+          totalWaterBills += grandTotal;
+          totalWaterCollected += amountPaid;
+          totalWaterArrears += balance;
+        } else if (invoice.billType === 'ELECTRICITY') {
+          totalElectricityBills += grandTotal;
+          totalElectricityCollected += amountPaid;
+          totalElectricityArrears += balance;
+        }
+        
+        totalBillsExpected += grandTotal;
+        totalBillsCollected += amountPaid;
+        totalBillsArrears += balance;
+        
+        if (invoice.status === 'PAID') paidBillsCount++;
+        else if (invoice.status === 'PARTIAL') partialBillsCount++;
+        else if (invoice.status === 'UNPAID') unpaidBillsCount++;
+        else if (invoice.status === 'OVERDUE') overdueBillsCount++;
+      }
+    }
+
+    const waterCollectionRate = totalWaterBills > 0 ? (totalWaterCollected / totalWaterBills) * 100 : 0;
+    const electricityCollectionRate = totalElectricityBills > 0 ? (totalElectricityCollected / totalElectricityBills) * 100 : 0;
+    const overallCollectionRate = totalBillsExpected > 0 ? (totalBillsCollected / totalBillsExpected) * 100 : 0;
+
+    const monthlyTrends = {};
+    billInvoices.forEach(invoice => {
+      const monthKey = new Date(invoice.issueDate).toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short' 
+      });
+      const billType = invoice.billType;
+      
+      if (!monthlyTrends[monthKey]) {
+        monthlyTrends[monthKey] = {
+          month: monthKey,
+          water: { expected: 0, collected: 0, arrears: 0 },
+          electricity: { expected: 0, collected: 0, arrears: 0 },
+          total: { expected: 0, collected: 0, arrears: 0 }
+        };
+      }
+      
+      const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
+      const amountPaid = invoice.amountPaid || 0;
+      const balance = invoice.balance || (grandTotal - amountPaid);
+      
+      if (billType === 'WATER') {
+        monthlyTrends[monthKey].water.expected += grandTotal;
+        monthlyTrends[monthKey].water.collected += amountPaid;
+        monthlyTrends[monthKey].water.arrears += balance;
+      } else if (billType === 'ELECTRICITY') {
+        monthlyTrends[monthKey].electricity.expected += grandTotal;
+        monthlyTrends[monthKey].electricity.collected += amountPaid;
+        monthlyTrends[monthKey].electricity.arrears += balance;
+      }
+      
+      monthlyTrends[monthKey].total.expected += grandTotal;
+      monthlyTrends[monthKey].total.collected += amountPaid;
+      monthlyTrends[monthKey].total.arrears += balance;
+    });
+
+    const tenantBillSummary = tenants.map(tenant => {
+      let waterTotal = 0, waterPaid = 0, waterBalance = 0;
+      let electricityTotal = 0, electricityPaid = 0, electricityBalance = 0;
+      
+      tenant.billInvoices.forEach(invoice => {
+        const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
+        const amountPaid = invoice.amountPaid || 0;
+        const balance = invoice.balance || (grandTotal - amountPaid);
+        
+        if (invoice.billType === 'WATER') {
+          waterTotal += grandTotal;
+          waterPaid += amountPaid;
+          waterBalance += balance;
+        } else if (invoice.billType === 'ELECTRICITY') {
+          electricityTotal += grandTotal;
+          electricityPaid += amountPaid;
+          electricityBalance += balance;
+        }
+      });
+      
+      return {
+        tenantId: tenant.id,
+        tenantName: tenant.fullName,
+        unitNo: tenant.unit?.unitNo || 'N/A',
+        unitType: tenant.unit?.type || 'N/A',
+        water: {
+          total: waterTotal,
+          paid: waterPaid,
+          outstanding: waterBalance,
+          status: waterBalance === 0 ? 'PAID' : waterPaid > 0 ? 'PARTIAL' : 'UNPAID'
+        },
+        electricity: {
+          total: electricityTotal,
+          paid: electricityPaid,
+          outstanding: electricityBalance,
+          status: electricityBalance === 0 ? 'PAID' : electricityPaid > 0 ? 'PARTIAL' : 'UNPAID'
+        },
+        totalOutstanding: waterBalance + electricityBalance
+      };
+    }).filter(t => t.totalOutstanding > 0);
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const delinquentBills = billInvoices.filter(invoice => 
+      invoice.status === 'OVERDUE' || 
+      (invoice.status === 'UNPAID' && new Date(invoice.dueDate) < thirtyDaysAgo)
+    );
+
+    res.json({
+      success: true,
+      data: {
+        property: {
+          id: property.id,
+          name: property.name,
+          address: property.address
+        },
+        summary: {
+          totalTenants: tenants.length,
+          totalBillInvoices: billInvoices.length,
+          water: {
+            totalBilled: totalWaterBills,
+            totalCollected: totalWaterCollected,
+            totalArrears: totalWaterArrears,
+            collectionRate: parseFloat(waterCollectionRate.toFixed(2)),
+            status: waterCollectionRate >= 90 ? 'EXCELLENT' : waterCollectionRate >= 75 ? 'GOOD' : waterCollectionRate >= 50 ? 'AVERAGE' : 'POOR'
+          },
+          electricity: {
+            totalBilled: totalElectricityBills,
+            totalCollected: totalElectricityCollected,
+            totalArrears: totalElectricityArrears,
+            collectionRate: parseFloat(electricityCollectionRate.toFixed(2)),
+            status: electricityCollectionRate >= 90 ? 'EXCELLENT' : electricityCollectionRate >= 75 ? 'GOOD' : electricityCollectionRate >= 50 ? 'AVERAGE' : 'POOR'
+          },
+          overall: {
+            totalBilled: totalBillsExpected,
+            totalCollected: totalBillsCollected,
+            totalArrears: totalBillsArrears,
+            collectionRate: parseFloat(overallCollectionRate.toFixed(2)),
+            delinquentBillsCount: delinquentBills.length,
+            paymentBreakdown: {
+              paid: paidBillsCount,
+              partial: partialBillsCount,
+              unpaid: unpaidBillsCount,
+              overdue: overdueBillsCount
+            }
+          }
+        },
+        monthlyTrends: Object.values(monthlyTrends),
+        tenantOutstanding: tenantBillSummary,
+        delinquentBills: delinquentBills.map(invoice => ({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          tenantName: invoice.tenant.fullName,
+          unitNo: invoice.tenant.unit?.unitNo || 'N/A',
+          billType: invoice.billType,
+          amount: invoice.grandTotal || invoice.totalAmount,
+          amountPaid: invoice.amountPaid || 0,
+          balance: invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0)),
+          issueDate: invoice.issueDate,
+          dueDate: invoice.dueDate,
+          daysOverdue: Math.floor((new Date() - new Date(invoice.dueDate)) / (1000 * 60 * 60 * 24)),
+          status: invoice.status
+        })),
+        billInvoices: billInvoices.map(invoice => ({
+          id: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          tenantName: invoice.tenant.fullName,
+          unitNo: invoice.tenant.unit?.unitNo || 'N/A',
+          billType: invoice.billType,
+          billReferenceNumber: invoice.billReferenceNumber,
+          billReferenceDate: invoice.billReferenceDate,
+          issueDate: invoice.issueDate,
+          dueDate: invoice.dueDate,
+          totalAmount: invoice.grandTotal || invoice.totalAmount,
+          amountPaid: invoice.amountPaid || 0,
+          balance: invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0)),
+          status: invoice.status,
+          unitsConsumed: invoice.units,
+          chargePerUnit: invoice.chargePerUnit,
+          previousReading: invoice.previousReading,
+          currentReading: invoice.currentReading,
+          vatRate: invoice.vatRate,
+          vatAmount: invoice.vatAmount
+        })),
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(take),
+          total,
+          totalPages: Math.ceil(total / take)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property bills payment report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate property bills payment report',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Get outstanding invoices for a tenant
+// @route   GET /api/payments/outstanding/:tenantId
+// @access  Private
+export const getOutstandingInvoices = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { tenantId } = req.params;
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      include: {
+        unit: {
+          include: { property: true }
+        }
+      }
+    });
+
+    if (!tenant) {
+      return res.status(404).json({ success: false, message: 'Tenant not found' });
+    }
+
+    const propertyId = tenant.unit?.propertyId;
+    
+    if (userRole !== 'ADMIN') {
+      const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view outstanding invoices for this tenant' 
+        });
+      }
+    }
+
+    const hasPreviewPermission = userRole === 'ADMIN' || 
+      await permissionService.hasPermission(userId, 'PREVIEW_PAYMENTS');
+
+    const rentInvoices = await prisma.invoice.findMany({
+      where: {
+        tenantId,
+        status: {
+          in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+        }
+      },
+      orderBy: { dueDate: 'asc' },
+      select: {
+        id: true,
+        invoiceNumber: true,
+        issueDate: true,
+        dueDate: true,
+        paymentPeriod: true,
+        paymentPolicy: true,
+        rent: hasPreviewPermission,
+        serviceCharge: hasPreviewPermission,
+        vat: hasPreviewPermission,
+        totalDue: true,
+        amountPaid: true,
+        balance: true,
+        status: true,
+        pdfUrl: true
+      }
+    });
+
+    const totalRentBalance = rentInvoices.reduce((sum, inv) => sum + inv.balance, 0);
+
+    res.json({
+      success: true,
+      data: {
+        rentInvoices,
+        totals: {
+          totalRentBalance,
+          totalOutstanding: totalRentBalance,
+          invoiceCount: rentInvoices.length
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching outstanding invoices:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch outstanding invoices' 
+    });
+  }
+};
+
 // @desc    Create payment report (Invoice-based, RENT ONLY)
 // @route   POST /api/payments
-// @access  Private (ADMIN, MANAGER)
+// @access  Private (ADMIN, MANAGER, or USER with RECORD_PAYMENTS permission)
 export const createPaymentReport = async (req, res) => {
   let transactionResult = null;
   
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { 
       tenantId, 
       amountPaid,
-      invoiceIds = [], // Array of invoice IDs being paid
+      invoiceIds = [],
       notes,
       paymentPeriod,
       createMissingInvoices = false,
@@ -1181,7 +1463,6 @@ export const createPaymentReport = async (req, res) => {
       handleOverpayment = true
     } = req.body;
 
-    // Input validation
     if (!tenantId) {
       return res.status(400).json({ 
         success: false, 
@@ -1198,19 +1479,6 @@ export const createPaymentReport = async (req, res) => {
 
     const parsedAmountPaid = parseFloat(amountPaid);
 
-    // Validate paymentPeriod date format
-    let paymentPeriodDate = null;
-    if (paymentPeriod) {
-      paymentPeriodDate = new Date(paymentPeriod);
-      if (isNaN(paymentPeriodDate.getTime())) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Invalid paymentPeriod date format' 
-        });
-      }
-    }
-
-    // 1. Fetch tenant with related data
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
@@ -1237,7 +1505,42 @@ export const createPaymentReport = async (req, res) => {
       });
     }
 
-    // 2. Check for existing credit balance
+    const propertyId = tenant.unit?.propertyId;
+
+    if (userRole !== 'ADMIN') {
+      const canRecordPayment = await canManagePaymentForProperty(userId, userRole, propertyId);
+      if (!canRecordPayment) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to record payments for this property' 
+        });
+      }
+      
+      const hasRecordPermission = await permissionService.hasPermission(
+        userId, 
+        'RECORD_PAYMENTS', 
+        propertyId
+      );
+      
+      if (!hasRecordPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to record payments' 
+        });
+      }
+    }
+
+    let paymentPeriodDate = null;
+    if (paymentPeriod) {
+      paymentPeriodDate = new Date(paymentPeriod);
+      if (isNaN(paymentPeriodDate.getTime())) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Invalid paymentPeriod date format' 
+        });
+      }
+    }
+
     let existingCredit = 0;
     if (handleOverpayment) {
       existingCredit = await getTenantCreditBalance(prisma, tenantId);
@@ -1246,7 +1549,6 @@ export const createPaymentReport = async (req, res) => {
       }
     }
 
-    // 3. Determine invoices to process based on user selection
     let invoicesToProcess = [];
     let totalInvoiceBalance = 0;
     let paymentPolicy = tenant.paymentPolicy;
@@ -1254,7 +1556,6 @@ export const createPaymentReport = async (req, res) => {
       paymentPeriodDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 
       new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 
-    // If user selected specific invoices
     if (invoiceIds && invoiceIds.length > 0) {
       invoicesToProcess = await prisma.invoice.findMany({
         where: {
@@ -1279,10 +1580,7 @@ export const createPaymentReport = async (req, res) => {
       paymentPeriodStr = invoicesToProcess[0].paymentPeriod || paymentPeriodStr;
       
       console.log(`Processing ${invoicesToProcess.length} selected invoices with total balance: ${totalInvoiceBalance}`);
-    } 
-    // If user didn't select any invoices
-    else {
-      // Get all unpaid/partial invoices ordered by due date (FIFO)
+    } else {
       invoicesToProcess = await prisma.invoice.findMany({
         where: {
           tenantId: tenantId,
@@ -1295,9 +1593,7 @@ export const createPaymentReport = async (req, res) => {
 
       totalInvoiceBalance = invoicesToProcess.reduce((sum, inv) => sum + inv.balance, 0);
       
-      // If no existing invoices
       if (invoicesToProcess.length === 0) {
-        // If createMissingInvoices is true, create one
         if (createMissingInvoices) {
           const expected = await computeExpectedChargesForPolicy(
             tenantId,
@@ -1330,7 +1626,6 @@ export const createPaymentReport = async (req, res) => {
           paymentPeriodStr = newInvoice.paymentPeriod;
           console.log(`Created new ${tenant.paymentPolicy || 'MONTHLY'} invoice for payment: ${newInvoice.invoiceNumber}`);
         } else {
-          // createMissingInvoices is false AND no invoices exist - ERROR
           return res.status(400).json({
             success: false,
             message: 'No invoices found for this tenant. Either create an invoice first, set createMissingInvoices to true, or provide specific invoiceIds.',
@@ -1342,28 +1637,21 @@ export const createPaymentReport = async (req, res) => {
           });
         }
       } else {
-        // Use existing invoices (FIFO)
         paymentPolicy = invoicesToProcess[0].paymentPolicy || tenant.paymentPolicy;
         paymentPeriodStr = invoicesToProcess[0].paymentPeriod || paymentPeriodStr;
         console.log(`Using FIFO: Processing ${invoicesToProcess.length} oldest invoices with total balance: ${totalInvoiceBalance}`);
       }
     }
 
-    // Calculate total amount available (payment + existing credit)
     const totalAvailable = parsedAmountPaid + existingCredit;
     
-    // Check for overpayment
     let overpaymentAmount = 0;
     let commissionBaseAmount = 0;
     let actualPaymentForCurrentPeriod = parsedAmountPaid;
 
     if (totalAvailable > totalInvoiceBalance) {
       overpaymentAmount = totalAvailable - totalInvoiceBalance;
-      
-      // For commission calculation, use only what's due for current period
       commissionBaseAmount = Math.min(totalInvoiceBalance, parsedAmountPaid);
-      
-      // Calculate actual cash payment for current period
       actualPaymentForCurrentPeriod = Math.max(0, totalInvoiceBalance - existingCredit);
       
       console.log(`Overpayment detected: ${overpaymentAmount}`);
@@ -1372,7 +1660,6 @@ export const createPaymentReport = async (req, res) => {
       commissionBaseAmount = parsedAmountPaid;
     }
 
-    // Validate payment amount
     if (!handleOverpayment && totalAvailable > totalInvoiceBalance) {
       return res.status(400).json({
         success: false,
@@ -1387,7 +1674,6 @@ export const createPaymentReport = async (req, res) => {
       });
     }
 
-    // Calculate frequency based on payment policy
     let frequency = 'MONTHLY';
     switch (paymentPolicy) {
       case 'QUARTERLY':
@@ -1401,9 +1687,7 @@ export const createPaymentReport = async (req, res) => {
         frequency = 'MONTHLY';
     }
 
-    // 4. Process payment in transaction
     transactionResult = await prisma.$transaction(async (tx) => {
-      // Apply existing credit first
       let creditUsed = 0;
       if (existingCredit > 0) {
         creditUsed = Math.min(existingCredit, totalInvoiceBalance);
@@ -1412,13 +1696,11 @@ export const createPaymentReport = async (req, res) => {
         console.log(`Applied ${creditUsed} from existing credit, remaining: ${Math.max(0, remainingCredit)}`);
       }
 
-      // Build notes with payment details for proper tracking
       const paymentNotes = [];
       if (notes) paymentNotes.push(notes);
       if (creditUsed > 0) paymentNotes.push(`Applied Ksh ${creditUsed.toFixed(2)} from credit balance`);
       if (overpaymentAmount > 0) paymentNotes.push(`Overpayment: Ksh ${overpaymentAmount.toFixed(2)}`);
 
-      // Create PaymentReport for current payment
       const report = await tx.paymentReport.create({
         data: {
           tenantId,
@@ -1426,18 +1708,17 @@ export const createPaymentReport = async (req, res) => {
           serviceCharge: invoicesToProcess.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
           vat: invoicesToProcess.reduce((sum, inv) => sum + (inv.vat || 0), 0),
           totalDue: invoicesToProcess.reduce((sum, inv) => sum + inv.totalDue, 0),
-          amountPaid: totalAvailable, // Total cash + credit applied
+          amountPaid: totalAvailable,
           arrears: Math.max(0, totalInvoiceBalance - totalAvailable),
           status: totalAvailable >= totalInvoiceBalance ? 'PAID' : 
                   totalAvailable > 0 ? 'PARTIAL' : 'UNPAID',
           paymentPeriod: paymentPeriodDate || new Date(),
           datePaid: new Date(),
           notes: paymentNotes.join('. ') || null,
-          receiptUrl: null // Will be updated after transaction
+          receiptUrl: null
         }
       });
 
-      // Update existing invoices for the same period if flag is true and no specific invoices selected
       let invoiceUpdateResult = null;
       let remainingPayment = totalAvailable;
       const updatedInvoices = [];
@@ -1454,7 +1735,6 @@ export const createPaymentReport = async (req, res) => {
             totalAvailable > 0 ? 'PARTIAL' : 'UNPAID'
         );
         
-        // Add auto-updated invoices to the results
         if (invoiceUpdateResult.updatedInvoices.length > 0) {
           updatedInvoices.push(...invoiceUpdateResult.updatedInvoices.map(inv => ({
             ...inv,
@@ -1463,23 +1743,19 @@ export const createPaymentReport = async (req, res) => {
           })));
         }
         
-        // Update remaining payment
         remainingPayment = invoiceUpdateResult.remainingPayment;
         
         console.log(`Auto-updated ${invoiceUpdateResult.updatedInvoices.length} invoices for period ${paymentPeriodStr}, applied ${invoiceUpdateResult.totalApplied}`);
       } else {
-        // If specific invoices selected or updateExistingInvoices is false, start with full available amount
         remainingPayment = totalAvailable;
       }
 
-      // Handle overpayment with FIFO allocation
       let overpaymentRecords = [];
       let remainingOverpayment = overpaymentAmount;
       
       if (overpaymentAmount > 0 && handleOverpayment) {
         console.log(`Handling overpayment of ${overpaymentAmount} with FIFO allocation`);
         
-        // First, allocate overpayment to other unpaid invoices (not in the current processing list)
         const otherUnpaidInvoices = await tx.invoice.findMany({
           where: {
             tenantId: tenantId,
@@ -1493,7 +1769,6 @@ export const createPaymentReport = async (req, res) => {
           orderBy: { dueDate: 'asc' }
         });
 
-        // Allocate overpayment to other unpaid invoices first
         for (const invoice of otherUnpaidInvoices) {
           if (remainingOverpayment <= 0) break;
           
@@ -1530,7 +1805,6 @@ export const createPaymentReport = async (req, res) => {
               commissionApplicable: false
             });
 
-            // Add to updated invoices for response
             updatedInvoices.push({
               id: invoice.id,
               invoiceNumber: invoice.invoiceNumber,
@@ -1551,7 +1825,6 @@ export const createPaymentReport = async (req, res) => {
           }
         }
 
-        // If still have overpayment, create prepaid future billing periods
         if (remainingOverpayment > 0) {
           const currentPolicyCharges = await computeExpectedChargesForPolicy(
             tenantId,
@@ -1599,7 +1872,6 @@ export const createPaymentReport = async (req, res) => {
             });
           }
           
-          // Store remainder as credit balance
           if (remainder > 0) {
             await updateTenantCreditBalance(tx, tenantId, remainder);
             overpaymentRecords.push({
@@ -1613,17 +1885,14 @@ export const createPaymentReport = async (req, res) => {
         }
       }
 
-      // Apply payment to selected/oldest invoices (if not already processed by updateExistingInvoicesForPayment)
       for (const invoice of invoicesToProcess) {
         if (remainingPayment <= 0) break;
         
-        // Check if this invoice was already updated by updateExistingInvoicesForPayment
         const alreadyUpdated = invoiceUpdateResult?.updatedInvoices?.find(
           ui => ui.id === invoice.id
         );
         
         if (alreadyUpdated) {
-          // Skip, already updated
           continue;
         }
         
@@ -1667,7 +1936,6 @@ export const createPaymentReport = async (req, res) => {
         remainingPayment -= paymentToApply;
       }
 
-      // Create Income record - FIXED: Using relation connect syntax
       const income = await tx.income.create({
         data: {
           property: {
@@ -1676,12 +1944,11 @@ export const createPaymentReport = async (req, res) => {
           tenant: {
             connect: { id: tenantId }
           },
-          amount: parsedAmountPaid, // Actual cash payment received
+          amount: parsedAmountPaid,
           frequency: frequency
         }
       });
 
-      // Process commission
       let commission = null;
       if (tenant.unit?.property?.commissionFee && tenant.unit?.property?.commissionFee > 0 && commissionBaseAmount > 0) {
         
@@ -1749,10 +2016,8 @@ export const createPaymentReport = async (req, res) => {
       timeout: 60000,
     });
 
-    // 5. Generate receipt AFTER successful transaction
     let receiptResult = null;
     try {
-      // Fetch fresh invoice data for receipt generation
       const freshInvoices = await prisma.invoice.findMany({
         where: { paymentReportId: transactionResult.report.id }
       });
@@ -1765,7 +2030,6 @@ export const createPaymentReport = async (req, res) => {
         transactionResult.creditUsed
       );
 
-      // Update payment report with receipt URL
       await prisma.paymentReport.update({
         where: { id: transactionResult.report.id },
         data: { receiptUrl: receiptResult.receiptUrl }
@@ -1774,10 +2038,8 @@ export const createPaymentReport = async (req, res) => {
       console.log(`Receipt generated successfully: ${receiptResult.receiptNumber}`);
     } catch (receiptError) {
       console.error('Failed to generate receipt (non-critical):', receiptError);
-      // Don't fail the payment if receipt generation fails
     }
 
-    // 6. Format response
     res.status(201).json({
       success: true,
       data: {
@@ -1882,151 +2144,43 @@ export const createPaymentReport = async (req, res) => {
   }
 };
 
-// Helper function to update existing invoices when payment is made
-async function updateExistingInvoicesForPayment(tx, tenantId, paymentPeriodStr, parsedAmountPaid, paymentReportId, periodStartDate, paymentStatus) {
-  try {
-    // Find all unpaid/partial invoices for this tenant in the same payment period
-    const existingInvoices = await tx.invoice.findMany({
-      where: {
-        tenantId,
-        paymentPeriod: paymentPeriodStr,
-        status: {
-          in: ['UNPAID', 'PARTIAL', 'OVERDUE']
-        },
-        paymentReportId: null // Only invoices not already linked to a payment report
-      },
-      orderBy: {
-        dueDate: 'asc' // Pay oldest first
-      }
-    });
-
-    if (existingInvoices.length === 0) {
-      return {
-        updatedInvoices: [],
-        remainingPayment: parsedAmountPaid,
-        totalApplied: 0
-      };
-    }
-
-    let remainingPayment = parsedAmountPaid;
-    const updatedInvoices = [];
-
-    // Apply payment to existing invoices
-    for (const invoice of existingInvoices) {
-      if (remainingPayment <= 0) break;
-
-      // Check if invoice is for the same period (based on paymentPeriod string)
-      if (invoice.paymentPeriod === paymentPeriodStr) {
-        if (invoice.balance > 0) {
-          const paymentToApply = Math.min(invoice.balance, remainingPayment);
-          const newAmountPaid = invoice.amountPaid + paymentToApply;
-          const newBalance = invoice.balance - paymentToApply;
-          
-          // Determine new status
-          let newStatus = invoice.status;
-          if (newBalance <= 0) {
-            newStatus = 'PAID';
-          } else if (paymentToApply > 0 && invoice.status === 'UNPAID') {
-            newStatus = 'PARTIAL';
-          }
-
-          await tx.invoice.update({
-            where: { id: invoice.id },
-            data: {
-              amountPaid: newAmountPaid,
-              balance: newBalance,
-              status: newStatus,
-              paymentReportId: paymentReportId, // Link to current payment report
-              updatedAt: new Date()
-            }
-          });
-
-          remainingPayment -= paymentToApply;
-          updatedInvoices.push({
-            id: invoice.id,
-            invoiceNumber: invoice.invoiceNumber,
-            previousBalance: invoice.balance,
-            previousAmountPaid: invoice.amountPaid,
-            paymentApplied: paymentToApply,
-            newAmountPaid,
-            newBalance,
-            newStatus,
-            previousStatus: invoice.status,
-            paymentPolicy: invoice.paymentPolicy,
-            wasAutoPaid: true
-          });
-        }
-      }
-    }
-
-    // If payment status is PAID, ensure all invoices for this period are marked as PAID
-    if (paymentStatus === 'PAID' && updatedInvoices.length > 0 && remainingPayment > 0) {
-      // Find any remaining unpaid invoices for this period
-      const remainingUnpaidInvoices = await tx.invoice.findMany({
-        where: {
-          tenantId,
-          paymentPeriod: paymentPeriodStr,
-          status: {
-            in: ['UNPAID', 'PARTIAL', 'OVERDUE']
-          },
-          id: {
-            notIn: updatedInvoices.map(i => i.id)
-          },
-          paymentReportId: null
-        }
-      });
-
-      // Mark all remaining invoices as PAID
-      for (const invoice of remainingUnpaidInvoices) {
-        await tx.invoice.update({
-          where: { id: invoice.id },
-          data: {
-            amountPaid: invoice.totalDue,
-            balance: 0,
-            status: 'PAID',
-            paymentReportId: paymentReportId,
-            updatedAt: new Date()
-          }
-        });
-
-        updatedInvoices.push({
-          id: invoice.id,
-          invoiceNumber: invoice.invoiceNumber,
-          previousBalance: invoice.balance,
-          previousAmountPaid: invoice.amountPaid,
-          paymentApplied: invoice.balance,
-          newAmountPaid: invoice.totalDue,
-          newBalance: 0,
-          newStatus: 'PAID',
-          previousStatus: invoice.status,
-          paymentPolicy: invoice.paymentPolicy,
-          wasAutoPaid: true
-        });
-      }
-    }
-
-    return {
-      updatedInvoices,
-      remainingPayment,
-      totalApplied: parsedAmountPaid - remainingPayment
-    };
-  } catch (error) {
-    console.error('Error in updateExistingInvoicesForPayment:', error);
-    throw error;
-  }
-}
-
 // @desc    Get income reports (with basic filtering)
 // @route   GET /api/payments/income
 // @access  Private
 export const getIncomeReports = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { propertyId, tenantId, dateFrom, dateTo, page = 1, limit = 10 } = req.query;
     const { skip, limit: take } = getPaginationParams(req.query);
 
+    if (userRole !== 'ADMIN') {
+      const hasPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_PAYMENT_REPORTS'
+      );
+      if (!hasPermission) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view income reports' 
+        });
+      }
+    }
+
     const where = {};
 
-    if (propertyId) where.propertyId = propertyId;
+    if (propertyId) {
+      if (userRole !== 'ADMIN') {
+        const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+        if (!canView) {
+          return res.status(403).json({ 
+            success: false, 
+            message: 'You do not have permission to view income for this property' 
+          });
+        }
+      }
+      where.propertyId = propertyId;
+    }
     if (tenantId) where.tenantId = tenantId;
 
     if (dateFrom || dateTo) {
@@ -2079,13 +2233,38 @@ export const getIncomeReports = async (req, res) => {
 // @access  Private (ADMIN, MANAGER)
 export const createIncome = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { propertyId, tenantId, amount, frequency } = req.body;
+
+    if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
+      const hasPermission = await permissionService.hasPermission(
+        userId, 
+        'RECORD_PAYMENTS'
+      );
+      if (!hasPermission) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to create income records' 
+        });
+      }
+    }
 
     if (!propertyId && !tenantId) {
       return res.status(400).json({ success: false, message: 'Either propertyId or tenantId is required' });
     }
     if (amount == null || isNaN(amount) || amount < 0) {
       return res.status(400).json({ success: false, message: 'Valid non-negative amount is required' });
+    }
+
+    if (propertyId && userRole !== 'ADMIN') {
+      const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
+      if (!canManage) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to create income for this property' 
+        });
+      }
     }
 
     const income = await prisma.income.create({
@@ -2120,19 +2299,53 @@ export const createIncome = async (req, res) => {
 
 // @desc    Preview expected payment for tenant
 // @route   GET /api/payments/preview/:tenantId
-// @access  Private
+// @access  Private (requires PREVIEW_PAYMENTS permission)
 export const previewPayment = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { tenantId } = req.params;
     const { includeCredit = true, paymentPeriod } = req.query;
 
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
-      select: { paymentPolicy: true }
+      select: { 
+        paymentPolicy: true,
+        unit: {
+          select: {
+            propertyId: true
+          }
+        }
+      }
     });
 
     if (!tenant) {
       return res.status(404).json({ success: false, message: 'Tenant not found' });
+    }
+
+    const propertyId = tenant.unit?.propertyId;
+
+    if (userRole !== 'ADMIN') {
+      const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to preview payments for this tenant' 
+        });
+      }
+      
+      const hasPreviewPermission = await permissionService.hasPermission(
+        userId, 
+        'PREVIEW_PAYMENTS', 
+        propertyId
+      );
+      
+      if (!hasPreviewPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to preview payments' 
+        });
+      }
     }
 
     const preview = await computeExpectedChargesForPolicy(
@@ -2141,7 +2354,6 @@ export const previewPayment = async (req, res) => {
       tenant.paymentPolicy || 'MONTHLY'
     );
     
-    // Check for existing credit balance
     let creditBalance = 0;
     if (includeCredit) {
       creditBalance = await getTenantCreditBalance(prisma, tenantId);
@@ -2157,89 +2369,115 @@ export const previewPayment = async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Preview payment error:', error);
     res.status(400).json({ success: false, message: error.message });
   }
 };
 
 // @desc    Update payment report (with income/commission updates)
 // @route   PUT /api/payments/:id
-// @access  Private (ADMIN, MANAGER)
+// @access  Private (ADMIN, MANAGER, or users with EDIT_PAYMENT_RECORDS permission)
 export const updatePaymentReportWithIncome = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
     const { amountPaid, paymentPeriod, notes } = req.body;
 
-    const result = await prisma.$transaction(async (tx) => {
-      // Find existing payment report
-      const existingReport = await tx.paymentReport.findUnique({
-        where: { id },
-        include: {
-          tenant: {
-            include: {
-              unit: {
-                include: {
-                  property: true
-                }
+    const existingReport = await prisma.paymentReport.findUnique({
+      where: { id },
+      include: {
+        tenant: {
+          include: {
+            unit: {
+              include: {
+                property: true
               }
             }
-          },
-          invoices: true
-        }
+          }
+        },
+        invoices: true
+      }
+    });
+
+    if (!existingReport) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Payment report not found' 
       });
+    }
 
-      if (!existingReport) {
-        throw new Error('Payment report not found');
+    const propertyId = existingReport.tenant?.unit?.propertyId;
+
+    if (userRole !== 'ADMIN') {
+      const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
+      if (!canManage) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to update payment records for this property' 
+        });
       }
-
-      // Validate amountPaid if provided
-      let parsedAmountPaid = existingReport.amountPaid;
-      if (amountPaid !== undefined && amountPaid !== null) {
-        if (isNaN(amountPaid)) {
-          throw new Error('Valid amountPaid is required');
-        }
-        parsedAmountPaid = parseFloat(amountPaid);
-        if (parsedAmountPaid < 0) {
-          throw new Error('amountPaid cannot be negative');
-        }
+      
+      const hasEditPermission = await permissionService.hasPermission(
+        userId, 
+        'EDIT_PAYMENT_RECORDS', 
+        propertyId
+      );
+      
+      if (!hasEditPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to update payment records' 
+        });
       }
+    }
 
-      // Recalculate expected charges if payment period changes
-      const existingPolicyMonths = existingReport.invoices?.length > 0
-        ? Math.max(...existingReport.invoices.map(inv => getInvoicePeriodMonths(inv, existingReport.tenant.paymentPolicy || 'MONTHLY')))
-        : getPolicyMonths(existingReport.tenant.paymentPolicy || 'MONTHLY');
-
-      let expected = {
-        rent: existingReport.rent,
-        serviceCharge: existingReport.serviceCharge,
-        vat: existingReport.vat,
-        vatType: existingReport.tenant.vatType,
-        vatRate: existingReport.tenant.vatRate,
-        totalDue: existingReport.totalDue,
-        periodStart: existingReport.paymentPeriod,
-        periodEnd: new Date(
-          new Date(existingReport.paymentPeriod).getFullYear(),
-          new Date(existingReport.paymentPeriod).getMonth() + existingPolicyMonths,
-          0
-        )
-      };
-
-      if (paymentPeriod) {
-        expected = await computeExpectedChargesForPolicy(
-          existingReport.tenantId,
-          paymentPeriod,
-          existingReport.tenant.paymentPolicy || 'MONTHLY'
-        );
+    let parsedAmountPaid = existingReport.amountPaid;
+    if (amountPaid !== undefined && amountPaid !== null) {
+      if (isNaN(amountPaid)) {
+        throw new Error('Valid amountPaid is required');
       }
+      parsedAmountPaid = parseFloat(amountPaid);
+      if (parsedAmountPaid < 0) {
+        throw new Error('amountPaid cannot be negative');
+      }
+    }
 
-      // Calculate arrears and status
-      const arrears = parseFloat((expected.totalDue - parsedAmountPaid).toFixed(2));
-      const status = parsedAmountPaid >= expected.totalDue
-        ? 'PAID'
-        : parsedAmountPaid > 0
-          ? 'PARTIAL'
-          : 'UNPAID';
+    const existingPolicyMonths = existingReport.invoices?.length > 0
+      ? Math.max(...existingReport.invoices.map(inv => getInvoicePeriodMonths(inv, existingReport.tenant.paymentPolicy || 'MONTHLY')))
+      : getPolicyMonths(existingReport.tenant.paymentPolicy || 'MONTHLY');
 
-      // Update payment report
+    let expected = {
+      rent: existingReport.rent,
+      serviceCharge: existingReport.serviceCharge,
+      vat: existingReport.vat,
+      vatType: existingReport.tenant.vatType,
+      vatRate: existingReport.tenant.vatRate,
+      totalDue: existingReport.totalDue,
+      periodStart: existingReport.paymentPeriod,
+      periodEnd: new Date(
+        new Date(existingReport.paymentPeriod).getFullYear(),
+        new Date(existingReport.paymentPeriod).getMonth() + existingPolicyMonths,
+        0
+      )
+    };
+
+    if (paymentPeriod) {
+      expected = await computeExpectedChargesForPolicy(
+        existingReport.tenantId,
+        paymentPeriod,
+        existingReport.tenant.paymentPolicy || 'MONTHLY'
+      );
+    }
+
+    const arrears = parseFloat((expected.totalDue - parsedAmountPaid).toFixed(2));
+    const status = parsedAmountPaid >= expected.totalDue
+      ? 'PAID'
+      : parsedAmountPaid > 0
+        ? 'PARTIAL'
+        : 'UNPAID';
+
+    const result = await prisma.$transaction(async (tx) => {
       const updatedReport = await tx.paymentReport.update({
         where: { id },
         data: {
@@ -2287,7 +2525,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         }
       });
 
-      // Update existing rent invoice if it exists
       if (existingReport.invoices && existingReport.invoices.length > 0) {
         const rentInvoice = existingReport.invoices[0];
         const rentBalance = arrears > 0 ? arrears : 0;
@@ -2308,10 +2545,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         });
       }
 
-      // Update related income record if it exists
       const income = await tx.income.findFirst({
         where: {
-          tenantId: existingReport.tenant,
+          tenantId: existingReport.tenantId,
           propertyId: existingReport.tenant.unit.propertyId,
           createdAt: {
             gte: new Date(existingReport.paymentPeriod),
@@ -2330,7 +2566,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           }
         });
 
-        // Re-process commission if income was updated
         if (updatedIncome) {
           await processCommissionForIncome(tx, updatedIncome.id);
         }
@@ -2355,18 +2590,132 @@ export const updatePaymentReportWithIncome = async (req, res) => {
   }
 };
 
+// @desc    Download payment receipt PDF
+// @route   GET /api/payments/:id/receipt
+// @access  Private (requires DOWNLOAD_PAYMENT_RECEIPT permission)
+export const downloadPaymentReceipt = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+
+    const paymentReport = await prisma.paymentReport.findUnique({
+      where: { id },
+      include: {
+        tenant: {
+          include: {
+            unit: {
+              include: {
+                property: true
+              }
+            }
+          }
+        }
+      }
+    });
+
+    if (!paymentReport) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment report not found'
+      });
+    }
+
+    const propertyId = paymentReport.tenant?.unit?.propertyId;
+
+    if (userRole !== 'ADMIN') {
+      const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to download receipts for this property' 
+        });
+      }
+      
+      const hasDownloadPermission = await permissionService.hasPermission(
+        userId, 
+        'DOWNLOAD_PAYMENT_RECEIPT', 
+        propertyId
+      );
+      
+      if (!hasDownloadPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to download payment receipts' 
+        });
+      }
+    }
+
+    if (!paymentReport.receiptUrl) {
+      return res.status(404).json({
+        success: false,
+        message: 'Receipt not found for this payment. It may still be generating or failed to generate.'
+      });
+    }
+
+    const fileName = path.basename(paymentReport.receiptUrl);
+    const filePath = path.join(process.cwd(), 'uploads', 'receipts', fileName);
+
+    try {
+      await fs.access(filePath);
+    } catch (error) {
+      return res.status(404).json({
+        success: false,
+        message: 'Receipt file not found on server. It may have been deleted or moved.'
+      });
+    }
+
+    const fileBuffer = await fs.readFile(filePath);
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="receipt-${fileName}"`);
+    res.send(fileBuffer);
+
+  } catch (error) {
+    console.error('Error downloading receipt:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to download receipt'
+    });
+  }
+};
+
 // @desc    Get arrears for a property
 // @route   GET /api/payments/arrears/:propertyId
-// @access  Private
+// @access  Private (requires VIEW_ARREARS permission)
 export async function getPropertyArrears(req, res) {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { propertyId } = req.params;
 
     if (!propertyId) {
       return res.status(400).json({ error: 'Property ID is required' });
     }
 
-    // Fetch all units with their tenants for this property
+    if (userRole !== 'ADMIN') {
+      const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view arrears for this property' 
+        });
+      }
+      
+      const hasArrearsPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_ARREARS', 
+        propertyId
+      );
+      
+      if (!hasArrearsPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to view arrears' 
+        });
+      }
+    }
+
     const units = await prisma.unit.findMany({
       where: {
         propertyId: propertyId,
@@ -2378,7 +2727,6 @@ export async function getPropertyArrears(req, res) {
       include: {
         tenant: {
           include: {
-            // Get unpaid/partial invoices
             invoices: {
               where: {
                 status: {
@@ -2389,7 +2737,6 @@ export async function getPropertyArrears(req, res) {
                 dueDate: 'asc'
               }
             },
-            // Get unpaid/partial bill invoices
             billInvoices: {
               where: {
                 status: {
@@ -2400,7 +2747,6 @@ export async function getPropertyArrears(req, res) {
                 dueDate: 'asc'
               }
             },
-            // Get payment reports for calculation
             paymentReports: {
               orderBy: {
                 paymentPeriod: 'desc'
@@ -2416,7 +2762,6 @@ export async function getPropertyArrears(req, res) {
       }
     });
 
-    // Process arrears data
     const arrearsData = [];
 
     for (const unit of units) {
@@ -2424,10 +2769,8 @@ export async function getPropertyArrears(req, res) {
 
       const tenant = unit.tenant;
       
-      // Check for credit balance
       const creditBalance = await getTenantCreditBalance(prisma, tenant.id);
       
-      // Process rent invoices (unpaid/partial)
       for (const invoice of tenant.invoices) {
         if (invoice.balance > 0) {
           arrearsData.push({
@@ -2454,7 +2797,6 @@ export async function getPropertyArrears(req, res) {
         }
       }
 
-      // Process bill invoices (unpaid/partial)
       for (const billInvoice of tenant.billInvoices) {
         if (billInvoice.balance > 0) {
           arrearsData.push({
@@ -2479,70 +2821,14 @@ export async function getPropertyArrears(req, res) {
           });
         }
       }
-
-      // Calculate current rent arrears (for the current period if no invoice exists yet)
-      const expectedMonthlyRent = tenant.rent;
-      
-      // Calculate service charge if applicable
-      let serviceChargeAmount = 0;
-      if (tenant.serviceCharge) {
-        if (tenant.serviceCharge.type === 'PERCENTAGE') {
-          serviceChargeAmount = (expectedMonthlyRent * tenant.serviceCharge.percentage) / 100;
-        } else if (tenant.serviceCharge.type === 'FIXED') {
-          serviceChargeAmount = tenant.serviceCharge.fixedAmount || 0;
-        } else if (tenant.serviceCharge.type === 'PER_SQ_FT') {
-          serviceChargeAmount = (unit.sizeSqFt || 0) * (tenant.serviceCharge.perSqFtRate || 0);
-        }
-      }
-
-      const totalExpectedAmount = expectedMonthlyRent + serviceChargeAmount;
-
-      // Calculate total paid from payment reports for current period
-      const currentPeriodStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-      const currentPeriodPaid = tenant.paymentReports
-        .filter(report => new Date(report.paymentPeriod) >= currentPeriodStart && report.status !== 'CREDIT' && report.status !== 'PREPAID')
-        .reduce((sum, report) => sum + report.amountPaid, 0);
-
-      const currentRentBalance = totalExpectedAmount - currentPeriodPaid - creditBalance;
-
-      // Only add current rent arrears if there's a balance AND no existing invoice for current period
-      const currentPeriodInvoiceExists = tenant.invoices.some(invoice => {
-        const invoicePeriod = new Date(invoice.paymentPeriod);
-        return invoicePeriod >= currentPeriodStart && invoice.balance > 0;
-      });
-
-      if (currentRentBalance > 0 && !currentPeriodInvoiceExists) {
-        arrearsData.push({
-          id: `current-rent-${tenant.id}`,
-          tenantId: tenant.id,
-          tenantName: tenant.fullName,
-          tenantContact: tenant.contact,
-          unitType: unit.type || 'Unit',
-          unitNo: unit.unitNo || 'N/A',
-          floor: unit.floor || 'N/A',
-          invoiceNumber: `PENDING-RENT-${tenant.id.substring(0, 8).toUpperCase()}`,
-          invoiceType: 'RENT',
-          expectedAmount: totalExpectedAmount,
-          paidAmount: currentPeriodPaid,
-          balance: currentRentBalance,
-          dueDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1),
-          status: currentPeriodPaid > 0 ? 'PARTIAL' : 'UNPAID',
-          description: `Current period rent for ${unit.property.name}`,
-          isPendingInvoice: true,
-          hasCreditBalance: creditBalance > 0,
-          creditBalance: creditBalance
-        });
-      }
     }
 
-    // Sort by due date (oldest first) then by balance (highest first)
     arrearsData.sort((a, b) => {
       const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
       if (dateDiff !== 0) return dateDiff;
       return b.balance - a.balance;
     });
 
-    // Calculate totals
     const totalArrears = arrearsData.reduce((sum, item) => sum + item.balance, 0);
     const totalExpected = arrearsData.reduce((sum, item) => sum + item.expectedAmount, 0);
     const totalPaid = arrearsData.reduce((sum, item) => sum + item.paidAmount, 0);
@@ -2574,79 +2860,13 @@ export async function getPropertyArrears(req, res) {
   }
 }
 
-// @desc    Download payment receipt PDF
-// @route   GET /api/payments/:id/receipt
-// @access  Private
-export const downloadPaymentReceipt = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const paymentReport = await prisma.paymentReport.findUnique({
-      where: { id },
-      include: {
-        tenant: {
-          include: {
-            unit: {
-              include: {
-                property: true
-              }
-            }
-          }
-        }
-      }
-    });
-
-    if (!paymentReport) {
-      return res.status(404).json({
-        success: false,
-        message: 'Payment report not found'
-      });
-    }
-
-    // Check if receipt exists
-    if (!paymentReport.receiptUrl) {
-      return res.status(404).json({
-        success: false,
-        message: 'Receipt not found for this payment. It may still be generating or failed to generate.'
-      });
-    }
-
-    // Construct full file path from receiptUrl
-    // receiptUrl format: /uploads/receipts/RCP-xxx.pdf
-    const fileName = path.basename(paymentReport.receiptUrl);
-    const filePath = path.join(process.cwd(), 'uploads', 'receipts', fileName);
-
-    // Check if file exists
-    try {
-      await fs.access(filePath);
-    } catch (error) {
-      return res.status(404).json({
-        success: false,
-        message: 'Receipt file not found on server. It may have been deleted or moved.'
-      });
-    }
-
-    // Read and send the file
-    const fileBuffer = await fs.readFile(filePath);
-    
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="receipt-${fileName}"`);
-    res.send(fileBuffer);
-
-  } catch (error) {
-    console.error('Error downloading receipt:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to download receipt'
-    });
-  }
-};
-
 // @desc    Delete payment report with comprehensive cleanup
 // @route   DELETE /api/payments/:id
-// @access  Private (Admin only)
+// @access  Private (Admin only or users with DELETE_PAYMENT_RECORDS permission)
 export const deletePaymentReport = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
     const { 
       deleteLinkedInvoices = false,
@@ -2655,7 +2875,6 @@ export const deletePaymentReport = async (req, res) => {
       force = false 
     } = req.body;
     
-    // Find payment report with all related data
     const paymentReport = await prisma.paymentReport.findUnique({
       where: { id },
       include: {
@@ -2683,12 +2902,36 @@ export const deletePaymentReport = async (req, res) => {
         message: 'Payment report not found' 
       });
     }
+
+    const propertyId = paymentReport.tenant?.unit?.property?.id;
+
+    if (userRole !== 'ADMIN') {
+      const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
+      if (!canManage) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to delete payment records for this property' 
+        });
+      }
+      
+      const hasDeletePermission = await permissionService.hasPermission(
+        userId, 
+        'DELETE_PAYMENT_RECORDS', 
+        propertyId
+      );
+      
+      if (!hasDeletePermission) {
+        return res.status(403).json({ 
+          success: false, 
+          message: 'You do not have permission to delete payment records' 
+        });
+      }
+    }
     
-    // Safety check: prevent deletion of old records without force flag
     const reportAge = Date.now() - new Date(paymentReport.createdAt).getTime();
-    const maxAge = 90 * 24 * 60 * 60 * 1000; // 90 days
+    const maxAge = 90 * 24 * 60 * 60 * 1000;
     
-    if (!force && reportAge > maxAge) {
+    if (!force && reportAge > maxAge && userRole !== 'ADMIN') {
       return res.status(400).json({
         success: false,
         message: `Payment report is older than 90 days. Use force=true to delete.`,
@@ -2710,9 +2953,7 @@ export const deletePaymentReport = async (req, res) => {
       unlinkCount: 0
     };
     
-    // Start transaction for cleanup
     await prisma.$transaction(async (tx) => {
-      // 1. Delete receipt PDF from storage if exists
       if (paymentReport.receiptUrl) {
         try {
           await deleteFromStorage(paymentReport.receiptUrl);
@@ -2723,10 +2964,8 @@ export const deletePaymentReport = async (req, res) => {
         }
       }
       
-      // 2. Handle linked rent invoices
       if (paymentReport.invoices.length > 0) {
         if (deleteLinkedInvoices) {
-          // Delete all linked invoices and their PDFs
           for (const invoice of paymentReport.invoices) {
             if (invoice.pdfUrl) {
               try {
@@ -2747,7 +2986,6 @@ export const deletePaymentReport = async (req, res) => {
             });
           }
         } else {
-          // Just unlink invoices
           await tx.invoice.updateMany({
             where: { paymentReportId: paymentReport.id },
             data: { paymentReportId: null }
@@ -2756,10 +2994,8 @@ export const deletePaymentReport = async (req, res) => {
         }
       }
       
-      // 3. Handle linked bill invoices
       if (paymentReport.billInvoices.length > 0) {
         if (deleteBillInvoices) {
-          // Delete all linked bill invoices and their PDFs
           for (const billInvoice of paymentReport.billInvoices) {
             if (billInvoice.pdfUrl) {
               try {
@@ -2780,7 +3016,6 @@ export const deletePaymentReport = async (req, res) => {
             });
           }
         } else {
-          // Just unlink bill invoices
           await tx.billInvoice.updateMany({
             where: { paymentReportId: paymentReport.id },
             data: { paymentReportId: null }
@@ -2789,14 +3024,12 @@ export const deletePaymentReport = async (req, res) => {
         }
       }
       
-      // 4. Handle related income record
       if (deleteIncome) {
-        // Find income records created for this payment
         const relatedIncome = await tx.income.findFirst({
           where: {
             tenantId: paymentReport.tenantId,
             createdAt: {
-              gte: new Date(paymentReport.datePaid.getTime() - 60000), // Within 1 minute
+              gte: new Date(paymentReport.datePaid.getTime() - 60000),
               lte: new Date(paymentReport.datePaid.getTime() + 60000)
             },
             amount: paymentReport.amountPaid
@@ -2816,7 +3049,6 @@ export const deletePaymentReport = async (req, res) => {
         }
       }
       
-      // 5. Delete the payment report
       await tx.paymentReport.delete({
         where: { id: paymentReport.id }
       });

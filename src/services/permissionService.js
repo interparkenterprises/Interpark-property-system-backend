@@ -40,9 +40,7 @@ class PermissionService {
         create: 'CREATE_INVOICES',
         edit: 'EDIT_INVOICES',
         delete: 'DELETE_INVOICES',
-        recordPayment: 'RECORD_PAYMENTS',
-        processRefund: 'PROCESS_REFUNDS',
-        waiveLateFee: 'WAIVE_LATE_FEES'
+        download: 'DOWNLOAD_INVOICES'
       },
       // Bill permissions (utility)
       bill: {
@@ -77,9 +75,22 @@ class PermissionService {
         approve: 'APPROVE_DAILY_REPORTS',
         submit: 'SUBMIT_DAILY_REPORTS'
       },
-      // Payment report permissions
+      // Payment Report permissions
       paymentReport: {
-        view: 'VIEW_PAYMENT_REPORTS'
+        view: 'VIEW_PAYMENT_REPORTS',
+        create: 'RECORD_PAYMENTS',        // Recording payments
+        edit: 'EDIT_PAYMENT_RECORDS',     // Editing payment records
+        delete: 'DELETE_PAYMENT_RECORDS', // Deleting payment records
+        download: 'DOWNLOAD_PAYMENT_RECEIPT', // Downloading receipts
+        preview: 'PREVIEW_PAYMENTS',      // Previewing payments
+        viewArrears: 'VIEW_ARREARS'       // Viewing arrears
+      },
+
+      // Receipt permissions
+      receipt: {
+        view: 'VIEW_RECEIPTS',
+        download: 'DOWNLOAD_RECEIPTS',
+        generate: 'GENERATE_RECEIPTS'
       },
       // Document permissions
       offerLetter: {
@@ -90,8 +101,18 @@ class PermissionService {
       },
       demandLetter: {
         view: 'VIEW_DEMAND_LETTERS',
-        create: 'CREATE_DEMAND_LETTERS',
+        create: 'CREATE_DEMAND_LETTER',
+        autoGenerate: 'AUTO_GENERATE_DEMAND_LETTER',
+        batchGenerate: 'BATCH_GENERATE_DEMAND_LETTERS',
+        edit: 'EDIT_DEMAND_LETTER_STATUS',
+        delete: 'DELETE_DEMAND_LETTER',
+        download: 'DOWNLOAD_DEMAND_LETTER',
         send: 'SEND_DEMAND_LETTERS'
+      },
+
+      // Add this separate permission for overdue invoices
+      overdueInvoice: {
+        view: 'VIEW_OVERDUE_INVOICES'
       },
       // Lead permissions
       lead: {

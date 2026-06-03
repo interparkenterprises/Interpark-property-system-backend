@@ -45,10 +45,10 @@ const checkBillPermission = async (userId, userRole, propertyId, operation) => {
     // Map operation to permission code
     const permissionMap = {
       view: 'VIEW_BILLS',
-      create: 'CREATE_BILL',
-      edit: 'EDIT_BILL',
-      delete: 'DELETE_BILL',
-      pay: 'PAY_BILL',
+      create: 'CREATE_BILLS',
+      edit: 'EDIT_BILLS',
+      delete: 'DELETE_BILLS',
+      pay: 'PAY_BILLS',
       recordMeterReading: 'RECORD_METER_READINGS'
     };
     
@@ -187,7 +187,7 @@ export const createBill = async (req, res) => {
       return res.status(403).json({ 
         error: 'Access denied',
         message: 'You do not have permission to create bills for this property.',
-        requiredPermission: 'CREATE_BILL'
+        requiredPermission: 'CREATE_BILLS'
       });
     }
 
@@ -568,7 +568,7 @@ export const updateBill = async (req, res) => {
       return res.status(403).json({ 
         error: 'Access denied',
         message: 'You do not have permission to update this bill.',
-        requiredPermission: 'EDIT_BILL'
+        requiredPermission: 'EDIT_BILLS'
       });
     }
 
@@ -644,7 +644,7 @@ export const deleteBill = async (req, res) => {
       return res.status(403).json({ 
         error: 'Access denied',
         message: 'You do not have permission to delete this bill.',
-        requiredPermission: 'DELETE_BILL'
+        requiredPermission: 'DELETE_BILLS'
       });
     }
 
@@ -686,7 +686,7 @@ export const payBill = async (req, res) => {
       return res.status(403).json({ 
         error: 'Access denied',
         message: 'You do not have permission to pay this bill.',
-        requiredPermission: 'PAY_BILL'
+        requiredPermission: 'PAY_BILLS'
       });
     }
 

@@ -2,13 +2,13 @@ import express from 'express';
 import {
   generateInvoice,
   getInvoicesByTenant,
-  getAllInvoices,  //  - Added from updated controller
+  getAllInvoices,
   getInvoiceById,
   updateInvoiceStatus,
   downloadInvoice,
   generateInvoiceFromPartialPayment,
   getPartialPayments,
-  updateInvoicePaymentPolicy,  // - Added from updated controller
+  updateInvoicePaymentPolicy,
   deleteInvoice,
   deleteInvoicePDF
 } from '../controllers/invoice.controller.js';
@@ -20,19 +20,31 @@ const router = express.Router();
 // Apply protect middleware to all routes that need authentication
 router.use(protect);
 
-// Routes that require specific roles
-router.post('/generate', authorize('ADMIN', 'MANAGER'), generateInvoice);
-router.post('/generate-from-partial', authorize('ADMIN', 'MANAGER'), generateInvoiceFromPartialPayment);
-router.patch('/:id/status', authorize('ADMIN', 'MANAGER'), updateInvoiceStatus);
-router.patch('/:id/payment-policy', authorize('ADMIN', 'MANAGER'), updateInvoicePaymentPolicy); // NEW
-router.delete('/:id', authorize('ADMIN', 'MANAGER'), deleteInvoice);
-router.delete('/:id/pdf', authorize('ADMIN', 'MANAGER'), deleteInvoicePDF);
+// ======================================================
+// INVOICE GENERATION & MANAGEMENT (Requires CREATE_INVOICES permission)
+// ======================================================
+router.post('/generate', authorize('ADMIN', 'MANAGER', 'USER'), generateInvoice);
+router.post('/generate-from-partial', authorize('ADMIN', 'MANAGER', 'USER'), generateInvoiceFromPartialPayment);
 
-// Routes that are accessible to authenticated users (no specific role required)
-router.get('/', getAllInvoices); // NEW - Get all invoices with filters
-router.get('/tenant/:tenantId', getInvoicesByTenant);
-router.get('/partial-payments', getPartialPayments);
-router.get('/:id', getInvoiceById);
-router.get('/:id/download', downloadInvoice);
+// ======================================================
+// INVOICE UPDATES (Requires EDIT_INVOICES permission)
+// ======================================================
+router.patch('/:id/status', authorize('ADMIN', 'MANAGER', 'USER'), updateInvoiceStatus);
+router.patch('/:id/payment-policy', authorize('ADMIN', 'MANAGER', 'USER'), updateInvoicePaymentPolicy);
+
+// ======================================================
+// INVOICE DELETION (Requires DELETE_INVOICES permission)
+// ======================================================
+router.delete('/:id', authorize('ADMIN', 'MANAGER', 'USER'), deleteInvoice);
+router.delete('/:id/pdf', authorize('ADMIN', 'MANAGER', 'USER'), deleteInvoicePDF);
+
+// ======================================================
+// INVOICE VIEWING (Requires VIEW_INVOICES permission)
+// ======================================================
+router.get('/', authorize('ADMIN', 'MANAGER', 'USER'), getAllInvoices);
+router.get('/tenant/:tenantId', authorize('ADMIN', 'MANAGER', 'USER'), getInvoicesByTenant);
+router.get('/partial-payments', authorize('ADMIN', 'MANAGER', 'USER'), getPartialPayments);
+router.get('/:id', authorize('ADMIN', 'MANAGER', 'USER'), getInvoiceById);
+router.get('/:id/download', authorize('ADMIN', 'MANAGER', 'USER'), downloadInvoice);
 
 export default router;

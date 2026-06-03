@@ -3,6 +3,72 @@ import prisma from '../lib/prisma.js';
 import { generateDemandLetterPDF } from '../utils/demandLetterTemplate.js';
 import { uploadDocument } from '../utils/uploadHelper.js';
 import { generateFileName } from '../utils/storage.js';
+import permissionService from "../services/permissionService.js";
+
+// ======================================================
+// PERMISSION HELPER FUNCTIONS
+// ======================================================
+
+// Helper to check if user can access demand letter based on property
+async function canAccessDemandLetter(userId, userRole, demandLetterId) {
+  // ADMIN can access everything
+  if (userRole === 'ADMIN') return true;
+  
+  const demandLetter = await prisma.demandLetter.findUnique({
+    where: { id: demandLetterId },
+    select: { propertyId: true }
+  });
+  
+  if (!demandLetter) return false;
+  
+  const propertyId = demandLetter.propertyId;
+  
+  // MANAGER can access properties they own
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+    return property?.managerId === userId;
+  }
+  
+  // USER role needs explicit permission
+  return permissionService.checkPropertyAccess(userId, propertyId, 'canView');
+}
+
+// Helper to check if user can create demand letters for a property
+async function canCreateDemandLetterForProperty(userId, userRole, propertyId) {
+  if (userRole === 'ADMIN') return true;
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+    return property?.managerId === userId;
+  }
+  
+  return permissionService.hasPermission(userId, 'CREATE_DEMAND_LETTER', propertyId);
+}
+
+// Helper to check if user can view demand letters for a property
+async function canViewDemandLettersForProperty(userId, userRole, propertyId) {
+  if (userRole === 'ADMIN') return true;
+  
+  if (userRole === 'MANAGER') {
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { managerId: true }
+    });
+    return property?.managerId === userId;
+  }
+  
+  return permissionService.hasPermission(userId, 'VIEW_DEMAND_LETTERS', propertyId);
+}
+
+// ======================================================
+// HELPER FUNCTIONS
+// ======================================================
 
 /**
  * Deduplicate invoices to avoid counting balances twice
@@ -79,11 +145,60 @@ function deduplicateInvoices(invoices) {
 }
 
 /**
+ * Helper function to generate unique letter number
+ */
+async function generateLetterNumber() {
+  const year = new Date().getFullYear();
+  const prefix = `DL-${year}`;
+  
+  // Get the latest letter number for this year
+  const latestLetter = await prisma.demandLetter.findFirst({
+    where: {
+      letterNumber: {
+        startsWith: prefix
+      }
+    },
+    orderBy: {
+      letterNumber: 'desc'
+    }
+  });
+
+  if (!latestLetter) {
+    return `${prefix}-0001`;
+  }
+
+  // Extract the sequence number and increment
+  const lastNumber = parseInt(latestLetter.letterNumber.split('-')[2]);
+  const newNumber = (lastNumber + 1).toString().padStart(4, '0');
+
+  return `${prefix}-${newNumber}`;
+}
+
+/**
+ * Format payment policy for display
+ */
+function formatPaymentPolicy(policy) {
+  const policies = {
+    'MONTHLY': 'Monthly',
+    'QUARTERLY': 'Quarterly',
+    'ANNUAL': 'Annually'
+  };
+  return policies[policy] || policy;
+}
+
+// ======================================================
+// DEMAND LETTER GENERATION FUNCTIONS
+// ======================================================
+
+/**
  * Generate demand letter for a specific tenant
  * POST /api/demand-letters/generate
+ * Requires: CREATE_DEMAND_LETTER permission
  */
 export const generateDemandLetter = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const {
       tenantId,
       invoiceId,
@@ -126,6 +241,32 @@ export const generateDemandLetter = async (req, res) => {
         success: false,
         message: 'Tenant not found'
       });
+    }
+
+    const propertyId = tenant.unit?.propertyId;
+
+    // CHECK PERMISSION TO CREATE DEMAND LETTER
+    if (userRole !== 'ADMIN') {
+      const canCreate = await canCreateDemandLetterForProperty(userId, userRole, propertyId);
+      if (!canCreate) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to create demand letters for this property'
+        });
+      }
+      
+      const hasCreatePermission = await permissionService.hasPermission(
+        userId, 
+        'CREATE_DEMAND_LETTER', 
+        propertyId
+      );
+      
+      if (!hasCreatePermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to create demand letters'
+        });
+      }
     }
 
     // Fetch invoice if provided
@@ -285,9 +426,12 @@ export const generateDemandLetter = async (req, res) => {
 /**
  * Auto-generate demand letter for tenant with overdue invoices
  * POST /api/demand-letters/auto-generate/:tenantId
+ * Requires: AUTO_GENERATE_DEMAND_LETTER permission
  */
 export const autoGenerateDemandLetter = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { tenantId } = req.params;
     const { demandPeriod = '7 days', notes } = req.body;
 
@@ -329,6 +473,32 @@ export const autoGenerateDemandLetter = async (req, res) => {
         success: false,
         message: 'Tenant not found'
       });
+    }
+
+    const propertyId = tenant.unit?.propertyId;
+
+    // CHECK PERMISSION FOR AUTO-GENERATE
+    if (userRole !== 'ADMIN') {
+      const canCreate = await canCreateDemandLetterForProperty(userId, userRole, propertyId);
+      if (!canCreate) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to auto-generate demand letters for this property'
+        });
+      }
+      
+      const hasAutoGeneratePermission = await permissionService.hasPermission(
+        userId, 
+        'AUTO_GENERATE_DEMAND_LETTER', 
+        propertyId
+      );
+      
+      if (!hasAutoGeneratePermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to auto-generate demand letters'
+        });
+      }
     }
 
     if (!tenant.invoices || tenant.invoices.length === 0) {
@@ -381,12 +551,233 @@ export const autoGenerateDemandLetter = async (req, res) => {
 };
 
 /**
+ * Batch generate demand letters for multiple tenants
+ * POST /api/demand-letters/batch-generate
+ * Requires: BATCH_GENERATE_DEMAND_LETTERS permission
+ */
+export const batchGenerateDemandLetters = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { tenantIds, demandPeriod = '7 days', notes } = req.body;
+
+    if (!tenantIds || !Array.isArray(tenantIds) || tenantIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'tenantIds array is required'
+      });
+    }
+
+    // CHECK PERMISSION FOR BATCH GENERATE
+    if (userRole !== 'ADMIN') {
+      const hasBatchPermission = await permissionService.hasPermission(
+        userId, 
+        'BATCH_GENERATE_DEMAND_LETTERS'
+      );
+      
+      if (!hasBatchPermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to batch generate demand letters'
+        });
+      }
+    }
+
+    const results = {
+      success: [],
+      failed: []
+    };
+
+    // Process each tenant
+    for (const tenantId of tenantIds) {
+      try {
+        // Fetch tenant with overdue invoices
+        const tenant = await prisma.tenant.findUnique({
+          where: { id: tenantId },
+          include: {
+            unit: {
+              include: {
+                property: true
+              }
+            },
+            invoices: {
+              where: {
+                status: {
+                  in: ['UNPAID', 'OVERDUE', 'PARTIAL']
+                }
+              },
+              orderBy: {
+                dueDate: 'asc'
+              },
+              include: {
+                paymentReport: {
+                  select: {
+                    id: true
+                  }
+                }
+              }
+            }
+          }
+        });
+
+        if (!tenant) {
+          results.failed.push({
+            tenantId,
+            reason: 'Tenant not found'
+          });
+          continue;
+        }
+
+        if (!tenant.invoices || tenant.invoices.length === 0) {
+          results.failed.push({
+            tenantId,
+            reason: 'No overdue invoices found'
+          });
+          continue;
+        }
+
+        // Deduplicate invoices
+        const deduplicatedInvoices = deduplicateInvoices(tenant.invoices);
+        
+        if (deduplicatedInvoices.length === 0) {
+          results.failed.push({
+            tenantId,
+            reason: 'No valid overdue invoices found after deduplication'
+          });
+          continue;
+        }
+
+        // Calculate outstanding amount
+        const outstandingAmount = deduplicatedInvoices.reduce((sum, invoice) => sum + invoice.balance, 0);
+        const oldestInvoice = deduplicatedInvoices[0];
+
+        // Generate demand letter data
+        const demandLetterData = {
+          tenantId,
+          invoiceId: oldestInvoice.id,
+          outstandingAmount,
+          rentalPeriod: oldestInvoice.paymentPeriod,
+          dueDate: oldestInvoice.dueDate,
+          demandPeriod,
+          referenceNumber: oldestInvoice.invoiceNumber,
+          notes: notes || `Batch generated demand letter for ${deduplicatedInvoices.length} overdue invoice(s) (after deduplication)`
+        };
+
+        // Simulate the generation process
+        const demandLetter = await prisma.demandLetter.create({
+          data: {
+            letterNumber: await generateLetterNumber(),
+            tenantId,
+            propertyId: tenant.unit?.propertyId || 'unknown',
+            landlordId: 'unknown',
+            unitId: tenant.unitId || 'unknown',
+            invoiceId: oldestInvoice.id,
+            generatedById: req.user.id,
+            issueDate: new Date(),
+            outstandingAmount,
+            rentalPeriod: oldestInvoice.paymentPeriod,
+            dueDate: oldestInvoice.dueDate,
+            demandPeriod,
+            referenceNumber: oldestInvoice.invoiceNumber,
+            paymentPolicy: tenant.paymentPolicy,
+            status: 'GENERATED',
+            notes: notes || `Batch generated demand letter for ${deduplicatedInvoices.length} overdue invoice(s)`
+          }
+        });
+
+        results.success.push({
+          tenantId,
+          tenantName: tenant.fullName,
+          demandLetterId: demandLetter.id,
+          letterNumber: demandLetter.letterNumber,
+          outstandingAmount,
+          invoiceCount: deduplicatedInvoices.length,
+          deduplicationApplied: deduplicatedInvoices.length !== tenant.invoices.length
+        });
+
+      } catch (error) {
+        results.failed.push({
+          tenantId,
+          reason: error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Batch generation completed. ${results.success.length} succeeded, ${results.failed.length} failed`,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Error in batch generation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to batch generate demand letters',
+      error: error.message
+    });
+  }
+};
+
+// ======================================================
+// DEMAND LETTER VIEWING FUNCTIONS
+// ======================================================
+
+/**
  * Get overdue invoices for a tenant (with deduplication)
  * GET /api/demand-letters/overdue-invoices/:tenantId
+ * Requires: VIEW_OVERDUE_INVOICES permission
  */
 export const getOverdueInvoices = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { tenantId } = req.params;
+
+    // Fetch tenant to get property info
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      include: {
+        unit: {
+          include: {
+            property: true
+          }
+        }
+      }
+    });
+
+    if (!tenant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Tenant not found'
+      });
+    }
+
+    const propertyId = tenant.unit?.propertyId;
+
+    // CHECK PERMISSION TO VIEW OVERDUE INVOICES
+    if (userRole !== 'ADMIN') {
+      const canView = await canViewDemandLettersForProperty(userId, userRole, propertyId);
+      if (!canView) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view overdue invoices for this property'
+        });
+      }
+      
+      const hasOverduePermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_OVERDUE_INVOICES', 
+        propertyId
+      );
+      
+      if (!hasOverduePermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view overdue invoices'
+        });
+      }
+    }
 
     // Fetch all invoices with specific statuses
     const allInvoices = await prisma.invoice.findMany({
@@ -457,9 +848,12 @@ export const getOverdueInvoices = async (req, res) => {
 /**
  * Get all demand letters with filters
  * GET /api/demand-letters
+ * Requires: VIEW_DEMAND_LETTERS permission
  */
 export const getDemandLetters = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const {
       tenantId,
       propertyId,
@@ -471,11 +865,24 @@ export const getDemandLetters = async (req, res) => {
       limit = 10
     } = req.query;
 
+    // CHECK BASE PERMISSION
+    if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
+      const hasViewPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_DEMAND_LETTERS'
+      );
+      if (!hasViewPermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view demand letters'
+        });
+      }
+    }
+
     // Build where clause
     const where = {};
 
     if (tenantId) where.tenantId = tenantId;
-    if (propertyId) where.propertyId = propertyId;
     if (landlordId) where.landlordId = landlordId;
     if (status) where.status = status;
 
@@ -485,14 +892,32 @@ export const getDemandLetters = async (req, res) => {
       if (endDate) where.issueDate.lte = new Date(endDate);
     }
 
-    // If user is a MANAGER, only show their properties
-    if (req.user.role === 'MANAGER') {
+    // Handle property filtering with permission checks
+    if (propertyId) {
+      if (userRole !== 'ADMIN') {
+        const canView = await canViewDemandLettersForProperty(userId, userRole, propertyId);
+        if (!canView) {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have permission to view demand letters for this property'
+          });
+        }
+      }
+      where.propertyId = propertyId;
+    } else if (userRole === 'MANAGER') {
+      // MANAGER can only see their own properties
       const managerProperties = await prisma.property.findMany({
-        where: { managerId: req.user.id },
+        where: { managerId: userId },
         select: { id: true }
       });
       where.propertyId = {
         in: managerProperties.map(p => p.id)
+      };
+    } else if (userRole !== 'ADMIN') {
+      // USER role - only properties they have access to
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      where.propertyId = {
+        in: accessiblePropertyIds
       };
     }
 
@@ -517,7 +942,8 @@ export const getDemandLetters = async (req, res) => {
           property: {
             select: {
               name: true,
-              address: true
+              address: true,
+              managerId: true
             }
           },
           landlord: {
@@ -577,9 +1003,12 @@ export const getDemandLetters = async (req, res) => {
 /**
  * Get specific demand letter by ID
  * GET /api/demand-letters/:id
+ * Requires: VIEW_DEMAND_LETTER_DETAILS permission
  */
 export const getDemandLetterById = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
 
     const demandLetter = await prisma.demandLetter.findUnique({
@@ -612,17 +1041,25 @@ export const getDemandLetterById = async (req, res) => {
       });
     }
 
-    // Check authorization for managers
-    if (req.user.role === 'MANAGER') {
-      const property = await prisma.property.findUnique({
-        where: { id: demandLetter.propertyId },
-        select: { managerId: true }
-      });
-
-      if (property.managerId !== req.user.id) {
+    // Check authorization
+    if (userRole !== 'ADMIN') {
+      const canAccess = await canAccessDemandLetter(userId, userRole, id);
+      if (!canAccess) {
         return res.status(403).json({
           success: false,
           message: 'Unauthorized access to this demand letter'
+        });
+      }
+      
+      const hasViewDetailsPermission = await permissionService.hasPermission(
+        userId, 
+        'VIEW_DEMAND_LETTER_DETAILS'
+      );
+      
+      if (!hasViewDetailsPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view demand letter details'
         });
       }
     }
@@ -642,12 +1079,19 @@ export const getDemandLetterById = async (req, res) => {
   }
 };
 
+// ======================================================
+// DEMAND LETTER DOWNLOAD FUNCTION
+// ======================================================
+
 /**
  * Download demand letter PDF
  * GET /api/demand-letters/:id/download
+ * Requires: DOWNLOAD_DEMAND_LETTER permission
  */
 export const downloadDemandLetter = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
 
     const demandLetter = await prisma.demandLetter.findUnique({
@@ -673,17 +1117,25 @@ export const downloadDemandLetter = async (req, res) => {
       });
     }
 
-    // Check authorization for managers
-    if (req.user.role === 'MANAGER') {
-      const property = await prisma.property.findUnique({
-        where: { id: demandLetter.propertyId },
-        select: { managerId: true }
-      });
-
-      if (property.managerId !== req.user.id) {
+    // Check authorization
+    if (userRole !== 'ADMIN') {
+      const canAccess = await canAccessDemandLetter(userId, userRole, id);
+      if (!canAccess) {
         return res.status(403).json({
           success: false,
           message: 'Unauthorized access to this demand letter'
+        });
+      }
+      
+      const hasDownloadPermission = await permissionService.hasPermission(
+        userId, 
+        'DOWNLOAD_DEMAND_LETTER'
+      );
+      
+      if (!hasDownloadPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to download demand letters'
         });
       }
     }
@@ -706,12 +1158,19 @@ export const downloadDemandLetter = async (req, res) => {
   }
 };
 
+// ======================================================
+// DEMAND LETTER UPDATE FUNCTIONS
+// ======================================================
+
 /**
  * Update demand letter status
  * PATCH /api/demand-letters/:id/status
+ * Requires: EDIT_DEMAND_LETTER_STATUS permission
  */
 export const updateDemandLetterStatus = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
     const { status, notes } = req.body;
 
@@ -724,7 +1183,45 @@ export const updateDemandLetterStatus = async (req, res) => {
       });
     }
 
-    const demandLetter = await prisma.demandLetter.update({
+    const demandLetter = await prisma.demandLetter.findUnique({
+      where: { id },
+      select: { propertyId: true }
+    });
+
+    if (!demandLetter) {
+      return res.status(404).json({
+        success: false,
+        message: 'Demand letter not found'
+      });
+    }
+
+    const propertyId = demandLetter.propertyId;
+
+    // CHECK PERMISSION TO UPDATE STATUS
+    if (userRole !== 'ADMIN') {
+      const canAccess = await canAccessDemandLetter(userId, userRole, id);
+      if (!canAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'Unauthorized access to this demand letter'
+        });
+      }
+      
+      const hasEditPermission = await permissionService.hasPermission(
+        userId, 
+        'EDIT_DEMAND_LETTER_STATUS', 
+        propertyId
+      );
+      
+      if (!hasEditPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to update demand letter status'
+        });
+      }
+    }
+
+    const updatedDemandLetter = await prisma.demandLetter.update({
       where: { id },
       data: {
         status,
@@ -749,7 +1246,7 @@ export const updateDemandLetterStatus = async (req, res) => {
     res.json({
       success: true,
       message: 'Demand letter status updated successfully',
-      data: demandLetter
+      data: updatedDemandLetter
     });
 
   } catch (error) {
@@ -762,16 +1259,24 @@ export const updateDemandLetterStatus = async (req, res) => {
   }
 };
 
+// ======================================================
+// DEMAND LETTER DELETE FUNCTIONS
+// ======================================================
+
 /**
  * Delete demand letter
  * DELETE /api/demand-letters/:id
+ * Requires: DELETE_DEMAND_LETTER permission
  */
 export const deleteDemandLetter = async (req, res) => {
   try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
     const { id } = req.params;
 
     const demandLetter = await prisma.demandLetter.findUnique({
-      where: { id }
+      where: { id },
+      select: { propertyId: true }
     });
 
     if (!demandLetter) {
@@ -779,6 +1284,32 @@ export const deleteDemandLetter = async (req, res) => {
         success: false,
         message: 'Demand letter not found'
       });
+    }
+
+    const propertyId = demandLetter.propertyId;
+
+    // CHECK PERMISSION TO DELETE
+    if (userRole !== 'ADMIN') {
+      const canAccess = await canAccessDemandLetter(userId, userRole, id);
+      if (!canAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'Unauthorized access to this demand letter'
+        });
+      }
+      
+      const hasDeletePermission = await permissionService.hasPermission(
+        userId, 
+        'DELETE_DEMAND_LETTER', 
+        propertyId
+      );
+      
+      if (!hasDeletePermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to delete demand letters'
+        });
+      }
     }
 
     await prisma.demandLetter.delete({
@@ -800,190 +1331,151 @@ export const deleteDemandLetter = async (req, res) => {
   }
 };
 
-/**
- * Batch generate demand letters for multiple tenants
- * POST /api/demand-letters/batch-generate
- */
-export const batchGenerateDemandLetters = async (req, res) => {
-  try {
-    const { tenantIds, demandPeriod = '7 days', notes } = req.body;
+// ======================================================
+// DEMAND LETTER SEND FUNCTION
+// ======================================================
 
-    if (!tenantIds || !Array.isArray(tenantIds) || tenantIds.length === 0) {
-      return res.status(400).json({
+/**
+ * Send demand letter to tenant
+ * POST /api/demand-letters/:id/send
+ * Requires: SEND_DEMAND_LETTERS permission
+ */
+export const sendDemandLetter = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+    const { email, phone, notes } = req.body;
+
+    const demandLetter = await prisma.demandLetter.findUnique({
+      where: { id },
+      include: {
+        tenant: true,
+        property: true
+      }
+    });
+
+    if (!demandLetter) {
+      return res.status(404).json({
         success: false,
-        message: 'tenantIds array is required'
+        message: 'Demand letter not found'
       });
     }
 
-    const results = {
-      success: [],
-      failed: []
-    };
+    const propertyId = demandLetter.propertyId;
 
-    // Process each tenant
-    for (const tenantId of tenantIds) {
-      try {
-        // Fetch tenant with overdue invoices
-        const tenant = await prisma.tenant.findUnique({
-          where: { id: tenantId },
-          include: {
-            invoices: {
-              where: {
-                status: {
-                  in: ['UNPAID', 'OVERDUE', 'PARTIAL']
-                }
-              },
-              orderBy: {
-                dueDate: 'asc'
-              },
-              include: {
-                paymentReport: {
-                  select: {
-                    id: true
-                  }
-                }
-              }
-            }
-          }
+    // CHECK PERMISSION TO SEND
+    if (userRole !== 'ADMIN') {
+      const canAccess = await canAccessDemandLetter(userId, userRole, id);
+      if (!canAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'Unauthorized access to this demand letter'
         });
-
-        if (!tenant) {
-          results.failed.push({
-            tenantId,
-            reason: 'Tenant not found'
-          });
-          continue;
-        }
-
-        if (!tenant.invoices || tenant.invoices.length === 0) {
-          results.failed.push({
-            tenantId,
-            reason: 'No overdue invoices found'
-          });
-          continue;
-        }
-
-        // Deduplicate invoices
-        const deduplicatedInvoices = deduplicateInvoices(tenant.invoices);
-        
-        if (deduplicatedInvoices.length === 0) {
-          results.failed.push({
-            tenantId,
-            reason: 'No valid overdue invoices found after deduplication'
-          });
-          continue;
-        }
-
-        // Calculate outstanding amount
-        const outstandingAmount = deduplicatedInvoices.reduce((sum, invoice) => sum + invoice.balance, 0);
-        const oldestInvoice = deduplicatedInvoices[0];
-
-        // Generate demand letter data
-        const demandLetterData = {
-          tenantId,
-          invoiceId: oldestInvoice.id,
-          outstandingAmount,
-          rentalPeriod: oldestInvoice.paymentPeriod,
-          dueDate: oldestInvoice.dueDate,
-          demandPeriod,
-          referenceNumber: oldestInvoice.invoiceNumber,
-          notes: notes || `Batch generated demand letter for ${deduplicatedInvoices.length} overdue invoice(s) (after deduplication)`
-        };
-
-        // Simulate the generation process
-        const demandLetter = await prisma.demandLetter.create({
-          data: {
-            letterNumber: await generateLetterNumber(),
-            tenantId,
-            propertyId: tenant.unit?.propertyId || 'unknown',
-            landlordId: 'unknown', // You might need to fetch this
-            unitId: tenant.unitId || 'unknown',
-            invoiceId: oldestInvoice.id,
-            generatedById: req.user.id,
-            issueDate: new Date(),
-            outstandingAmount,
-            rentalPeriod: oldestInvoice.paymentPeriod,
-            dueDate: oldestInvoice.dueDate,
-            demandPeriod,
-            referenceNumber: oldestInvoice.invoiceNumber,
-            paymentPolicy: tenant.paymentPolicy,
-            status: 'GENERATED',
-            notes: notes || `Batch generated demand letter for ${deduplicatedInvoices.length} overdue invoice(s)`
-          }
-        });
-
-        results.success.push({
-          tenantId,
-          tenantName: tenant.fullName,
-          demandLetterId: demandLetter.id,
-          letterNumber: demandLetter.letterNumber,
-          outstandingAmount,
-          invoiceCount: deduplicatedInvoices.length,
-          deduplicationApplied: deduplicatedInvoices.length !== tenant.invoices.length
-        });
-
-      } catch (error) {
-        results.failed.push({
-          tenantId,
-          reason: error.message
+      }
+      
+      const hasSendPermission = await permissionService.hasPermission(
+        userId, 
+        'SEND_DEMAND_LETTERS', 
+        propertyId
+      );
+      
+      if (!hasSendPermission) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to send demand letters'
         });
       }
     }
 
+    // Here you would implement actual email/SMS sending logic
+    // For now, just update the status to SENT and record delivery method
+
+    const sentTo = [];
+    if (email || demandLetter.tenant.email) {
+      sentTo.push(email || demandLetter.tenant.email);
+    }
+    if (phone || demandLetter.tenant.contact) {
+      sentTo.push(phone || demandLetter.tenant.contact);
+    }
+
+    const updatedDemandLetter = await prisma.demandLetter.update({
+      where: { id },
+      data: {
+        status: 'SENT',
+        sentAt: new Date(),
+        sentTo: sentTo.join(', '),
+        notes: notes || `Demand letter sent to ${sentTo.join(', ')}`,
+        updatedAt: new Date()
+      },
+      include: {
+        tenant: {
+          select: {
+            fullName: true,
+            contact: true,
+            email: true
+          }
+        },
+        property: {
+          select: {
+            name: true
+          }
+        }
+      }
+    });
+
     res.json({
       success: true,
-      message: `Batch generation completed. ${results.success.length} succeeded, ${results.failed.length} failed`,
-      data: results
+      message: 'Demand letter sent successfully',
+      data: updatedDemandLetter
     });
 
   } catch (error) {
-    console.error('Error in batch generation:', error);
+    console.error('Error sending demand letter:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to batch generate demand letters',
+      message: 'Failed to send demand letter',
       error: error.message
     });
   }
 };
 
-/**
- * Helper function to generate unique letter number
- */
-async function generateLetterNumber() {
-  const year = new Date().getFullYear();
-  const prefix = `DL-${year}`;
-  
-  // Get the latest letter number for this year
-  const latestLetter = await prisma.demandLetter.findFirst({
-    where: {
-      letterNumber: {
-        startsWith: prefix
-      }
-    },
-    orderBy: {
-      letterNumber: 'desc'
-    }
-  });
+// ======================================================
+// DEBUG FUNCTION (Remove in production)
+// ======================================================
 
-  if (!latestLetter) {
-    return `${prefix}-0001`;
+/**
+ * Debug endpoint to check user permissions
+ * GET /api/demand-letters/debug/user
+
+export const debugUser = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    
+    // Get user permissions
+    const permissions = await permissionService.getUserPermissions(userId);
+    
+    // Get accessible properties
+    const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+    
+    res.json({
+      success: true,
+      user: {
+        id: userId,
+        role: userRole,
+        name: req.user.name,
+        email: req.user.email
+      },
+      permissions,
+      accessiblePropertyCount: accessiblePropertyIds.length,
+      accessiblePropertyIds: accessiblePropertyIds.slice(0, 10) // Limit for response size
+    });
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
-
-  // Extract the sequence number and increment
-  const lastNumber = parseInt(latestLetter.letterNumber.split('-')[2]);
-  const newNumber = (lastNumber + 1).toString().padStart(4, '0');
-
-  return `${prefix}-${newNumber}`;
-}
-
-/**
- * Format payment policy for display
- */
-function formatPaymentPolicy(policy) {
-  const policies = {
-    'MONTHLY': 'Monthly',
-    'QUARTERLY': 'Quarterly',
-    'ANNUAL': 'Annually'
-  };
-  return policies[policy] || policy;
-}
+}; */
