@@ -267,13 +267,11 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
       }
     });
 
-    // SOURCE OF TRUTH: Use paymentReport values for totals (these are correctly calculated in the transaction)
+    // SOURCE OF TRUTH: Use paymentReport values
     const totalRent = paymentReport.rent;
     const totalServiceCharge = paymentReport.serviceCharge;
     const totalVat = paymentReport.vat;
     const totalDue = paymentReport.totalDue;
-    
-    // CRITICAL: The actual amount received is from paymentReport, not recalculated from invoices
     const actualAmountReceived = paymentReport.amountPaid;
     
     // Get payment policy
@@ -285,41 +283,64 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
       ? parseFloat((totalDue / policyMonths).toFixed(2)) 
       : totalDue;
 
-    // Build invoice data for receipt display
+    // Calculate monthly rent (base amount before multiplication)
+    const monthlyRentAmount = tenant.rent;
+    
+    // Calculate monthly service charge and VAT
+    let monthlyServiceCharge = 0;
+    let monthlyVat = 0;
+    
+    if (totalServiceCharge > 0 && policyMonths > 0) {
+      monthlyServiceCharge = parseFloat((totalServiceCharge / policyMonths).toFixed(2));
+    }
+    if (totalVat > 0 && policyMonths > 0) {
+      monthlyVat = parseFloat((totalVat / policyMonths).toFixed(2));
+    }
+
+    // Build corrected invoice data for receipt display
     const invoicesForReceipt = freshInvoices.map(inv => {
-      // Calculate the correct amounts for this specific invoice
-      const originalTotalDue = inv.totalDue;
-      const amountPaidForInvoice = inv.amountPaid;
-      const currentBalance = inv.balance;
+      // CRITICAL FIX: Calculate the monthly amount for this invoice
+      // For a QUARTERLY invoice: totalDue = monthlyRent × 3
+      // Monthly amount = totalDue ÷ policyMonths
+      const monthlyAmount = policyMonths > 0 
+        ? parseFloat((inv.totalDue / policyMonths).toFixed(2))
+        : inv.totalDue;
       
-      // Determine correct status for display
-      let displayStatus = inv.status;
-      if (currentBalance <= 0.01) { // Handle floating point precision
-        displayStatus = 'PAID';
-      } else if (amountPaidForInvoice > 0 && currentBalance > 0) {
-        displayStatus = 'PARTIAL';
-      } else if (amountPaidForInvoice === 0 && currentBalance > 0) {
-        displayStatus = 'UNPAID';
+      // Calculate how much of the monthly amount was paid
+      // For a full monthly payment, this equals monthlyAmount
+      const monthlyPaidAmount = actualAmountReceived;
+      
+      // Calculate remaining balance on a monthly basis
+      const monthlyBalance = Math.max(0, monthlyAmount - monthlyPaidAmount);
+      
+      // Determine status for this monthly period
+      let displayStatus = 'PAID';
+      if (monthlyBalance > 0.01) {
+        displayStatus = monthlyPaidAmount > 0 ? 'PARTIAL' : 'UNPAID';
       }
       
       return {
         invoiceNumber: inv.invoiceNumber,
         paymentPeriod: inv.paymentPeriod,
-        previousBalance: originalTotalDue,
-        paymentApplied: amountPaidForInvoice,
-        newAmountPaid: amountPaidForInvoice,
-        newBalance: currentBalance,
+        // For display: Show the MONTHLY amount
+        previousBalance: monthlyAmount,
+        paymentApplied: monthlyPaidAmount,
+        newAmountPaid: monthlyPaidAmount,
+        newBalance: monthlyBalance,
         newStatus: displayStatus,
         previousStatus: inv.status,
         paymentPolicy: inv.paymentPolicy || paymentPolicy,
-        // Individual invoice breakdown (for reference)
-        rent: inv.rent || 0,
-        serviceCharge: inv.serviceCharge || 0,
-        vat: inv.vat || 0
+        monthlyAmount: monthlyAmount, // Explicit field for clarity
+        fullInvoiceAmount: inv.totalDue,
+        policyMonths: policyMonths,
+        // Individual invoice breakdown (monthly basis)
+        rent: monthlyRentAmount,
+        serviceCharge: monthlyServiceCharge,
+        vat: monthlyVat
       };
     });
 
-    // Determine payment period label
+    // Determine payment period label (should be a single month)
     let paymentPeriodLabel = freshInvoices[0]?.paymentPeriod;
     if (!paymentPeriodLabel && paymentReport.paymentPeriod) {
       paymentPeriodLabel = new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', {
@@ -331,7 +352,7 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
     // Generate receipt number
     const receiptNumber = `RCP-${Date.now()}-${paymentReport.id.slice(-6).toUpperCase()}`;
 
-    // Prepare complete receipt data
+    // Prepare complete receipt data with corrected monthly amounts
     const receiptData = {
       receiptNumber,
       paymentDate: paymentReport.datePaid,
@@ -341,33 +362,36 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
       unitType: tenant.unit?.type || 'Unit',
       unitNo: tenant.unit?.unitNo || '',
       paymentPeriod: paymentPeriodLabel,
-      paymentPolicy,
-      monthlyEquivalent,
-      billedRent: parseFloat(totalRent.toFixed(2)),
-      billedServiceCharge: parseFloat(totalServiceCharge.toFixed(2)),
-      billedVat: parseFloat(totalVat.toFixed(2)),
-      billedTotalDue: parseFloat(totalDue.toFixed(2)),
-      amountPaid: parseFloat(actualAmountReceived.toFixed(2)), // CRITICAL: This is the actual amount received
+      paymentPolicy: paymentPolicy,
+      monthlyEquivalent: monthlyEquivalent,
+      billedRent: parseFloat(monthlyRentAmount.toFixed(2)),
+      billedServiceCharge: parseFloat(monthlyServiceCharge.toFixed(2)),
+      billedVat: parseFloat(monthlyVat.toFixed(2)),
+      billedTotalDue: parseFloat(monthlyEquivalent.toFixed(2)),
+      amountPaid: parseFloat(actualAmountReceived.toFixed(2)),
       invoicesPaid: invoicesForReceipt,
       overpaymentAmount: parseFloat((overpaymentAmount || 0).toFixed(2)),
       creditUsed: parseFloat((creditUsed || 0).toFixed(2)),
-      totalAllocated: parseFloat(actualAmountReceived.toFixed(2)), // CRITICAL: Must equal amountPaid
+      totalAllocated: parseFloat(actualAmountReceived.toFixed(2)),
       paymentReportId: paymentReport.id,
       notes: paymentReport.notes,
-      paymentMethod: 'Bank Transfer' // Default, can be customized
+      paymentMethod: 'Bank Transfer'
     };
 
-    // Log receipt data for debugging (remove in production)
-    console.log('Generating receipt with data:', {
-      amountPaid: receiptData.amountPaid,
-      totalAllocated: receiptData.totalAllocated,
-      billedTotalDue: receiptData.billedTotalDue,
-      overpaymentAmount: receiptData.overpaymentAmount,
-      creditUsed: receiptData.creditUsed,
-      invoicesCount: receiptData.invoicesPaid.length
+    // Debug log
+    console.log('Receipt generation - Amount calculation:', {
+      paymentPolicy,
+      policyMonths,
+      monthlyRent: monthlyRentAmount,
+      monthlyServiceCharge,
+      monthlyVat,
+      monthlyTotalDue: monthlyEquivalent,
+      amountPaid: actualAmountReceived,
+      invoiceOriginalTotal: freshInvoices[0]?.totalDue,
+      invoiceMonthlyAmount: invoicesForReceipt[0]?.monthlyAmount
     });
 
-    // Generate receipt HTML and PDF
+    // Generate receipt
     const receiptHTML = generateReceiptHTML(receiptData);
     const pdfBuffer = await generatePDF(receiptHTML);
 
@@ -382,8 +406,6 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
     };
   } catch (error) {
     console.error('Error generating receipt:', error);
-    // Don't throw the error - just log it and return null
-    // This prevents payment recording from failing if receipt generation fails
     return {
       receiptUrl: null,
       receiptNumber: null,

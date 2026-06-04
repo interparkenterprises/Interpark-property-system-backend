@@ -19,7 +19,7 @@ export async function generateReceiptPDF(data) {
       const doc = new PDFDocument({ 
         margin: 50,
         size: 'A4',
-        bufferPages: true // Enable bufferPages for footer positioning
+        bufferPages: true
       });
       const chunks = [];
 
@@ -140,7 +140,9 @@ export async function generateReceiptPDF(data) {
         creditUsed = 0,
         totalAllocated = 0,
         paymentReportId,
-        notes
+        notes,
+        paymentPolicy,
+        monthlyEquivalent
       } = data;
 
       // ===========================================
@@ -240,6 +242,8 @@ export async function generateReceiptPDF(data) {
       
       rightY = drawInfoRow('Payment Period', paymentPeriod, rightCol, rightY, colWidth);
       rightY = drawInfoRow('Payment Method', paymentMethod, rightCol, rightY, colWidth);
+      rightY = drawInfoRow('Payment Policy', paymentPolicy || 'MONTHLY', rightCol, rightY, colWidth);
+      rightY = drawInfoRow('Monthly Equivalent', formatCurrency(monthlyEquivalent || amountPaid), rightCol, rightY, colWidth);
       
       if (creditUsed > 0) {
         rightY = drawInfoRow('Credit Applied', `-${formatCurrency(creditUsed)}`, rightCol, rightY, colWidth);
@@ -253,11 +257,11 @@ export async function generateReceiptPDF(data) {
       doc.y = Math.max(leftY, rightY) + 15;
 
       // ===========================================
-      // INVOICES PAID TABLE (SIMPLIFIED)
+      // INVOICES PAID TABLE - MODIFIED HEADERS
       // ===========================================
       
       if (invoicesPaid.length > 0) {
-        // Check if we need new page (shouldn't happen on single page receipt, but safety check)
+        // Check if we need new page
         if (doc.y > doc.page.height - 250) {
           doc.addPage();
           doc.y = 50;
@@ -266,13 +270,14 @@ export async function generateReceiptPDF(data) {
         doc.fontSize(11)
            .fillColor('#1e293b')
            .font('Helvetica-Bold')
-           .text('Invoices Paid', 50, doc.y);
+           .text('Payment Breakdown', 50, doc.y);
         
         doc.moveDown(0.3);
 
         const tableTop = doc.y;
         const tableWidth = doc.page.width - 100;
-        const colWidths = [tableWidth * 0.30, tableWidth * 0.25, tableWidth * 0.25, tableWidth * 0.20];
+        // MODIFIED: Updated column widths for better clarity
+        const colWidths = [tableWidth * 0.25, tableWidth * 0.25, tableWidth * 0.25, tableWidth * 0.25];
         
         // Table Header
         doc.fillColor('#ffffff')
@@ -281,7 +286,8 @@ export async function generateReceiptPDF(data) {
         doc.rect(50, tableTop, tableWidth, 20).fill('#005478');
         
         let xPos = 50;
-        const headers = ['Amount', 'Total Paid', 'Balance', 'Status'];
+        // MODIFIED: Clearer headers that explain the amounts
+        const headers = ['Monthly Amount', 'Amount Paid', 'Remaining Balance', 'Status'];
         
         doc.fontSize(8)
            .fillColor('#ffffff')
@@ -301,29 +307,31 @@ export async function generateReceiptPDF(data) {
             doc.fillColor('#f8fafc').rect(50, rowY, tableWidth, 18).fill();
           }
           
-          // Status color coding - only PARTIAL or PAID
+          // Status color coding
           let statusColor = '#1e293b';
           if (inv.newStatus === 'PAID') statusColor = '#166534';
           if (inv.newStatus === 'PARTIAL') statusColor = '#92400e';
+          if (inv.newStatus === 'UNPAID') statusColor = '#dc2626';
           
           xPos = 50;
           
-          // Amount (original total due)
+          // MODIFIED: Show the monthly amount (not the full invoice amount)
+          const monthlyAmount = inv.monthlyAmount || inv.previousBalance;
           doc.fontSize(9)
              .fillColor('#1e293b')
              .font('Helvetica')
-             .text(formatCurrency(inv.previousBalance + (inv.paymentApplied || 0)), xPos + 3, rowY + 4, { width: colWidths[0] - 6 });
+             .text(formatCurrency(monthlyAmount), xPos + 3, rowY + 4, { width: colWidths[0] - 6 });
           xPos += colWidths[0];
           
-          // Total Paid
-          doc.text(formatCurrency(inv.newAmountPaid || inv.amountPaid || 0), xPos + 3, rowY + 4, { width: colWidths[1] - 6 });
+          // Amount Paid (what was paid for this period)
+          doc.text(formatCurrency(inv.paymentApplied || inv.amountPaid || 0), xPos + 3, rowY + 4, { width: colWidths[1] - 6 });
           xPos += colWidths[1];
           
-          // Balance
+          // Remaining Balance
           doc.text(formatCurrency(inv.newBalance), xPos + 3, rowY + 4, { width: colWidths[2] - 6 });
           xPos += colWidths[2];
           
-          // Status (only PARTIAL or PAID)
+          // Status
           doc.fillColor(statusColor).font('Helvetica-Bold');
           doc.text(inv.newStatus, xPos + 3, rowY + 4, { width: colWidths[3] - 6 });
           
@@ -422,7 +430,7 @@ export async function generateReceiptPDF(data) {
       }
 
       // ===========================================
-      // FIXED FOOTER - Positioned absolutely at bottom
+      // FIXED FOOTER
       // ===========================================
       
       const footerY = doc.page.height - 80;
@@ -457,7 +465,6 @@ export async function generateReceiptPDF(data) {
          .font('Helvetica')
          .text('Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke', 50, footerY + 54, { align: 'center' });
 
-      // End document
       doc.end();
       
     } catch (error) {
@@ -468,12 +475,9 @@ export async function generateReceiptPDF(data) {
 }
 
 /**
- * Legacy HTML template for email/backup purposes
- * @param {Object} data - Receipt data
- * @returns {string} HTML content
+ * HTML template for email/backup purposes - MODIFIED with correct headers
  */
 export const generateReceiptHTML = (data) => {
-  // Keep the HTML version for email purposes if needed
   const {
     receiptNumber,
     paymentDate,
@@ -490,7 +494,9 @@ export const generateReceiptHTML = (data) => {
     creditUsed = 0,
     totalAllocated = 0,
     paymentReportId,
-    notes
+    notes,
+    paymentPolicy,
+    monthlyEquivalent
   } = data;
 
   const formatCurrency = (amount) => {
@@ -525,10 +531,13 @@ export const generateReceiptHTML = (data) => {
     table { width: 100%; border-collapse: collapse; margin: 15px 0; }
     th { background: #005478; color: white; padding: 8px; text-align: left; }
     td { padding: 8px; border-bottom: 1px solid #ddd; }
-    .total { text-align: right; font-weight: bold; color: #005478; }
+    .total { text-align: right; font-weight: bold; color: #005478; font-size: 16px; margin-top: 20px; }
     .footer { margin-top: 40px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px; }
     .status-paid { color: #166534; font-weight: bold; }
     .status-partial { color: #92400e; font-weight: bold; }
+    .info-row { margin: 5px 0; }
+    .label { font-weight: bold; color: #64748b; font-size: 12px; }
+    .value { color: #1e293b; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -539,53 +548,61 @@ export const generateReceiptHTML = (data) => {
   
   <div class="meta">
     <div>
-      <small>RECEIPT NUMBER</small><br>
-      <strong>${receiptNumber}</strong>
+      <div class="label">RECEIPT NUMBER</div>
+      <div class="value"><strong>${receiptNumber}</strong></div>
     </div>
     <div style="text-align: right;">
-      <small>PAYMENT DATE</small><br>
-      <strong>${formatDate(paymentDate)}</strong>
+      <div class="label">PAYMENT DATE</div>
+      <div class="value"><strong>${formatDate(paymentDate)}</strong></div>
     </div>
   </div>
 
-  <div style="display: flex; gap: 40px;">
+  <div style="display: flex; gap: 40px; margin-bottom: 30px;">
     <div style="flex: 1;">
       <div class="section-title">Tenant Information</div>
-      <p><strong>${tenantName}</strong><br>
-      ${tenantContact || 'N/A'}<br>
-      ${propertyName}<br>
-      ${unitType}${unitNo ? ' - ' + unitNo : ''}</p>
+      <div class="info-row"><strong>${tenantName}</strong></div>
+      <div class="info-row">${tenantContact || 'N/A'}</div>
+      <div class="info-row">${propertyName}</div>
+      <div class="info-row">${unitType}${unitNo ? ' - ' + unitNo : ''}</div>
     </div>
     <div style="flex: 1;">
       <div class="section-title">Payment Details</div>
-      <p>Period: ${paymentPeriod}<br>
-      Method: ${paymentMethod}<br>
-      ${creditUsed > 0 ? `Credit Applied: -${formatCurrency(creditUsed)}<br>` : ''}
-      ${overpaymentAmount > 0 ? `Overpayment: ${formatCurrency(overpaymentAmount)}<br>` : ''}</p>
+      <div class="info-row">Period: ${paymentPeriod}</div>
+      <div class="info-row">Method: ${paymentMethod}</div>
+      <div class="info-row">Policy: ${paymentPolicy || 'MONTHLY'}</div>
+      <div class="info-row">Monthly Equivalent: ${formatCurrency(monthlyEquivalent || amountPaid)}</div>
+      ${creditUsed > 0 ? `<div class="info-row">Credit Applied: -${formatCurrency(creditUsed)}</div>` : ''}
+      ${overpaymentAmount > 0 ? `<div class="info-row">Overpayment: ${formatCurrency(overpaymentAmount)}</div>` : ''}
     </div>
   </div>
 
   ${invoicesPaid.length > 0 ? `
   <div class="section">
-    <div class="section-title">Invoices Paid</div>
+    <div class="section-title">Payment Breakdown</div>
     <table>
-      <tr>
-        <th>Amount</th>
-        <th>Total Paid</th>
-        <th>Balance</th>
-        <th>Status</th>
-      </tr>
-      ${invoicesPaid.map(inv => {
-        const originalAmount = inv.previousBalance + (inv.paymentApplied || 0);
-        const statusClass = inv.newStatus === 'PAID' ? 'status-paid' : 'status-partial';
-        return `
+      <thead>
         <tr>
-          <td>${formatCurrency(originalAmount)}</td>
-          <td>${formatCurrency(inv.newAmountPaid || inv.amountPaid || 0)}</td>
-          <td>${formatCurrency(inv.newBalance)}</td>
-          <td class="${statusClass}">${inv.newStatus}</td>
+          <th>Monthly Amount</th>
+          <th>Amount Paid</th>
+          <th>Remaining Balance</th>
+          <th>Status</th>
         </tr>
-      `}).join('')}
+      </thead>
+      <tbody>
+        ${invoicesPaid.map(inv => {
+          const monthlyAmount = inv.monthlyAmount || inv.previousBalance;
+          const statusClass = inv.newStatus === 'PAID' ? 'status-paid' : 
+                             inv.newStatus === 'PARTIAL' ? 'status-partial' : '';
+          return `
+            <tr>
+              <td>${formatCurrency(monthlyAmount)}</td>
+              <td>${formatCurrency(inv.paymentApplied || inv.amountPaid || 0)}</td>
+              <td>${formatCurrency(inv.newBalance)}</td>
+              <td class="${statusClass}">${inv.newStatus}</td>
+            </tr>
+          `;
+        }).join('')}
+      </tbody>
     </table>
   </div>
   ` : ''}
