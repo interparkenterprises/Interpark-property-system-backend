@@ -197,30 +197,58 @@ export const loginUser = async (req, res) => {
           include: { property: true }
         },
         createdByManager: {
-          select: { id: true, name: true, email: true }
+          select: { id: true, name: true, email: true, role: true }
         }
       }
     });
 
     if (user && (await comparePassword(password, user.password))) {
       
-      // Check if managed user's creator manager still exists
+      // Check if managed user's creator still exists and is active
+      // Allow both MANAGER and ADMIN as valid creators
       if (user.isManagedUser && user.createdByManagerId) {
-        const manager = await prisma.user.findUnique({
+        const creator = await prisma.user.findUnique({
           where: { id: user.createdByManagerId }
         });
         
-        if (!manager || manager.role !== 'MANAGER') {
+        // Check if creator exists and has valid role (MANAGER or ADMIN)
+        if (!creator) {
           return res.status(401).json({ 
-            error: "Account access revoked - manager no longer active" 
+            error: "Account access revoked - creator account no longer exists" 
           });
         }
+        
+        // Allow both MANAGER and ADMIN roles
+        if (creator.role !== 'MANAGER' && creator.role !== 'ADMIN') {
+          return res.status(401).json({ 
+            error: "Account access revoked - invalid creator role" 
+          });
+        }
+        
+        // Additional validation for MANAGER creators
+        if (creator.role === 'MANAGER') {
+          // Check if manager is still approved and can manage users
+          if (!creator.isApproved) {
+            return res.status(401).json({ 
+              error: "Account access revoked - manager account is no longer approved" 
+            });
+          }
+          
+          // Optional: Check if manager can still login
+          if (!creator.canManagerLogin) {
+            return res.status(401).json({ 
+              error: "Account access revoked - manager account has been disabled" 
+            });
+          }
+        }
+        
+        // For ADMIN creators, no additional validation needed
       }
       
       // Check if user can login
       if (!user.canManagerLogin) {
         return res.status(401).json({ 
-          message: 'Your account has been disabled. Please contact your manager.' 
+          message: 'Your account has been disabled. Please contact your manager or admin.' 
         });
       }
       
@@ -255,7 +283,8 @@ export const loginUser = async (req, res) => {
         isManagedUser: user.isManagedUser,
         managedBy: user.createdByManager ? {
           id: user.createdByManager.id,
-          name: user.createdByManager.name
+          name: user.createdByManager.name,
+          role: user.createdByManager.role
         } : null,
         accessibleProperties,
         permissions,
