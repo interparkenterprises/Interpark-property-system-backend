@@ -260,52 +260,119 @@ function calculateCoveredBillingPeriods(overpaymentAmount, billingPeriodTotal) {
 // Helper: Generate and upload receipt PDF
 async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpaymentAmount = 0, creditUsed = 0) {
   try {
-    const totalRent = invoices.reduce((sum, inv) => sum + (inv.rent || 0), 0);
-    const totalServiceCharge = invoices.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0);
-    const totalVat = invoices.reduce((sum, inv) => sum + (inv.vat || 0), 0);
-    const totalDue = invoices.reduce((sum, inv) => sum + (inv.totalDue || 0), 0);
-    const paymentPolicy = invoices[0]?.paymentPolicy || tenant.paymentPolicy || 'MONTHLY';
-    const policyMonths = getPolicyMonths(paymentPolicy);
+    // Get fresh invoices with their current state to ensure accuracy
+    const freshInvoices = await prisma.invoice.findMany({
+      where: { 
+        id: { in: invoices.map(i => i.id) }
+      }
+    });
 
+    // SOURCE OF TRUTH: Use paymentReport values for totals (these are correctly calculated in the transaction)
+    const totalRent = paymentReport.rent;
+    const totalServiceCharge = paymentReport.serviceCharge;
+    const totalVat = paymentReport.vat;
+    const totalDue = paymentReport.totalDue;
+    
+    // CRITICAL: The actual amount received is from paymentReport, not recalculated from invoices
+    const actualAmountReceived = paymentReport.amountPaid;
+    
+    // Get payment policy
+    const paymentPolicy = freshInvoices[0]?.paymentPolicy || tenant.paymentPolicy || 'MONTHLY';
+    const policyMonths = getPolicyMonths(paymentPolicy);
+    
+    // Calculate monthly equivalent based on total due
+    const monthlyEquivalent = policyMonths > 0 && totalDue > 0 
+      ? parseFloat((totalDue / policyMonths).toFixed(2)) 
+      : totalDue;
+
+    // Build invoice data for receipt display
+    const invoicesForReceipt = freshInvoices.map(inv => {
+      // Calculate the correct amounts for this specific invoice
+      const originalTotalDue = inv.totalDue;
+      const amountPaidForInvoice = inv.amountPaid;
+      const currentBalance = inv.balance;
+      
+      // Determine correct status for display
+      let displayStatus = inv.status;
+      if (currentBalance <= 0.01) { // Handle floating point precision
+        displayStatus = 'PAID';
+      } else if (amountPaidForInvoice > 0 && currentBalance > 0) {
+        displayStatus = 'PARTIAL';
+      } else if (amountPaidForInvoice === 0 && currentBalance > 0) {
+        displayStatus = 'UNPAID';
+      }
+      
+      return {
+        invoiceNumber: inv.invoiceNumber,
+        paymentPeriod: inv.paymentPeriod,
+        previousBalance: originalTotalDue,
+        paymentApplied: amountPaidForInvoice,
+        newAmountPaid: amountPaidForInvoice,
+        newBalance: currentBalance,
+        newStatus: displayStatus,
+        previousStatus: inv.status,
+        paymentPolicy: inv.paymentPolicy || paymentPolicy,
+        // Individual invoice breakdown (for reference)
+        rent: inv.rent || 0,
+        serviceCharge: inv.serviceCharge || 0,
+        vat: inv.vat || 0
+      };
+    });
+
+    // Determine payment period label
+    let paymentPeriodLabel = freshInvoices[0]?.paymentPeriod;
+    if (!paymentPeriodLabel && paymentReport.paymentPeriod) {
+      paymentPeriodLabel = new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', {
+        month: 'long',
+        year: 'numeric'
+      });
+    }
+
+    // Generate receipt number
+    const receiptNumber = `RCP-${Date.now()}-${paymentReport.id.slice(-6).toUpperCase()}`;
+
+    // Prepare complete receipt data
     const receiptData = {
-      receiptNumber: `RCP-${Date.now()}-${paymentReport.id.slice(-6).toUpperCase()}`,
+      receiptNumber,
       paymentDate: paymentReport.datePaid,
       tenantName: tenant.fullName,
       tenantContact: tenant.contact,
       propertyName: tenant.unit?.property?.name || 'N/A',
       unitType: tenant.unit?.type || 'Unit',
       unitNo: tenant.unit?.unitNo || '',
-      paymentPeriod: invoices[0]?.paymentPeriod || new Date(paymentReport.paymentPeriod).toLocaleDateString('en-US', {
-        month: 'long',
-        year: 'numeric'
-      }),
+      paymentPeriod: paymentPeriodLabel,
       paymentPolicy,
-      monthlyEquivalent: parseFloat((totalDue / policyMonths).toFixed(2)),
+      monthlyEquivalent,
       billedRent: parseFloat(totalRent.toFixed(2)),
       billedServiceCharge: parseFloat(totalServiceCharge.toFixed(2)),
       billedVat: parseFloat(totalVat.toFixed(2)),
       billedTotalDue: parseFloat(totalDue.toFixed(2)),
-      amountPaid: paymentReport.amountPaid,
-      invoicesPaid: invoices.map(inv => ({
-        invoiceNumber: inv.invoiceNumber,
-        paymentPeriod: inv.paymentPeriod,
-        previousBalance: inv.totalDue,
-        paymentApplied: inv.amountPaid,
-        newBalance: inv.balance,
-        newStatus: inv.status,
-        paymentPolicy: inv.paymentPolicy || paymentPolicy
-      })),
-      overpaymentAmount,
-      creditUsed,
-      totalAllocated: paymentReport.amountPaid,
+      amountPaid: parseFloat(actualAmountReceived.toFixed(2)), // CRITICAL: This is the actual amount received
+      invoicesPaid: invoicesForReceipt,
+      overpaymentAmount: parseFloat((overpaymentAmount || 0).toFixed(2)),
+      creditUsed: parseFloat((creditUsed || 0).toFixed(2)),
+      totalAllocated: parseFloat(actualAmountReceived.toFixed(2)), // CRITICAL: Must equal amountPaid
       paymentReportId: paymentReport.id,
-      notes: paymentReport.notes
+      notes: paymentReport.notes,
+      paymentMethod: 'Bank Transfer' // Default, can be customized
     };
 
+    // Log receipt data for debugging (remove in production)
+    console.log('Generating receipt with data:', {
+      amountPaid: receiptData.amountPaid,
+      totalAllocated: receiptData.totalAllocated,
+      billedTotalDue: receiptData.billedTotalDue,
+      overpaymentAmount: receiptData.overpaymentAmount,
+      creditUsed: receiptData.creditUsed,
+      invoicesCount: receiptData.invoicesPaid.length
+    });
+
+    // Generate receipt HTML and PDF
     const receiptHTML = generateReceiptHTML(receiptData);
     const pdfBuffer = await generatePDF(receiptHTML);
 
-    const receiptFileName = `${receiptData.receiptNumber}.pdf`;
+    // Upload to storage
+    const receiptFileName = `${receiptNumber}.pdf`;
     const receiptUrl = await uploadToStorage(pdfBuffer, receiptFileName, 'receipts');
     
     return {
@@ -315,7 +382,14 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
     };
   } catch (error) {
     console.error('Error generating receipt:', error);
-    throw error;
+    // Don't throw the error - just log it and return null
+    // This prevents payment recording from failing if receipt generation fails
+    return {
+      receiptUrl: null,
+      receiptNumber: null,
+      pdfBuffer: null,
+      error: error.message
+    };
   }
 }
 
