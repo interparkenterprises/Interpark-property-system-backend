@@ -1247,7 +1247,7 @@ export const updateTenant = async (req, res) => {
     }
 
     // =============================================
-    // HANDLE SERVICE CHARGE UPDATE - RECOMMENDED VERSION
+    // HANDLE SERVICE CHARGE UPDATE - CORRECTED VERSION
     // =============================================
     if (serviceCharge) {
       // Validate type if provided
@@ -1281,8 +1281,9 @@ export const updateTenant = async (req, res) => {
           : null;
       }
       
+      // CORRECTED: Changed from perSqftRate to perSqFtRate
       if (serviceCharge.perSqFtRate !== undefined) {
-        serviceChargeUpdateData.perSqftRate = serviceCharge.perSqFtRate !== null 
+        serviceChargeUpdateData.perSqFtRate = serviceCharge.perSqFtRate !== null 
           ? parseFloat(serviceCharge.perSqFtRate) 
           : null;
       }
@@ -1303,7 +1304,7 @@ export const updateTenant = async (req, res) => {
               type: normalizedType,
               fixedAmount: serviceChargeUpdateData.fixedAmount ?? null,
               percentage: serviceChargeUpdateData.percentage ?? null,
-              perSqftRate: serviceChargeUpdateData.perSqftRate ?? null,
+              perSqFtRate: serviceChargeUpdateData.perSqFtRate ?? null, //  CORRECTED: Changed from perSqftRate to perSqFtRate
             },
           });
         }
@@ -1430,7 +1431,7 @@ export const updateServiceCharge = async (req, res) => {
           type: type.toUpperCase(),
           fixedAmount: fixedAmount !== undefined ? parseFloat(fixedAmount) : null,
           percentage: percentage !== undefined ? parseFloat(percentage) : null,
-          perSqFtRate: perSqFtRate !== undefined ? parseFloat(perSqFtRate) : null
+          perSqFtRate: perSqFtRate !== undefined ? parseFloat(perSqFtRate) : null // ✅ CORRECTED: perSqFtRate (capital F)
         }
       });
     } else {
@@ -1441,7 +1442,7 @@ export const updateServiceCharge = async (req, res) => {
           type: type.toUpperCase(),
           fixedAmount: fixedAmount ? parseFloat(fixedAmount) : null,
           percentage: percentage ? parseFloat(percentage) : null,
-          perSqFtRate: perSqFtRate ? parseFloat(perSqFtRate) : null
+          perSqFtRate: perSqFtRate ? parseFloat(perSqFtRate) : null // CORRECTED: perSqFtRate (capital F)
         }
       });
     }
