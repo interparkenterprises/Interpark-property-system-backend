@@ -306,33 +306,55 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
         ? parseFloat((inv.totalDue / policyMonths).toFixed(2))
         : inv.totalDue;
       
-      // Calculate how much of the monthly amount was paid
-      // For a full monthly payment, this equals monthlyAmount
-      const monthlyPaidAmount = actualAmountReceived;
+      //  CRITICAL FIX: Use the invoice's total amount paid, not just this payment
+      // This gives us the COMPLETE picture of what's been paid for this invoice
+      const totalAmountPaidForInvoice = inv.amountPaid;
+      const totalInvoiceBalance = inv.balance;
+      const invoiceTotalDue = inv.totalDue;
       
-      // Calculate remaining balance on a monthly basis
-      const monthlyBalance = Math.max(0, monthlyAmount - monthlyPaidAmount);
+      // Calculate the remaining balance on a monthly basis
+      const monthlyBalance = Math.max(0, invoiceTotalDue - totalAmountPaidForInvoice);
       
-      // Determine status for this monthly period
-      let displayStatus = 'PAID';
-      if (monthlyBalance > 0.01) {
-        displayStatus = monthlyPaidAmount > 0 ? 'PARTIAL' : 'UNPAID';
+      //  CRITICAL FIX: Determine status based on TOTAL amount paid vs TOTAL invoice amount
+      // This correctly shows PAID if the invoice is fully paid (including previous payments)
+      let displayStatus = 'UNPAID';
+      if (totalAmountPaidForInvoice >= invoiceTotalDue) {
+        displayStatus = 'PAID';
+      } else if (totalAmountPaidForInvoice > 0) {
+        displayStatus = 'PARTIAL';
       }
+      
+      //  CRITICAL FIX: Calculate the amount paid in this specific transaction for display
+      // This is the incremental amount added to the invoice in this payment
+      const paymentAppliedInThisTransaction = Math.min(
+        paymentReport.amountPaid,
+        invoiceTotalDue - (inv.amountPaid - paymentReport.amountPaid) // This is tricky, let's use a simpler approach
+      );
+      
+      // Simpler: Calculate how much of THIS payment went to this invoice
+      // Since we're allocating payments proportionally or FIFO, we need to track it
+      // For now, use a reasonable approach: if invoice is now paid and was previously unpaid,
+      // the full payment applied is the invoice total
+      const wasPreviouslyUnpaid = inv.amountPaid === 0;
+      const paymentApplied = wasPreviouslyUnpaid 
+        ? Math.min(inv.totalDue, actualAmountReceived)
+        : actualAmountReceived;
       
       return {
         invoiceNumber: inv.invoiceNumber,
         paymentPeriod: inv.paymentPeriod,
         // For display: Show the MONTHLY amount
         previousBalance: monthlyAmount,
-        paymentApplied: monthlyPaidAmount,
-        newAmountPaid: monthlyPaidAmount,
+        paymentApplied: totalAmountPaidForInvoice > 0 ? totalAmountPaidForInvoice : actualAmountReceived,
+        newAmountPaid: totalAmountPaidForInvoice,
         newBalance: monthlyBalance,
         newStatus: displayStatus,
         previousStatus: inv.status,
         paymentPolicy: inv.paymentPolicy || paymentPolicy,
-        monthlyAmount: monthlyAmount, // Explicit field for clarity
-        fullInvoiceAmount: inv.totalDue,
+        monthlyAmount: monthlyAmount,
+        fullInvoiceAmount: invoiceTotalDue,
         policyMonths: policyMonths,
+        totalPaidForInvoice: totalAmountPaidForInvoice, // New field for total paid
         // Individual invoice breakdown (monthly basis)
         rent: monthlyRentAmount,
         serviceCharge: monthlyServiceCharge,
@@ -378,17 +400,15 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
       paymentMethod: 'Bank Transfer'
     };
 
-    // Debug log
-    console.log('Receipt generation - Amount calculation:', {
-      paymentPolicy,
-      policyMonths,
-      monthlyRent: monthlyRentAmount,
-      monthlyServiceCharge,
-      monthlyVat,
-      monthlyTotalDue: monthlyEquivalent,
-      amountPaid: actualAmountReceived,
-      invoiceOriginalTotal: freshInvoices[0]?.totalDue,
-      invoiceMonthlyAmount: invoicesForReceipt[0]?.monthlyAmount
+    // Debug log to verify the calculation
+    console.log('Receipt generation - Invoice status calculation:', {
+      invoiceStatuses: invoicesForReceipt.map(inv => ({
+        invoiceNumber: inv.invoiceNumber,
+        totalDue: inv.fullInvoiceAmount,
+        totalPaidForInvoice: inv.totalPaidForInvoice,
+        displayStatus: inv.newStatus,
+        monthlyBalance: inv.newBalance
+      }))
     });
 
     // Generate receipt
@@ -414,7 +434,6 @@ async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpay
     };
   }
 }
-
 // Helper function to update existing invoices when payment is made
 async function updateExistingInvoicesForPayment(tx, tenantId, paymentPeriodStr, parsedAmountPaid, paymentReportId, periodStartDate, paymentStatus) {
   try {
