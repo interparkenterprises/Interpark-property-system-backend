@@ -2064,49 +2064,79 @@ export const createPaymentReport = async (req, res) => {
         }
       });
 
+      // =============================================
+      // COMMISSION CREATION WITH PROPER MANAGER HANDLING
+      // =============================================
       let commission = null;
-      if (tenant.unit?.property?.commissionFee && tenant.unit?.property?.commissionFee > 0 && commissionBaseAmount > 0) {
+      if (tenant.unit?.property?.commissionFee && 
+          tenant.unit?.property?.commissionFee > 0 && 
+          commissionBaseAmount > 0) {
         
-        let vatExclusiveCommissionBase = commissionBaseAmount;
-        const tenantVatType = tenant.vatType || 'NOT_APPLICABLE';
-        const tenantVatRate = tenant.vatRate || 0;
+        // Get the property's manager (could be ADMIN or MANAGER)
+        const propertyManagerId = tenant.unit?.property?.managerId;
         
-        if (tenantVatType === 'INCLUSIVE' && tenantVatRate > 0) {
-          vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
-        } else if (tenantVatType === 'EXCLUSIVE') {
-          vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
-        }
-        
-        const commissionAmount = (vatExclusiveCommissionBase * tenant.unit.property.commissionFee) / 100;
-        
-        const periodStart = new Date();
-        let periodEnd = new Date();
-        
-        switch (frequency) {
-          case 'QUARTERLY':
-            periodEnd.setMonth(periodEnd.getMonth() + 3);
-            break;
-          case 'ANNUAL':
-            periodEnd.setFullYear(periodEnd.getFullYear() + 1);
-            break;
-          default:
-            periodEnd.setMonth(periodEnd.getMonth() + 1);
-        }
+        // Only create commission if the property has a manager assigned
+        if (propertyManagerId) {
+          // Verify the manager exists and has appropriate role
+          const manager = await tx.user.findUnique({
+            where: { id: propertyManagerId },
+            select: { id: true, role: true, name: true, email: true }
+          });
+          
+          if (!manager) {
+            console.log(`Warning: Property ${tenant.unit.propertyId} has managerId ${propertyManagerId} but user not found`);
+            // Don't create commission if manager doesn't exist
+          } else if (!['ADMIN', 'MANAGER'].includes(manager.role)) {
+            console.log(`Warning: User ${manager.name} (${manager.id}) is not ADMIN or MANAGER, cannot receive commission`);
+            // Don't create commission for non-ADMIN/non-MANAGER users
+          } else {
+            // Calculate commission
+            let vatExclusiveCommissionBase = commissionBaseAmount;
+            const tenantVatType = tenant.vatType || 'NOT_APPLICABLE';
+            const tenantVatRate = tenant.vatRate || 0;
+            
+            if (tenantVatType === 'INCLUSIVE' && tenantVatRate > 0) {
+              vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
+            } else if (tenantVatType === 'EXCLUSIVE') {
+              vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
+            }
+            
+            const commissionAmount = (vatExclusiveCommissionBase * tenant.unit.property.commissionFee) / 100;
+            
+            const periodStart = new Date();
+            let periodEnd = new Date();
+            
+            switch (frequency) {
+              case 'QUARTERLY':
+                periodEnd.setMonth(periodEnd.getMonth() + 3);
+                break;
+              case 'ANNUAL':
+                periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+                break;
+              default:
+                periodEnd.setMonth(periodEnd.getMonth() + 1);
+            }
 
-        commission = await tx.managerCommission.create({
-          data: {
-            propertyId: tenant.unit.propertyId,
-            managerId: tenant.unit.property.managerId,
-            commissionFee: tenant.unit.property.commissionFee,
-            incomeAmount: vatExclusiveCommissionBase,
-            originalIncomeAmount: parsedAmountPaid,
-            commissionAmount: commissionAmount,
-            periodStart: periodStart,
-            periodEnd: periodEnd,
-            status: 'PENDING',
-            notes: `VAT Type: ${tenantVatType}, VAT Rate: ${tenantVatRate}%, Commission calculated on current period only. Credit used: ${creditUsed}`
+            commission = await tx.managerCommission.create({
+              data: {
+                propertyId: tenant.unit.propertyId,
+                managerId: propertyManagerId,
+                commissionFee: tenant.unit.property.commissionFee,
+                incomeAmount: vatExclusiveCommissionBase,
+                originalIncomeAmount: parsedAmountPaid,
+                commissionAmount: commissionAmount,
+                periodStart: periodStart,
+                periodEnd: periodEnd,
+                status: 'PENDING',
+                notes: `Commission for ${manager.role}: ${manager.name} (${manager.email}). VAT Type: ${tenantVatType}, VAT Rate: ${tenantVatRate}%, Credit used: ${creditUsed}. Payment recorded by: ${req.user.id}`
+              }
+            });
+            
+            console.log(`Commission created for ${manager.role}: ${manager.name} (${manager.id}) - Amount: ${commissionAmount}`);
           }
-        });
+        } else {
+          console.log(`Commission not created: Property ${tenant.unit.propertyId} has no manager assigned`);
+        }
       }
 
       return {
@@ -2224,7 +2254,8 @@ export const createPaymentReport = async (req, res) => {
           ` (Overpayment of ${transactionResult.overpaymentAmount} allocated using FIFO)` : '') +
         (transactionResult.creditUsed > 0 ? 
           ` (${transactionResult.creditUsed} credit applied)` : '') +
-        (receiptResult ? ' (Receipt generated)' : '')
+        (receiptResult ? ' (Receipt generated)' : '') +
+        (transactionResult.commission ? ` (Commission: ${transactionResult.commission.commissionAmount})` : '')
     });
 
   } catch (error) {
@@ -2620,7 +2651,7 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               unit: {
                 include: {
                   property: {
-                    select: { id: true, name: true }
+                    select: { id: true, name: true, managerId: true, commissionFee: true }
                   }
                 }
               }
@@ -2681,8 +2712,41 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           }
         });
 
+        // =============================================
+        // COMMISSION PROCESSING WITH PROPER MANAGER HANDLING
+        // =============================================
         if (updatedIncome) {
-          await processCommissionForIncome(tx, updatedIncome.id);
+          // Get property details to check for commission
+          const property = await tx.property.findUnique({
+            where: { id: existingReport.tenant.unit.propertyId },
+            select: { 
+              id: true, 
+              managerId: true, 
+              commissionFee: true,
+              name: true 
+            }
+          });
+
+          // Only process commission if property has commission fee AND a manager assigned
+          if (property?.commissionFee && property?.commissionFee > 0 && property?.managerId) {
+            // Verify the manager exists and has appropriate role
+            const manager = await tx.user.findUnique({
+              where: { id: property.managerId },
+              select: { id: true, role: true, name: true, email: true }
+            });
+
+            if (!manager) {
+              console.log(`Warning: Property ${property.id} has managerId ${property.managerId} but user not found`);
+            } else if (!['ADMIN', 'MANAGER'].includes(manager.role)) {
+              console.log(`Warning: User ${manager.name} (${manager.id}) is not ADMIN or MANAGER, cannot receive commission`);
+            } else {
+              // Process the commission
+              await processCommissionForIncome(tx, updatedIncome.id);
+              console.log(`Commission processed for ${manager.role}: ${manager.name} (${manager.id}) on property: ${property.name}`);
+            }
+          } else if (property?.commissionFee && property?.commissionFee > 0 && !property?.managerId) {
+            console.log(`Commission not processed: Property ${property.id} has commission fee but no manager assigned`);
+          }
         }
       }
 
