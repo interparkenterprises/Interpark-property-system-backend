@@ -869,8 +869,20 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     // Generate unique invoice number
     const invoiceNumber = await generateInvoiceNumber();
 
-    // Determine payment period
-    const paymentPeriod = paymentReport.paymentPeriod || buildPaymentPeriodLabel(new Date(), tenant.paymentPolicy);
+    // FIX: Convert paymentPeriod to a string
+    // If paymentReport.paymentPeriod is a Date, format it to a readable string
+    let paymentPeriod;
+    if (paymentReport.paymentPeriod) {
+      // Convert Date to string format (e.g., "June 2026" or "June 1, 2026 - June 30, 2026")
+      const paymentDate = new Date(paymentReport.paymentPeriod);
+      
+      // Use the existing buildPaymentPeriodLabel function to get a consistent format
+      // Pass the tenant's payment policy to get the correct period label
+      paymentPeriod = buildPaymentPeriodLabel(paymentDate, tenant.paymentPolicy || 'MONTHLY');
+    } else {
+      // Fallback to current month if no payment period
+      paymentPeriod = buildPaymentPeriodLabel(new Date(), tenant.paymentPolicy || 'MONTHLY');
+    }
 
     // Create invoice record for the balance with paymentPolicy
     const invoice = await prisma.invoice.create({
@@ -880,7 +892,7 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
         paymentReportId: paymentReportId,
         issueDate: new Date(),
         dueDate: new Date(dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)),
-        paymentPeriod,
+        paymentPeriod: paymentPeriod, // Now this is a String, not a Date
         rent,
         serviceCharge,
         vat,
@@ -888,8 +900,8 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
         amountPaid: 0,
         balance: balance,
         status: 'UNPAID',
-        notes: notes || `Balance invoice for partial payment of ${paymentPeriod}`,
-        paymentPolicy: tenant.paymentPolicy
+        notes: notes || `Balance invoice for ${paymentPeriod}`,
+        paymentPolicy: tenant.paymentPolicy || 'MONTHLY'
       },
       include: {
         tenant: {
