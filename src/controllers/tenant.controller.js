@@ -4,7 +4,11 @@ import permissionService from "../services/permissionService.js";
 import { 
   calculateEscalatedRent,  
   calculatePaymentByPolicy,
-  getRentScheduleWithPayments 
+  getRentScheduleWithPayments,
+  calculateServiceCharge,
+  calculateVAT,
+  calculateTotalPayment,
+  getPolicyMonths
 } from '../services/rentCalculation.js';
 import { getPaymentSummary } from '../services/paymentScheduling.js';
 
@@ -195,12 +199,34 @@ export const getTenants = async (req, res) => {
       const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
       const paymentSummary = getPaymentSummary(tenant);
       
+      // Calculate service charge based on rent ONLY
+      const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
+      const serviceChargeByPolicy = serviceChargeDetails.amount * getPolicyMonths(tenant.paymentPolicy);
+      
+      // Calculate VAT on rent
+      const vatOnRent = calculateVAT(paymentAmount, tenant.vatType, tenant.vatRate);
+      
+      // Calculate VAT on service charge (using service charge's own VAT settings)
+      const vatOnServiceCharge = serviceChargeDetails.vatAmount * getPolicyMonths(tenant.paymentPolicy);
+      
+      const totalPayment = paymentAmount + vatOnRent + serviceChargeByPolicy + vatOnServiceCharge;
+      
       return {
         ...tenant,
         rentInfo: {
           ...rentInfo,
           monthlyRent: monthlyRent,
           paymentAmount: paymentAmount,
+          serviceCharge: {
+            monthly: serviceChargeDetails.amount,
+            byPolicy: serviceChargeByPolicy,
+            vatType: serviceChargeDetails.vatType,
+            vatRate: serviceChargeDetails.vatRate,
+            vatAmount: vatOnServiceCharge,
+            totalByPolicy: serviceChargeByPolicy + vatOnServiceCharge
+          },
+          vatOnRent: vatOnRent,
+          totalPayment: totalPayment,
           paymentPolicy: tenant.paymentPolicy
         },
         paymentSummary
@@ -251,10 +277,13 @@ export const getTenant = async (req, res) => {
       }
     });
 
-    // Calculate escalated rent and schedule
+    // Calculate escalated rent
     const rentInfo = calculateEscalatedRent(fullTenant);
     const monthlyRent = rentInfo.currentRent;
-    const paymentAmount = calculatePaymentByPolicy(monthlyRent, fullTenant.paymentPolicy);
+    
+    // Calculate total payment breakdown using the new function
+    const paymentBreakdown = calculateTotalPayment(fullTenant, monthlyRent, fullTenant.paymentPolicy);
+    
     const rentSchedule = getRentScheduleWithPayments(fullTenant, 3);
     
     // Calculate payment summary with due dates
@@ -265,8 +294,7 @@ export const getTenant = async (req, res) => {
       rentInfo: {
         ...rentInfo,
         monthlyRent: monthlyRent,
-        paymentAmount: paymentAmount,
-        paymentPolicy: fullTenant.paymentPolicy
+        paymentBreakdown: paymentBreakdown
       },
       rentSchedule,
       paymentSummary
@@ -341,12 +369,34 @@ export const getTenantsByProperty = async (req, res) => {
       const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
       const paymentSummary = getPaymentSummary(tenant);
       
+      // Calculate service charge based on rent ONLY
+      const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
+      const serviceChargeByPolicy = serviceChargeDetails.amount * getPolicyMonths(tenant.paymentPolicy);
+      
+      // Calculate VAT on rent
+      const vatOnRent = calculateVAT(paymentAmount, tenant.vatType, tenant.vatRate);
+      
+      // Calculate VAT on service charge (using service charge's own VAT settings)
+      const vatOnServiceCharge = serviceChargeDetails.vatAmount * getPolicyMonths(tenant.paymentPolicy);
+      
+      const totalPayment = paymentAmount + vatOnRent + serviceChargeByPolicy + vatOnServiceCharge;
+      
       return {
         ...tenant,
         rentInfo: {
           ...rentInfo,
           monthlyRent: monthlyRent,
           paymentAmount: paymentAmount,
+          serviceCharge: {
+            monthly: serviceChargeDetails.amount,
+            byPolicy: serviceChargeByPolicy,
+            vatType: serviceChargeDetails.vatType,
+            vatRate: serviceChargeDetails.vatRate,
+            vatAmount: vatOnServiceCharge,
+            totalByPolicy: serviceChargeByPolicy + vatOnServiceCharge
+          },
+          vatOnRent: vatOnRent,
+          totalPayment: totalPayment,
           paymentPolicy: tenant.paymentPolicy
         },
         paymentSummary
@@ -551,12 +601,34 @@ export const getOverdueTenants = async (req, res) => {
         const paymentSummary = getPaymentSummary(tenant);
         const overdueDays = calculateOverdueDays(tenant);
         
+        // Calculate service charge based on rent ONLY
+        const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
+        const serviceChargeByPolicy = serviceChargeDetails.amount * getPolicyMonths(tenant.paymentPolicy);
+        
+        // Calculate VAT on rent
+        const vatOnRent = calculateVAT(paymentAmount, tenant.vatType, tenant.vatRate);
+        
+        // Calculate VAT on service charge (using service charge's own VAT settings)
+        const vatOnServiceCharge = serviceChargeDetails.vatAmount * getPolicyMonths(tenant.paymentPolicy);
+        
+        const totalPayment = paymentAmount + vatOnRent + serviceChargeByPolicy + vatOnServiceCharge;
+        
         return {
           ...tenant,
           rentInfo: {
             ...rentInfo,
             monthlyRent: monthlyRent,
             paymentAmount: paymentAmount,
+            serviceCharge: {
+              monthly: serviceChargeDetails.amount,
+              byPolicy: serviceChargeByPolicy,
+              vatType: serviceChargeDetails.vatType,
+              vatRate: serviceChargeDetails.vatRate,
+              vatAmount: vatOnServiceCharge,
+              totalByPolicy: serviceChargeByPolicy + vatOnServiceCharge
+            },
+            vatOnRent: vatOnRent,
+            totalPayment: totalPayment,
             paymentPolicy: tenant.paymentPolicy
           },
           paymentSummary,
@@ -711,7 +783,9 @@ export const getNextPaymentsByProperty = async (req, res) => {
       // Calculate rent info with escalation
       const rentInfo = calculateEscalatedRent(tenant);
       const monthlyRent = rentInfo.currentRent;
-      const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+      
+      // Calculate total payment breakdown
+      const paymentBreakdown = calculateTotalPayment(tenant, monthlyRent, tenant.paymentPolicy);
       const paymentSummary = getPaymentSummary(tenant);
       
       // Get the next due date
@@ -723,33 +797,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
         
         // Calculate days until due (negative if overdue)
         const daysUntilDue = Math.ceil((dueDateObj - now) / (1000 * 60 * 60 * 24));
-        
-        // Calculate service charge for this period
-        let serviceChargeAmount = 0;
-        if (tenant.serviceCharge) {
-          switch (tenant.serviceCharge.type) {
-            case 'FIXED':
-              serviceChargeAmount = tenant.serviceCharge.fixedAmount || 0;
-              break;
-            case 'PERCENTAGE':
-              serviceChargeAmount = (monthlyRent * (tenant.serviceCharge.percentage || 0)) / 100;
-              break;
-            case 'PER_SQ_FT':
-              serviceChargeAmount = (tenant.unit.sizeSqFt || 0) * (tenant.serviceCharge.perSqftRate || 0);
-              break;
-          }
-        }
-        
-        // Calculate VAT if applicable
-        let vatAmount = 0;
-        if (tenant.vatType !== 'NOT_APPLICABLE' && tenant.vatRate > 0) {
-          const subtotal = paymentAmount + serviceChargeAmount;
-          vatAmount = tenant.vatType === 'INCLUSIVE' 
-            ? (subtotal * tenant.vatRate) / (100 + tenant.vatRate)
-            : (subtotal * tenant.vatRate) / 100;
-        }
-        
-        const totalDue = paymentAmount + serviceChargeAmount + vatAmount;
         
         tenantsWithNextPayment.push({
           id: tenant.id,
@@ -770,10 +817,11 @@ export const getNextPaymentsByProperty = async (req, res) => {
             daysUntilDue: daysUntilDue,
             isOverdue: isOverdue,
             amount: {
-              rent: paymentAmount,
-              serviceCharge: serviceChargeAmount,
-              vat: vatAmount,
-              total: Math.round(totalDue * 100) / 100
+              rent: paymentBreakdown.rent.paymentByPolicy,
+              serviceCharge: paymentBreakdown.serviceCharge.paymentByPolicy,
+              vatOnRent: paymentBreakdown.rent.vatAmount,
+              vatOnServiceCharge: paymentBreakdown.serviceCharge.vatAmount,
+              total: paymentBreakdown.total.paymentByPolicy
             },
             status: paymentSummary.status,
             policy: tenant.paymentPolicy
@@ -830,6 +878,7 @@ export const getNextPaymentsByProperty = async (req, res) => {
     res.status(400).json({ message: error.message });
   }
 };
+
 // @desc    Create tenant
 // @route   POST /api/tenants
 // @access  Private (ADMIN, MANAGER, and USER with CREATE_TENANT permission)
@@ -942,10 +991,10 @@ export const createTenant = async (req, res) => {
       });
     }
 
-    // Validate escalation frequency
+    // Validate escalation frequency - NEW: Added BI_ENNIAL
     let normalizedEscalationFrequency = null;
     if (escalationFrequency !== undefined && escalationFrequency !== null) {
-      const validEscalations = ["ANNUALLY", "BI_ANNUALLY"];
+      const validEscalations = ["ANNUALLY", "BI_ANNUALLY", "BI_ENNIAL"];
       normalizedEscalationFrequency = escalationFrequency.toUpperCase();
       if (!validEscalations.includes(normalizedEscalationFrequency)) {
         return res.status(400).json({
@@ -1023,7 +1072,7 @@ export const createTenant = async (req, res) => {
     });
 
     // =============================================
-    // HANDLE SERVICE CHARGE - CORRECTED VERSION
+    // HANDLE SERVICE CHARGE - UPDATED WITH VAT SUPPORT
     // =============================================
     if (serviceCharge) {
       // Extract and validate type
@@ -1036,13 +1085,43 @@ export const createTenant = async (req, res) => {
         });
       }
 
+      // Validate service charge VAT type
+      let normalizedServiceVatType = "NOT_APPLICABLE";
+      if (serviceCharge.vatType) {
+        const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
+        normalizedServiceVatType = serviceCharge.vatType.toUpperCase();
+        if (!validVatTypes.includes(normalizedServiceVatType)) {
+          return res.status(400).json({
+            message: `Invalid service charge VAT type. Must be one of: ${validVatTypes.join(", ")}`,
+          });
+        }
+      }
+
+      // Validate service charge VAT rate
+      let parsedServiceVatRate = 0;
+      if (serviceCharge.vatRate !== undefined && serviceCharge.vatRate !== null) {
+        parsedServiceVatRate = parseFloat(serviceCharge.vatRate);
+        if (isNaN(parsedServiceVatRate) || parsedServiceVatRate < 0 || parsedServiceVatRate > 100) {
+          return res.status(400).json({
+            message: "Service charge VAT rate must be a number between 0 and 100",
+          });
+        }
+      }
+
+      // If VAT type is NOT_APPLICABLE, force vatRate = 0
+      if (normalizedServiceVatType === "NOT_APPLICABLE") {
+        parsedServiceVatRate = 0;
+      }
+
       // Build data object with CORRECT Prisma field name: perSqFtRate (camelCase with capital F)
       const serviceChargeData = {
         tenantId: tenant.id,
         type: normalizedType,
         fixedAmount: serviceCharge.fixedAmount ? parseFloat(serviceCharge.fixedAmount) : null,
         percentage: serviceCharge.percentage ? parseFloat(serviceCharge.percentage) : null,
-        perSqFtRate: serviceCharge.perSqFtRate ? parseFloat(serviceCharge.perSqFtRate) : null, // CORRECT: perSqFtRate (capital F)
+        perSqFtRate: serviceCharge.perSqFtRate ? parseFloat(serviceCharge.perSqFtRate) : null,
+        vatType: normalizedServiceVatType,
+        vatRate: parsedServiceVatRate,
       };
 
       await prisma.serviceCharge.create({
@@ -1142,13 +1221,13 @@ export const updateTenant = async (req, res) => {
       }
     }
 
-    // Validate escalation frequency
+    // Validate escalation frequency - NEW: Added BI_ENNIAL
     let normalizedEscalationFrequency = undefined;
     if (escalationFrequency !== undefined) {
       if (escalationFrequency === null) {
         normalizedEscalationFrequency = null;
       } else {
-        const validEscalations = ["ANNUALLY", "BI_ANNUALLY"];
+        const validEscalations = ["ANNUALLY", "BI_ANNUALLY", "BI_ENNIAL"];
         normalizedEscalationFrequency = escalationFrequency.toUpperCase();
         if (!validEscalations.includes(normalizedEscalationFrequency)) {
           return res.status(400).json({
@@ -1247,7 +1326,7 @@ export const updateTenant = async (req, res) => {
     }
 
     // =============================================
-    // HANDLE SERVICE CHARGE UPDATE - CORRECTED VERSION
+    // HANDLE SERVICE CHARGE UPDATE - UPDATED WITH VAT SUPPORT
     // =============================================
     if (serviceCharge) {
       // Validate type if provided
@@ -1259,6 +1338,33 @@ export const updateTenant = async (req, res) => {
           return res.status(400).json({
             message: `Invalid service charge type. Must be: ${validTypes.join(", ")}`,
           });
+        }
+      }
+
+      // Validate service charge VAT type
+      let normalizedServiceVatType = undefined;
+      if (serviceCharge.vatType !== undefined) {
+        const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
+        normalizedServiceVatType = serviceCharge.vatType.toUpperCase();
+        if (!validVatTypes.includes(normalizedServiceVatType)) {
+          return res.status(400).json({
+            message: `Invalid service charge VAT type. Must be: ${validVatTypes.join(", ")}`,
+          });
+        }
+      }
+
+      // Validate service charge VAT rate
+      let parsedServiceVatRate = undefined;
+      if (serviceCharge.vatRate !== undefined) {
+        if (serviceCharge.vatRate === null) {
+          parsedServiceVatRate = 0;
+        } else {
+          parsedServiceVatRate = parseFloat(serviceCharge.vatRate);
+          if (isNaN(parsedServiceVatRate) || parsedServiceVatRate < 0 || parsedServiceVatRate > 100) {
+            return res.status(400).json({
+              message: "Service charge VAT rate must be between 0 and 100",
+            });
+          }
         }
       }
 
@@ -1281,11 +1387,24 @@ export const updateTenant = async (req, res) => {
           : null;
       }
       
-      // CORRECTED: Changed from perSqftRate to perSqFtRate
       if (serviceCharge.perSqFtRate !== undefined) {
         serviceChargeUpdateData.perSqFtRate = serviceCharge.perSqFtRate !== null 
           ? parseFloat(serviceCharge.perSqFtRate) 
           : null;
+      }
+
+      // Add VAT fields
+      if (normalizedServiceVatType !== undefined) {
+        serviceChargeUpdateData.vatType = normalizedServiceVatType;
+      }
+      
+      if (parsedServiceVatRate !== undefined) {
+        serviceChargeUpdateData.vatRate = parsedServiceVatRate;
+      }
+
+      // If VAT type is NOT_APPLICABLE, force vatRate = 0
+      if (normalizedServiceVatType === "NOT_APPLICABLE") {
+        serviceChargeUpdateData.vatRate = 0;
       }
 
       // Update or create service charge
@@ -1304,7 +1423,9 @@ export const updateTenant = async (req, res) => {
               type: normalizedType,
               fixedAmount: serviceChargeUpdateData.fixedAmount ?? null,
               percentage: serviceChargeUpdateData.percentage ?? null,
-              perSqFtRate: serviceChargeUpdateData.perSqFtRate ?? null, //  CORRECTED: Changed from perSqftRate to perSqFtRate
+              perSqFtRate: serviceChargeUpdateData.perSqFtRate ?? null,
+              vatType: serviceChargeUpdateData.vatType ?? "NOT_APPLICABLE",
+              vatRate: serviceChargeUpdateData.vatRate ?? 0,
             },
           });
         }
@@ -1325,6 +1446,7 @@ export const updateTenant = async (req, res) => {
     res.status(500).json({ message: "Server error", error: error.message });
   }
 };
+
 // @desc    Delete tenant
 // @route   DELETE /api/tenants/:id
 // @access  Private (ADMIN, MANAGER, and USER with DELETE_TENANT permission)
@@ -1401,7 +1523,7 @@ export const updateServiceCharge = async (req, res) => {
       });
     }
 
-    const { type, fixedAmount, percentage, perSqFtRate } = req.body;
+    const { type, fixedAmount, percentage, perSqFtRate, vatType, vatRate } = req.body;
 
     // Check if tenant exists
     const existingTenant = await prisma.tenant.findUnique({
@@ -1421,28 +1543,67 @@ export const updateServiceCharge = async (req, res) => {
       });
     }
 
+    // Validate VAT type if provided
+    let normalizedVatType = undefined;
+    if (vatType !== undefined) {
+      const validVatTypes = ['INCLUSIVE', 'EXCLUSIVE', 'NOT_APPLICABLE'];
+      normalizedVatType = vatType.toUpperCase();
+      if (!validVatTypes.includes(normalizedVatType)) {
+        return res.status(400).json({
+          message: `Invalid VAT type. Must be one of: ${validVatTypes.join(', ')}`
+        });
+      }
+    }
+
+    // Validate VAT rate if provided
+    let parsedVatRate = undefined;
+    if (vatRate !== undefined) {
+      if (vatRate === null) {
+        parsedVatRate = 0;
+      } else {
+        parsedVatRate = parseFloat(vatRate);
+        if (isNaN(parsedVatRate) || parsedVatRate < 0 || parsedVatRate > 100) {
+          return res.status(400).json({
+            message: "VAT rate must be between 0 and 100"
+          });
+        }
+      }
+    }
+
+    // If VAT type is NOT_APPLICABLE, force vatRate = 0
+    if (normalizedVatType === "NOT_APPLICABLE") {
+      parsedVatRate = 0;
+    }
+
+    const updateData = {
+      type: type.toUpperCase(),
+      fixedAmount: fixedAmount !== undefined ? parseFloat(fixedAmount) : null,
+      percentage: percentage !== undefined ? parseFloat(percentage) : null,
+      perSqFtRate: perSqFtRate !== undefined ? parseFloat(perSqFtRate) : null
+    };
+
+    // Add VAT fields if provided
+    if (normalizedVatType !== undefined) {
+      updateData.vatType = normalizedVatType;
+    }
+    if (parsedVatRate !== undefined) {
+      updateData.vatRate = parsedVatRate;
+    }
+
     let serviceCharge;
 
     if (existingTenant.serviceCharge) {
       // Update existing service charge
       serviceCharge = await prisma.serviceCharge.update({
         where: { tenantId: req.params.id },
-        data: {
-          type: type.toUpperCase(),
-          fixedAmount: fixedAmount !== undefined ? parseFloat(fixedAmount) : null,
-          percentage: percentage !== undefined ? parseFloat(percentage) : null,
-          perSqFtRate: perSqFtRate !== undefined ? parseFloat(perSqFtRate) : null // ✅ CORRECTED: perSqFtRate (capital F)
-        }
+        data: updateData
       });
     } else {
       // Create new service charge
       serviceCharge = await prisma.serviceCharge.create({
         data: {
           tenantId: req.params.id,
-          type: type.toUpperCase(),
-          fixedAmount: fixedAmount ? parseFloat(fixedAmount) : null,
-          percentage: percentage ? parseFloat(percentage) : null,
-          perSqFtRate: perSqFtRate ? parseFloat(perSqFtRate) : null // CORRECTED: perSqFtRate (capital F)
+          ...updateData
         }
       });
     }

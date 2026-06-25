@@ -4,7 +4,7 @@ import { processCommissionForIncome } from '../services/commissionService.js';
 import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 import { generateReceiptHTML } from '../utils/receiptTemplate.js';
 import { uploadToStorage } from '../utils/storage.js';
-import { getPolicyMonths, addBillingPeriod } from '../services/rentCalculation.js';
+import { getPolicyMonths, addBillingPeriod, getBaseRent } from '../services/rentCalculation.js';
 import path from 'path';
 import fs from 'fs/promises';
 import { existsSync } from 'fs';
@@ -43,6 +43,8 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     let escalationIntervalMonths = 12; // Default ANNUALLY
     if (tenant.escalationFrequency === 'BI_ANNUALLY') {
       escalationIntervalMonths = 6;
+    } else if (tenant.escalationFrequency === 'BI_ENNIAL') {
+      escalationIntervalMonths = 24;
     }
     
     const escalationsApplied = Math.floor(monthsElapsed / escalationIntervalMonths);
@@ -52,7 +54,12 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     }
   }
 
-  // Compute service charge
+  // =============================================
+  // FIXED: Get base rent (excluding VAT) for service charge calculation
+  // =============================================
+  const baseRent = getBaseRent(expectedRent, tenant.vatType, tenant.vatRate);
+
+  // Compute service charge based on BASE RENT (not rent + VAT)
   let serviceCharge = 0;
   const sc = tenant.serviceCharge;
   if (sc) {
@@ -61,7 +68,8 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
         serviceCharge = sc.fixedAmount || 0;
         break;
       case 'PERCENTAGE':
-        serviceCharge = expectedRent * (sc.percentage || 0) / 100;
+        // FIXED: Calculate percentage on BASE RENT (excluding VAT)
+        serviceCharge = baseRent * (sc.percentage || 0) / 100;
         break;
       case 'PER_SQ_FT':
         const sqFt = tenant.unit?.sizeSqFt || 0;
@@ -72,19 +80,32 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     }
   }
 
-  // Calculate VAT based on tenant's VAT configuration
+  // =============================================
+  // FIXED: Calculate VAT correctly for INCLUSIVE and EXCLUSIVE
+  // =============================================
   let vat = 0;
-  let baseAmount = expectedRent + serviceCharge;
-  const vatRate = 16; // Fixed 16% VAT rate
+  const vatRate = tenant.vatRate || 16; // Use tenant's VAT rate
 
   if (tenant.vatType === 'EXCLUSIVE') {
     // VAT is added on top of rent + service charge
+    const baseAmount = expectedRent + serviceCharge;
     vat = baseAmount * vatRate / 100;
   } else if (tenant.vatType === 'INCLUSIVE') {
     // VAT is already included in the rent amount
-    // Extract VAT from the inclusive amount: VAT = Amount × (VAT Rate / (100 + VAT Rate))
-    vat = baseAmount * (vatRate / (100 + vatRate));
-    // Note: The rent already includes VAT, so we don't add it to totalDue
+    // Calculate VAT on rent only (service charge has its own VAT settings)
+    const rentVatAmount = (expectedRent * vatRate) / (100 + vatRate);
+    
+    // Calculate VAT on service charge using service charge's own VAT settings
+    let serviceChargeVat = 0;
+    if (sc && sc.vatType && sc.vatType !== 'NOT_APPLICABLE' && sc.vatRate > 0) {
+      if (sc.vatType === 'INCLUSIVE') {
+        serviceChargeVat = (serviceCharge * sc.vatRate) / (100 + sc.vatRate);
+      } else if (sc.vatType === 'EXCLUSIVE') {
+        serviceChargeVat = (serviceCharge * sc.vatRate) / 100;
+      }
+    }
+    
+    vat = rentVatAmount + serviceChargeVat;
   } else {
     // NOT_APPLICABLE - no VAT
     vat = 0;
@@ -93,9 +114,21 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
   // Calculate total due
   let totalDue;
   if (tenant.vatType === 'EXCLUSIVE') {
-    totalDue = expectedRent + serviceCharge + vat;
+    // For EXCLUSIVE: rent + service charge + VAT
+    const baseAmount = expectedRent + serviceCharge;
+    const vatAmount = baseAmount * vatRate / 100;
+    totalDue = baseAmount + vatAmount;
+  } else if (tenant.vatType === 'INCLUSIVE') {
+    // For INCLUSIVE: rent (includes VAT) + service charge + service charge VAT (if any)
+    totalDue = expectedRent + serviceCharge;
+    
+    // Add service charge VAT if applicable and EXCLUSIVE
+    if (sc && sc.vatType === 'EXCLUSIVE' && sc.vatRate > 0) {
+      totalDue += (serviceCharge * sc.vatRate) / 100;
+    }
+    // If service charge VAT is INCLUSIVE, it's already included in the service charge
   } else {
-    // For INCLUSIVE and NOT_APPLICABLE, totalDue is just rent + service charge
+    // NOT_APPLICABLE: rent + service charge
     totalDue = expectedRent + serviceCharge;
   }
 

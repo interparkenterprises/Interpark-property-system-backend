@@ -419,6 +419,8 @@ model ServiceCharge {
   fixedAmount Float?
   percentage  Float?
   perSqFtRate Float?            @map("perSqFtRate")
+  vatType     VATType           @default(NOT_APPLICABLE)  // NEW
+  vatRate     Float?            @default(0)               // NEW
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   tenant      Tenant            @relation(fields: [tenantId], references: [id])
@@ -962,6 +964,7 @@ enum VATType {
 enum EscalationFrequency {
   ANNUALLY
   BI_ANNUALLY
+  BI_ENNIAL  // NEW: Every two years
 }
 
 enum ServiceChargeType {
