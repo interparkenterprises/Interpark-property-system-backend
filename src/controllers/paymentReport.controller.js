@@ -1865,6 +1865,24 @@ export const createPaymentReport = async (req, res) => {
           );
           
           const invoiceNumber = await generateInvoiceNumber();
+          
+          // =============================================
+          // FIXED: Extract numeric values from the expected object
+          // =============================================
+          const rentAmount = typeof expected.rent === 'object' 
+            ? expected.rent.amount || expected.rent.monthly || 0
+            : expected.rent || 0;
+          
+          const serviceChargeAmount = typeof expected.serviceCharge === 'object'
+            ? expected.serviceCharge.amount || expected.serviceCharge.monthly || 0
+            : expected.serviceCharge || 0;
+          
+          const vatAmount = typeof expected.vat === 'object'
+            ? expected.vat.total || expected.vat.monthlyTotal || 0
+            : expected.vat || 0;
+          
+          const totalDueAmount = expected.totalDue || 0;
+          
           const newInvoice = await prisma.invoice.create({
             data: {
               invoiceNumber,
@@ -1872,20 +1890,20 @@ export const createPaymentReport = async (req, res) => {
               issueDate: new Date(),
               dueDate: expected.periodEnd,
               paymentPeriod: expected.paymentPeriodLabel,
-              rent: expected.rent,
-              serviceCharge: expected.serviceCharge,
-              vat: expected.vat,
-              totalDue: expected.totalDue,
+              rent: rentAmount,
+              serviceCharge: serviceChargeAmount,
+              vat: vatAmount,
+              totalDue: totalDueAmount,
               amountPaid: 0,
-              balance: expected.totalDue,
+              balance: totalDueAmount,
               status: 'UNPAID',
               paymentPolicy: tenant.paymentPolicy || 'MONTHLY',
-              notes: `Auto-generated ${(tenant.paymentPolicy || 'MONTHLY')} invoice for payment recording. Monthly equivalent: Ksh ${expected.monthlyEquivalent.toFixed(2)}`
+              notes: `Auto-generated ${(tenant.paymentPolicy || 'MONTHLY')} invoice for payment recording. Monthly equivalent: Ksh ${expected.monthlyEquivalent?.toFixed(2) || totalDueAmount.toFixed(2)}`
             }
           });
           
           invoicesToProcess = [newInvoice];
-          totalInvoiceBalance = expected.totalDue;
+          totalInvoiceBalance = totalDueAmount;
           paymentPeriodStr = newInvoice.paymentPeriod;
           console.log(`Created new ${tenant.paymentPolicy || 'MONTHLY'} invoice for payment: ${newInvoice.invoiceNumber}`);
         } else {
@@ -1964,13 +1982,36 @@ export const createPaymentReport = async (req, res) => {
       if (creditUsed > 0) paymentNotes.push(`Applied Ksh ${creditUsed.toFixed(2)} from credit balance`);
       if (overpaymentAmount > 0) paymentNotes.push(`Overpayment: Ksh ${overpaymentAmount.toFixed(2)}`);
 
+      // =============================================
+      // FIXED: Calculate totals as numbers
+      // =============================================
+      const totalRent = invoicesToProcess.reduce((sum, inv) => {
+        const rentValue = typeof inv.rent === 'number' ? inv.rent : 0;
+        return sum + rentValue;
+      }, 0);
+      
+      const totalServiceCharge = invoicesToProcess.reduce((sum, inv) => {
+        const scValue = typeof inv.serviceCharge === 'number' ? inv.serviceCharge : 0;
+        return sum + scValue;
+      }, 0);
+      
+      const totalVat = invoicesToProcess.reduce((sum, inv) => {
+        const vatValue = typeof inv.vat === 'number' ? inv.vat : 0;
+        return sum + vatValue;
+      }, 0);
+      
+      const totalDue = invoicesToProcess.reduce((sum, inv) => {
+        const dueValue = typeof inv.totalDue === 'number' ? inv.totalDue : 0;
+        return sum + dueValue;
+      }, 0);
+
       const report = await tx.paymentReport.create({
         data: {
           tenantId,
-          rent: invoicesToProcess.reduce((sum, inv) => sum + inv.rent, 0),
-          serviceCharge: invoicesToProcess.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
-          vat: invoicesToProcess.reduce((sum, inv) => sum + (inv.vat || 0), 0),
-          totalDue: invoicesToProcess.reduce((sum, inv) => sum + inv.totalDue, 0),
+          rent: totalRent,
+          serviceCharge: totalServiceCharge,
+          vat: totalVat,
+          totalDue: totalDue,
           amountPaid: totalAvailable,
           arrears: Math.max(0, totalInvoiceBalance - totalAvailable),
           status: totalAvailable >= totalInvoiceBalance ? 'PAID' : 
@@ -2113,9 +2154,9 @@ export const createPaymentReport = async (req, res) => {
             const futureReport = await tx.paymentReport.create({
               data: {
                 tenantId,
-                rent: expected.rent,
-                serviceCharge: expected.serviceCharge,
-                vat: expected.vat,
+                rent: expected.rent.amount || expected.rent || 0,
+                serviceCharge: expected.serviceCharge.amount || expected.serviceCharge || 0,
+                vat: expected.vat.total || expected.vat || 0,
                 totalDue: expected.totalDue,
                 amountPaid: 0,
                 arrears: 0,
@@ -2220,12 +2261,9 @@ export const createPaymentReport = async (req, res) => {
           tenant.unit?.property?.commissionFee > 0 && 
           commissionBaseAmount > 0) {
         
-        // Get the property's manager (could be ADMIN or MANAGER)
         const propertyManagerId = tenant.unit?.property?.managerId;
         
-        // Only create commission if the property has a manager assigned
         if (propertyManagerId) {
-          // Verify the manager exists and has appropriate role
           const manager = await tx.user.findUnique({
             where: { id: propertyManagerId },
             select: { id: true, role: true, name: true, email: true }
@@ -2233,12 +2271,9 @@ export const createPaymentReport = async (req, res) => {
           
           if (!manager) {
             console.log(`Warning: Property ${tenant.unit.propertyId} has managerId ${propertyManagerId} but user not found`);
-            // Don't create commission if manager doesn't exist
           } else if (!['ADMIN', 'MANAGER'].includes(manager.role)) {
             console.log(`Warning: User ${manager.name} (${manager.id}) is not ADMIN or MANAGER, cannot receive commission`);
-            // Don't create commission for non-ADMIN/non-MANAGER users
           } else {
-            // Calculate commission
             let vatExclusiveCommissionBase = commissionBaseAmount;
             const tenantVatType = tenant.vatType || 'NOT_APPLICABLE';
             const tenantVatRate = tenant.vatRate || 0;
