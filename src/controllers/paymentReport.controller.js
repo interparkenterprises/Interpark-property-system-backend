@@ -54,16 +54,10 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     }
   }
 
-  // =============================================
   // Get base rent (excluding VAT) for service charge calculation
-  // For EXCLUSIVE VAT: base rent = expectedRent (already exclusive)
-  // For INCLUSIVE VAT: base rent = expectedRent / (1 + VAT rate)
-  // =============================================
   const baseRent = getBaseRent(expectedRent, tenant.vatType, tenant.vatRate);
 
-  // =============================================
   // Compute service charge based on BASE RENT
-  // =============================================
   let serviceCharge = 0;
   const sc = tenant.serviceCharge;
   if (sc) {
@@ -87,40 +81,40 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
   // Calculate VAT on Rent
   // =============================================
   let vatOnRent = 0;
-  const vatRate = tenant.vatRate || 16;
+  const rentVatType = tenant.vatType || 'NOT_APPLICABLE';
+  const rentVatRate = tenant.vatRate || 0;
 
-  if (tenant.vatType === 'EXCLUSIVE') {
-    vatOnRent = expectedRent * vatRate / 100;
-  } else if (tenant.vatType === 'INCLUSIVE') {
-    vatOnRent = (expectedRent * vatRate) / (100 + vatRate);
+  if (rentVatType === 'EXCLUSIVE') {
+    vatOnRent = expectedRent * rentVatRate / 100;
+  } else if (rentVatType === 'INCLUSIVE') {
+    vatOnRent = (expectedRent * rentVatRate) / (100 + rentVatRate);
   }
 
   // =============================================
-  // Calculate Service Charge VAT based on its own settings
+  // Calculate VAT on Service Charge (using its own settings)
   // =============================================
-  let serviceChargeVat = 0;
-  let serviceChargeInclusive = serviceCharge; // The amount the tenant pays (may include VAT)
+  let vatOnServiceCharge = 0;
+  const scVatType = sc?.vatType || 'NOT_APPLICABLE';
+  const scVatRate = sc?.vatRate || 0;
 
-  if (sc) {
-    const scVatType = sc.vatType || 'NOT_APPLICABLE';
-    const scVatRate = sc.vatRate || 0;
+  if (scVatType === 'EXCLUSIVE') {
+    vatOnServiceCharge = (serviceCharge * scVatRate) / 100;
+  } else if (scVatType === 'INCLUSIVE') {
+    vatOnServiceCharge = (serviceCharge * scVatRate) / (100 + scVatRate);
+  }
 
-    if (scVatType === 'EXCLUSIVE') {
-      // Service charge is exclusive of VAT, add VAT on top
-      serviceChargeVat = (serviceCharge * scVatRate) / 100;
-      // The total service charge the tenant pays is serviceCharge + VAT
-      serviceChargeInclusive = serviceCharge + serviceChargeVat;
-    } else if (scVatType === 'INCLUSIVE') {
-      // Service charge already includes VAT
-      // The serviceCharge amount already includes VAT, so we extract the VAT portion
-      serviceChargeVat = (serviceCharge * scVatRate) / (100 + scVatRate);
-      // The total service charge the tenant pays is the serviceCharge (already inclusive)
-      serviceChargeInclusive = serviceCharge;
-    } else {
-      // NOT_APPLICABLE - no VAT on service charge
-      serviceChargeVat = 0;
-      serviceChargeInclusive = serviceCharge;
-    }
+  // =============================================
+  // Calculate Service Charge Inclusive/Exclusive
+  // =============================================
+  let serviceChargeInclusive = serviceCharge;
+  let serviceChargeExclusive = serviceCharge;
+
+  if (scVatType === 'EXCLUSIVE') {
+    serviceChargeInclusive = serviceCharge + vatOnServiceCharge;
+    serviceChargeExclusive = serviceCharge;
+  } else if (scVatType === 'INCLUSIVE') {
+    serviceChargeInclusive = serviceCharge;
+    serviceChargeExclusive = serviceCharge - vatOnServiceCharge;
   }
 
   // =============================================
@@ -128,10 +122,10 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
   // =============================================
   let totalDue;
 
-  if (tenant.vatType === 'EXCLUSIVE') {
+  if (rentVatType === 'EXCLUSIVE') {
     // Rent (exclusive) + VAT on Rent + Service Charge (inclusive of its VAT)
     totalDue = expectedRent + vatOnRent + serviceChargeInclusive;
-  } else if (tenant.vatType === 'INCLUSIVE') {
+  } else if (rentVatType === 'INCLUSIVE') {
     // Rent (inclusive) + Service Charge (inclusive of its VAT)
     totalDue = expectedRent + serviceChargeInclusive;
   } else {
@@ -139,18 +133,41 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
     totalDue = expectedRent + serviceCharge;
   }
 
-  // Total VAT (for reporting)
-  const totalVat = vatOnRent + serviceChargeVat;
+  // Total VAT
+  const totalVat = vatOnRent + vatOnServiceCharge;
 
   return {
-    rent: parseFloat(expectedRent.toFixed(2)),
-    serviceCharge: parseFloat(serviceCharge.toFixed(2)), // Base service charge (before VAT)
-    serviceChargeInclusive: parseFloat(serviceChargeInclusive.toFixed(2)), // Service charge with VAT included
-    serviceChargeVat: parseFloat(serviceChargeVat.toFixed(2)), // VAT on service charge
-    vatOnRent: parseFloat(vatOnRent.toFixed(2)),
-    vat: parseFloat(totalVat.toFixed(2)),
-    vatType: tenant.vatType,
-    vatRate: tenant.vatRate || 0,
+    // Rent details
+    rent: {
+      amount: parseFloat(expectedRent.toFixed(2)),
+      vatType: rentVatType,
+      vatRate: rentVatRate,
+      vatAmount: parseFloat(vatOnRent.toFixed(2)),
+      totalWithVat: parseFloat((expectedRent + vatOnRent).toFixed(2))
+    },
+    // Service Charge details with clear VAT distinction
+    serviceCharge: {
+      amount: parseFloat(serviceCharge.toFixed(2)), // Base amount (before VAT)
+      exclusiveAmount: parseFloat(serviceChargeExclusive.toFixed(2)), // Exclusive of VAT
+      inclusiveAmount: parseFloat(serviceChargeInclusive.toFixed(2)), // Inclusive of VAT
+      vatType: scVatType,
+      vatRate: scVatRate,
+      vatAmount: parseFloat(vatOnServiceCharge.toFixed(2)),
+      hasVat: scVatType !== 'NOT_APPLICABLE' && scVatRate > 0,
+      type: sc?.type || null,
+      percentage: sc?.percentage || null,
+      fixedAmount: sc?.fixedAmount || null,
+      perSqFtRate: sc?.perSqFtRate || null
+    },
+    // VAT breakdown - clear distinction between rent and service charge
+    vat: {
+      total: parseFloat(totalVat.toFixed(2)),
+      rent: parseFloat(vatOnRent.toFixed(2)),
+      serviceCharge: parseFloat(vatOnServiceCharge.toFixed(2)),
+      // Show which components have VAT
+      hasRentVat: rentVatType !== 'NOT_APPLICABLE' && rentVatRate > 0,
+      hasServiceChargeVat: scVatType !== 'NOT_APPLICABLE' && scVatRate > 0
+    },
     totalDue: parseFloat(totalDue.toFixed(2)),
     periodStart: periodStartOfMonth,
     periodEnd: periodEndOfMonth
@@ -178,42 +195,127 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
   const normalizedStart = new Date(start.getFullYear(), start.getMonth(), 1);
   const periodMonths = getPolicyMonths(paymentPolicy);
 
-  let rent = 0;
-  let serviceCharge = 0;
-  let vat = 0;
+  let rentAmount = 0;
+  let rentVat = 0;
+  let serviceChargeAmount = 0;
+  let serviceChargeExclusive = 0;
+  let serviceChargeInclusive = 0;
+  let serviceChargeVat = 0;
+  let totalVat = 0;
   let totalDue = 0;
   const monthlyBreakdown = [];
+
+  let rentVatType = 'NOT_APPLICABLE';
+  let rentVatRate = 0;
+  let scVatType = 'NOT_APPLICABLE';
+  let scVatRate = 0;
+  let scType = null;
+  let scPercentage = null;
 
   for (let i = 0; i < periodMonths; i++) {
     const monthDate = new Date(normalizedStart.getFullYear(), normalizedStart.getMonth() + i, 1);
     const monthly = await computeExpectedCharges(tenantId, monthDate);
 
-    rent += monthly.rent;
-    serviceCharge += monthly.serviceCharge;
-    vat += monthly.vat;
+    rentAmount += monthly.rent.amount;
+    rentVat += monthly.rent.vatAmount;
+    serviceChargeAmount += monthly.serviceCharge.amount;
+    serviceChargeExclusive += monthly.serviceCharge.exclusiveAmount;
+    serviceChargeInclusive += monthly.serviceCharge.inclusiveAmount;
+    serviceChargeVat += monthly.serviceCharge.vatAmount;
+    totalVat += monthly.vat.total;
     totalDue += monthly.totalDue;
+
+    // Capture metadata from first month
+    if (i === 0) {
+      rentVatType = monthly.rent.vatType;
+      rentVatRate = monthly.rent.vatRate;
+      scVatType = monthly.serviceCharge.vatType;
+      scVatRate = monthly.serviceCharge.vatRate;
+      scType = monthly.serviceCharge.type;
+      scPercentage = monthly.serviceCharge.percentage;
+    }
 
     monthlyBreakdown.push({
       month: formatMonthYear(monthDate),
-      rent: monthly.rent,
-      serviceCharge: monthly.serviceCharge,
-      vat: monthly.vat,
+      rent: {
+        amount: monthly.rent.amount,
+        vatAmount: monthly.rent.vatAmount,
+        totalWithVat: monthly.rent.totalWithVat
+      },
+      serviceCharge: {
+        amount: monthly.serviceCharge.amount,
+        exclusiveAmount: monthly.serviceCharge.exclusiveAmount,
+        inclusiveAmount: monthly.serviceCharge.inclusiveAmount,
+        vatAmount: monthly.serviceCharge.vatAmount,
+        vatType: monthly.serviceCharge.vatType,
+        hasVat: monthly.serviceCharge.hasVat
+      },
+      vat: {
+        total: monthly.vat.total,
+        rent: monthly.vat.rent,
+        serviceCharge: monthly.vat.serviceCharge,
+        hasRentVat: monthly.vat.hasRentVat,
+        hasServiceChargeVat: monthly.vat.hasServiceChargeVat
+      },
       totalDue: monthly.totalDue
     });
   }
 
   const periodEnd = new Date(normalizedStart.getFullYear(), normalizedStart.getMonth() + periodMonths, 0);
+  const periodMonthsNum = periodMonths;
 
   return {
     paymentPolicy,
-    periodMonths,
+    periodMonths: periodMonthsNum,
     periodStart: normalizedStart,
     periodEnd,
     paymentPeriodLabel: formatPaymentPeriodLabel(normalizedStart, periodEnd, paymentPolicy),
-    monthlyEquivalent: parseFloat((totalDue / periodMonths).toFixed(2)),
-    rent: parseFloat(rent.toFixed(2)),
-    serviceCharge: parseFloat(serviceCharge.toFixed(2)),
-    vat: parseFloat(vat.toFixed(2)),
+    monthlyEquivalent: parseFloat((totalDue / periodMonthsNum).toFixed(2)),
+    // Rent summary
+    rent: {
+      amount: parseFloat(rentAmount.toFixed(2)),
+      monthly: parseFloat((rentAmount / periodMonthsNum).toFixed(2)),
+      vatType: rentVatType,
+      vatRate: rentVatRate,
+      vatAmount: parseFloat(rentVat.toFixed(2)),
+      monthlyVat: parseFloat((rentVat / periodMonthsNum).toFixed(2)),
+      totalWithVat: parseFloat((rentAmount + rentVat).toFixed(2))
+    },
+    // Service Charge summary with clear VAT distinction
+    serviceCharge: {
+      amount: parseFloat(serviceChargeAmount.toFixed(2)), // Base amount
+      monthly: parseFloat((serviceChargeAmount / periodMonthsNum).toFixed(2)),
+      exclusiveAmount: parseFloat(serviceChargeExclusive.toFixed(2)), // Exclusive of VAT
+      monthlyExclusive: parseFloat((serviceChargeExclusive / periodMonthsNum).toFixed(2)),
+      inclusiveAmount: parseFloat(serviceChargeInclusive.toFixed(2)), // Inclusive of VAT
+      monthlyInclusive: parseFloat((serviceChargeInclusive / periodMonthsNum).toFixed(2)),
+      vatType: scVatType,
+      vatRate: scVatRate,
+      vatAmount: parseFloat(serviceChargeVat.toFixed(2)),
+      monthlyVat: parseFloat((serviceChargeVat / periodMonthsNum).toFixed(2)),
+      hasVat: scVatType !== 'NOT_APPLICABLE' && scVatRate > 0,
+      type: scType,
+      percentage: scPercentage
+    },
+    // VAT breakdown - clear distinction between rent and service charge
+    vat: {
+      total: parseFloat(totalVat.toFixed(2)),
+      monthlyTotal: parseFloat((totalVat / periodMonthsNum).toFixed(2)),
+      rent: {
+        amount: parseFloat(rentVat.toFixed(2)),
+        monthly: parseFloat((rentVat / periodMonthsNum).toFixed(2)),
+        type: rentVatType,
+        rate: rentVatRate,
+        hasVat: rentVatType !== 'NOT_APPLICABLE' && rentVatRate > 0
+      },
+      serviceCharge: {
+        amount: parseFloat(serviceChargeVat.toFixed(2)),
+        monthly: parseFloat((serviceChargeVat / periodMonthsNum).toFixed(2)),
+        type: scVatType,
+        rate: scVatRate,
+        hasVat: scVatType !== 'NOT_APPLICABLE' && scVatRate > 0
+      }
+    },
     totalDue: parseFloat(totalDue.toFixed(2)),
     monthlyBreakdown
   };
