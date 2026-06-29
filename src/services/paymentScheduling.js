@@ -64,6 +64,8 @@ const setToStartOfDay = (date) => {
 /**
  * Calculate the next payment due date based on payment history and policy
  * Due date is always at the end of the day (11:59:59 PM)
+ * IMPORTANT: Due dates are always calculated from the rent start date,
+ * not from the last payment date, to ensure consistent billing periods.
  * @param {Object} tenant - Tenant object
  * @param {Array} paymentReports - Array of payment reports (optional)
  * @returns {Object} - Next payment due date and related info
@@ -73,6 +75,7 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const today = new Date();
   const currentDateEndOfDay = setToEndOfDay(today);
   const rentStartDate = setToStartOfDay(new Date(rentStart));
+  const policyMonths = getPolicyMonths(paymentPolicy);
   
   // If rent hasn't started yet, next due date is rent start date
   if (rentStartDate > currentDateEndOfDay) {
@@ -90,7 +93,6 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   // Sort payments by date (oldest to newest)
   const sortedPayments = [...paymentReports].sort((a, b) => new Date(a.datePaid) - new Date(b.datePaid));
   
-  let nextDueDate = null;
   let lastPaymentDate = null;
   let paymentsMade = 0;
   
@@ -100,9 +102,6 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     paymentsMade = sortedPayments.length;
   }
   
-  // Get policy months
-  const policyMonths = getPolicyMonths(paymentPolicy);
-  
   // Calculate expected number of payments by now
   const startDate = setToStartOfDay(new Date(rentStart));
   const monthsSinceStart = calculateMonthsDifference(startDate, today);
@@ -111,22 +110,20 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   // Determine if payments are up to date
   const paymentsBehind = Math.max(0, expectedPayments - paymentsMade);
   
-  if (paymentsBehind > 0) {
-    // Tenant is behind, next due date is based on last payment
-    if (lastPaymentDate) {
-      nextDueDate = addBillingPeriod(lastPaymentDate, paymentPolicy);
-    } else {
-      // No payments made yet, use rent start date (set to end of day)
-      nextDueDate = setToEndOfDay(new Date(rentStart));
-    }
-  } else {
-    // Up to date, next due date is from the last payment or start date
-    if (lastPaymentDate) {
-      nextDueDate = addBillingPeriod(lastPaymentDate, paymentPolicy);
-    } else {
-      nextDueDate = setToEndOfDay(new Date(rentStart));
-    }
+  // CRITICAL FIX: Calculate the next due date based on rent start date + (payments made + 1) periods
+  // This ensures due dates are always aligned with the rent start date
+  // Example: Rent starts 06/01/2026 -> First due date 07/01/2026, Second due date 08/01/2026, etc.
+  const nextPaymentNumber = paymentsMade + 1;
+  let calculatedNextDueDate = new Date(rentStartDate);
+  
+  // Add the appropriate number of billing periods from the rent start date
+  // This ensures the due date is always the expected billing period start
+  for (let i = 0; i < nextPaymentNumber; i++) {
+    calculatedNextDueDate = addBillingPeriod(calculatedNextDueDate, paymentPolicy);
   }
+  
+  // Set to end of day
+  const nextDueDate = setToEndOfDay(calculatedNextDueDate);
   
   // Check if overdue (compare dates only, not time)
   const isOverdue = calculateIfOverdue(nextDueDate, currentDateEndOfDay);
@@ -405,7 +402,7 @@ export const getPaymentSummary = (tenant) => {
   const nextPaymentDate = nextPaymentInfo.nextDueDate;
   const nextPaymentPeriod = nextPaymentDate ? getCurrentBillingPeriod(nextPaymentDate, tenant) : null;
   
-  // Calculate grace period info
+  // Calculate grace period info (set to 0 days as requested - no grace period)
   const gracePeriodDays = 0;
   const gracePeriodEnd = nextPaymentDate ? new Date(nextPaymentDate) : null;
   if (gracePeriodEnd && gracePeriodDays > 0) {
