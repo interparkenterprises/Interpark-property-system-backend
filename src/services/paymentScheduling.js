@@ -1,4 +1,4 @@
-import { calculateEscalatedRent, calculatePaymentByPolicy } from './rentCalculation.js';
+import { calculateEscalatedRent, calculatePaymentByPolicy, calculateServiceCharge, calculateVAT } from './rentCalculation.js';
 
 /**
  * Get policy months based on payment policy
@@ -62,13 +62,19 @@ const setToStartOfDay = (date) => {
 };
 
 /**
+ * Get the month start date (first day of the month) for a given date
+ * This is used to normalize payment periods for comparison
+ */
+const getMonthStart = (date) => {
+  const d = new Date(date);
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+/**
  * Calculate the next payment due date based on payment history and policy
  * Due date is always at the end of the day (11:59:59 PM)
- * IMPORTANT: Due dates are always calculated from the rent start date,
- * not from the last payment date, to ensure consistent billing periods.
- * @param {Object} tenant - Tenant object
- * @param {Array} paymentReports - Array of payment reports (optional)
- * @returns {Object} - Next payment due date and related info
  */
 export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const { paymentPolicy, rentStart } = tenant;
@@ -86,7 +92,12 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       paymentsMade: paymentReports.length,
       expectedPayments: 0,
       lastPaymentDate: paymentReports.length > 0 ? new Date(paymentReports[paymentReports.length - 1].datePaid) : null,
-      timeRemaining: calculateTimeRemaining(setToEndOfDay(rentStartDate), currentDateEndOfDay)
+      timeRemaining: calculateTimeRemaining(setToEndOfDay(rentStartDate), currentDateEndOfDay),
+      totalDuePerPeriod: 0,
+      totalPaidAllPeriods: 0,
+      fullyPaidPeriods: 0,
+      remainingBalanceForNextPeriod: 0,
+      carryOverAmount: 0
     };
   }
   
@@ -96,10 +107,11 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   let lastPaymentDate = null;
   let paymentsMade = 0;
   
-  // Get the most recent payment
-  if (sortedPayments.length > 0) {
-    lastPaymentDate = new Date(sortedPayments[sortedPayments.length - 1].datePaid);
-    paymentsMade = sortedPayments.length;
+  // Get the most recent payment (excluding CREDIT records)
+  const nonCreditPayments = sortedPayments.filter(p => p.status !== 'CREDIT');
+  if (nonCreditPayments.length > 0) {
+    lastPaymentDate = new Date(nonCreditPayments[nonCreditPayments.length - 1].datePaid);
+    paymentsMade = nonCreditPayments.length;
   }
   
   // Calculate expected number of payments by now
@@ -107,38 +119,203 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const monthsSinceStart = calculateMonthsDifference(startDate, today);
   const expectedPayments = Math.max(0, Math.floor(monthsSinceStart / policyMonths));
   
-  // Determine if payments are up to date
-  const paymentsBehind = Math.max(0, expectedPayments - paymentsMade);
+  // CRITICAL FIX: Use payment report's totalDue as the source of truth
+  // Group payments by month and find the totalDue from the payment report
+  const periodPayments = {};
+  const periodTotalDue = {};
+  let totalPaidAllPeriods = 0;
   
-  // CRITICAL FIX: Calculate the next due date based on rent start date + (payments made + 1) periods
-  // This ensures due dates are always aligned with the rent start date
-  // Example: Rent starts 06/01/2026 -> First due date 07/01/2026, Second due date 08/01/2026, etc.
-  const nextPaymentNumber = paymentsMade + 1;
-  let calculatedNextDueDate = new Date(rentStartDate);
+  // Only include non-CREDIT payments for period grouping
+  const paymentPeriods = nonCreditPayments.filter(p => p.paymentPeriod);
   
-  // Add the appropriate number of billing periods from the rent start date
-  // This ensures the due date is always the expected billing period start
-  for (let i = 0; i < nextPaymentNumber; i++) {
-    calculatedNextDueDate = addBillingPeriod(calculatedNextDueDate, paymentPolicy);
+  paymentPeriods.forEach(payment => {
+    const paymentDate = new Date(payment.paymentPeriod);
+    const monthStart = getMonthStart(paymentDate);
+    const periodKey = monthStart.toISOString();
+    
+    if (!periodPayments[periodKey]) {
+      periodPayments[periodKey] = 0;
+    }
+    periodPayments[periodKey] += payment.amountPaid || 0;
+    totalPaidAllPeriods += payment.amountPaid || 0;
+    
+    // Store the totalDue from the payment report (this is the source of truth)
+    if (payment.totalDue && !periodTotalDue[periodKey]) {
+      periodTotalDue[periodKey] = parseFloat(payment.totalDue.toFixed(2));
+    }
+  });
+  
+  // Handle payments without a payment period (legacy data)
+  const paymentsWithoutPeriod = nonCreditPayments.filter(p => !p.paymentPeriod);
+  let legacyTotalPaid = 0;
+  paymentsWithoutPeriod.forEach(p => {
+    legacyTotalPaid += p.amountPaid || 0;
+  });
+  
+  // If there are legacy payments, add them to the first period
+  if (legacyTotalPaid > 0) {
+    const firstPeriodKey = getMonthStart(rentStartDate).toISOString();
+    if (!periodPayments[firstPeriodKey]) {
+      periodPayments[firstPeriodKey] = 0;
+    }
+    periodPayments[firstPeriodKey] += legacyTotalPaid;
+    totalPaidAllPeriods += legacyTotalPaid;
   }
   
-  // Set to end of day
-  const nextDueDate = setToEndOfDay(calculatedNextDueDate);
+  // Calculate total due per period - use the value from payment report if available
+  // Otherwise calculate it
+  let totalDuePerPeriod = 0;
   
-  // Check if overdue (compare dates only, not time)
-  const isOverdue = calculateIfOverdue(nextDueDate, currentDateEndOfDay);
+  // Try to get totalDue from payment reports first (source of truth)
+  const periodKeys = Object.keys(periodTotalDue);
+  if (periodKeys.length > 0) {
+    // Use the first period's totalDue as the base
+    totalDuePerPeriod = periodTotalDue[periodKeys[0]];
+  }
   
-  // Calculate time remaining
+  // If no totalDue found in payment reports, calculate it
+  if (totalDuePerPeriod === 0) {
+    const monthlyRent = calculateEscalatedRent(tenant).currentRent;
+    const rentPaymentByPolicy = calculatePaymentByPolicy(monthlyRent, paymentPolicy);
+    const vatOnRent = calculateVAT(rentPaymentByPolicy, tenant.vatType, tenant.vatRate);
+    const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
+    const serviceChargeTotalByPolicy = serviceChargeDetails.totalWithVat * getPolicyMonths(paymentPolicy);
+    totalDuePerPeriod = rentPaymentByPolicy + vatOnRent + serviceChargeTotalByPolicy;
+  }
+  
+  // Round to 2 decimal places to avoid floating point issues
+  totalDuePerPeriod = parseFloat(totalDuePerPeriod.toFixed(2));
+  
+  // Calculate how many periods have elapsed since rent start
+  const periodsSinceStart = Math.max(0, Math.floor(monthsSinceStart / policyMonths));
+  
+  // Build periods using month start dates for consistency
+  const totalPeriodsToCheck = Math.max(periodsSinceStart + 24, 36);
+  
+  const allPeriods = [];
+  
+  for (let i = 0; i < totalPeriodsToCheck; i++) {
+    const periodDate = new Date(rentStartDate);
+    periodDate.setMonth(periodDate.getMonth() + (i * policyMonths));
+    const periodMonthStart = getMonthStart(periodDate);
+    const periodKey = periodMonthStart.toISOString();
+    
+    const periodEnd = new Date(periodMonthStart);
+    periodEnd.setMonth(periodEnd.getMonth() + policyMonths);
+    periodEnd.setDate(periodEnd.getDate() - 1);
+    periodEnd.setHours(23, 59, 59, 999);
+    
+    allPeriods.push({
+      index: i,
+      startDate: new Date(periodMonthStart),
+      endDate: periodEnd,
+      key: periodKey,
+      amountPaid: periodPayments[periodKey] || 0,
+      isFullyPaid: false,
+      remainingBalance: totalDuePerPeriod
+    });
+  }
+  
+  // Process periods sequentially, carrying over overpayments
+  let carryOverAmount = 0;
+  let fullyPaidPeriods = 0;
+  let firstUnpaidPeriodIndex = -1;
+  
+  for (let i = 0; i < allPeriods.length; i++) {
+    const period = allPeriods[i];
+    
+    const totalAvailable = period.amountPaid + carryOverAmount;
+    
+    if (totalAvailable >= totalDuePerPeriod) {
+      period.isFullyPaid = true;
+      period.remainingBalance = 0;
+      carryOverAmount = totalAvailable - totalDuePerPeriod;
+      fullyPaidPeriods++;
+    } else {
+      period.isFullyPaid = false;
+      period.remainingBalance = totalDuePerPeriod - totalAvailable;
+      carryOverAmount = 0;
+      
+      if (firstUnpaidPeriodIndex === -1) {
+        firstUnpaidPeriodIndex = i;
+      }
+    }
+  }
+  
+  // Calculate payments behind
+  let paymentsBehind = 0;
+  const periodsToCheck = Math.min(periodsSinceStart, allPeriods.length);
+  for (let i = 0; i < periodsToCheck; i++) {
+    if (!allPeriods[i].isFullyPaid) {
+      paymentsBehind++;
+    }
+  }
+  
+  // Determine the next due date
+  let nextDueDate;
+  let isOverdue = false;
+  let nextPeriodIndex = 0;
+  
+  // Find the first period that is not fully paid
+  for (let i = 0; i < allPeriods.length; i++) {
+    if (!allPeriods[i].isFullyPaid) {
+      nextPeriodIndex = i;
+      break;
+    }
+    if (i === allPeriods.length - 1) {
+      nextPeriodIndex = allPeriods.length;
+    }
+  }
+  
+  if (nextPeriodIndex >= allPeriods.length) {
+    const nextDate = new Date(rentStartDate);
+    nextDate.setMonth(nextDate.getMonth() + (fullyPaidPeriods * policyMonths));
+    nextDueDate = setToEndOfDay(nextDate);
+  } else {
+    const nextDate = new Date(rentStartDate);
+    nextDate.setMonth(nextDate.getMonth() + (nextPeriodIndex * policyMonths));
+    nextDueDate = setToEndOfDay(nextDate);
+  }
+  
+  isOverdue = calculateIfOverdue(nextDueDate, currentDateEndOfDay);
   const timeRemaining = calculateTimeRemaining(nextDueDate, currentDateEndOfDay);
+  
+  let remainingBalanceForNextPeriod = 0;
+  if (nextPeriodIndex < allPeriods.length) {
+    remainingBalanceForNextPeriod = allPeriods[nextPeriodIndex].remainingBalance;
+  } else {
+    remainingBalanceForNextPeriod = 0;
+  }
   
   return {
     nextDueDate,
     isOverdue,
     paymentsBehind,
-    paymentsMade,
-    expectedPayments,
+    paymentsMade: nonCreditPayments.length,
+    expectedPayments: periodsSinceStart,
     lastPaymentDate,
-    timeRemaining
+    timeRemaining,
+    totalDuePerPeriod,
+    totalPaidAllPeriods,
+    fullyPaidPeriods,
+    remainingBalanceForNextPeriod,
+    carryOverAmount,
+    _debug: {
+      periodPayments,
+      periodTotalDue,
+      allPeriods: allPeriods.slice(0, 12).map(p => ({
+        index: p.index,
+        key: p.key,
+        amountPaid: p.amountPaid,
+        isFullyPaid: p.isFullyPaid,
+        remainingBalance: p.remainingBalance
+      })),
+      carryOverAmount,
+      fullyPaidPeriods,
+      nextPeriodIndex,
+      totalDuePerPeriod,
+      periodsSinceStart
+    }
   };
 };
 
@@ -331,18 +508,22 @@ export const getPaymentSummary = (tenant) => {
   const paymentReports = tenant.paymentReports || [];
   const monthlyRent = calculateEscalatedRent(tenant).currentRent;
   const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
+  
+  // Get the next payment info which includes totalDuePerPeriod
   const nextPaymentInfo = calculateNextPaymentDue(tenant, paymentReports);
   const currentPeriod = getCurrentBillingPeriod(new Date(), tenant);
   
-  // Calculate total paid and outstanding
-  const totalPaid = paymentReports.reduce((sum, payment) => sum + payment.amount, 0);
+  // Calculate total paid (excluding CREDIT records)
+  const nonCreditPayments = paymentReports.filter(p => p.status !== 'CREDIT');
+  const totalPaid = nonCreditPayments.reduce((sum, payment) => sum + payment.amountPaid, 0);
   const policyMonths = getPolicyMonths(tenant.paymentPolicy);
   
-  // FIX: Calculate expected payments including current period if rent has started
+  // CRITICAL FIX: Use the FULL total due per period from nextPaymentInfo
+  const totalDuePerPeriod = nextPaymentInfo.totalDuePerPeriod || paymentAmount;
+  
+  // Calculate expected total based on number of periods that should have been paid
   const rentStartDate = new Date(tenant.rentStart);
   const today = new Date();
-  
-  // Set both dates to start of day for accurate comparison
   const rentStartStart = setToStartOfDay(rentStartDate);
   const todayStart = setToStartOfDay(today);
   
@@ -350,59 +531,63 @@ export const getPaymentSummary = (tenant) => {
   let expectedTotal = 0;
   
   if (rentStartStart <= todayStart) {
-    // Rent has started (including today)
-    // Calculate full months difference
     let monthsDiff = 0;
     const years = todayStart.getFullYear() - rentStartStart.getFullYear();
     const months = todayStart.getMonth() - rentStartStart.getMonth();
     monthsDiff = (years * 12) + months;
     
-    // If rent started today or in the past but monthsDiff is 0, 
-    // we should still count the current period
     if (monthsDiff === 0) {
-      // First billing period, rent has started
       expectedPaymentsCount = 1;
     } else {
-      // Calculate number of complete billing periods
       const completedPeriods = Math.floor(monthsDiff / policyMonths);
-      // Check if there's a current partial period
       const hasCurrentPeriod = (monthsDiff % policyMonths) >= 0;
       expectedPaymentsCount = completedPeriods + (hasCurrentPeriod ? 1 : 0);
     }
     
-    expectedTotal = expectedPaymentsCount * paymentAmount;
+    expectedTotal = expectedPaymentsCount * totalDuePerPeriod;
   } else {
-    // Rent hasn't started yet, no payments expected
     expectedPaymentsCount = 0;
     expectedTotal = 0;
   }
   
-  const outstandingBalance = expectedTotal - totalPaid;
+  // Round expectedTotal to avoid floating point issues
+  expectedTotal = parseFloat(expectedTotal.toFixed(2));
+  const totalPaidRounded = parseFloat(totalPaid.toFixed(2));
   
-  // Determine status with proper logic
+  // Calculate outstanding balance
+  let outstandingBalance = expectedTotal - totalPaidRounded;
+  
+  // Round to 2 decimal places
+  outstandingBalance = parseFloat(outstandingBalance.toFixed(2));
+  
+  // Determine status with proper logic using FULL amounts
   let status = 'UP_TO_DATE';
   if (rentStartStart > todayStart) {
-    // Rent hasn't started yet
     status = 'NOT_STARTED';
-  } else if (totalPaid === 0 && expectedTotal === 0) {
+  } else if (totalPaidRounded === 0 && expectedTotal === 0) {
     status = 'NO_PAYMENTS_DUE';
-  } else if (totalPaid === 0 && expectedTotal > 0) {
+  } else if (totalPaidRounded === 0 && expectedTotal > 0) {
     status = 'UNPAID';
   } else if (outstandingBalance > 0) {
     status = 'PARTIALLY_PAID';
   } else if (outstandingBalance < 0) {
     status = 'OVERPAID';
-  } else if (nextPaymentInfo.isOverdue) {
-    status = 'OVERDUE';
   } else {
-    status = 'UP_TO_DATE';
+    // All payments are up to date - check if there's a PAID status payment report
+    const hasPaidReport = nonCreditPayments.some(p => p.status === 'PAID');
+    if (hasPaidReport && nextPaymentInfo.fullyPaidPeriods >= 1) {
+      status = 'PAID';
+    } else if (nextPaymentInfo.isOverdue) {
+      status = 'OVERDUE';
+    } else {
+      status = 'UP_TO_DATE';
+    }
   }
   
   // Get next payment period
   const nextPaymentDate = nextPaymentInfo.nextDueDate;
   const nextPaymentPeriod = nextPaymentDate ? getCurrentBillingPeriod(nextPaymentDate, tenant) : null;
   
-  // Calculate grace period info (set to 0 days as requested - no grace period)
   const gracePeriodDays = 0;
   const gracePeriodEnd = nextPaymentDate ? new Date(nextPaymentDate) : null;
   if (gracePeriodEnd && gracePeriodDays > 0) {
@@ -415,16 +600,20 @@ export const getPaymentSummary = (tenant) => {
     policyMonths,
     monthlyRent,
     paymentAmountPerPeriod: paymentAmount,
+    totalDuePerPeriod: totalDuePerPeriod,
     nextPayment: {
       dueDate: nextPaymentDate,
       dueDateFormatted: nextPaymentDate ? nextPaymentDate.toLocaleDateString() : null,
       dueDateTime: nextPaymentDate ? nextPaymentDate.toLocaleString() : null,
-      amount: paymentAmount,
+      amount: totalDuePerPeriod,
       isOverdue: nextPaymentInfo.isOverdue,
       timeRemaining: nextPaymentInfo.timeRemaining,
       paymentsBehind: nextPaymentInfo.paymentsBehind,
       gracePeriodEnd: gracePeriodEnd,
-      gracePeriodEndFormatted: gracePeriodEnd ? gracePeriodEnd.toLocaleDateString() : null
+      gracePeriodEndFormatted: gracePeriodEnd ? gracePeriodEnd.toLocaleDateString() : null,
+      fullyPaidPeriods: nextPaymentInfo.fullyPaidPeriods,
+      remainingBalanceForNextPeriod: nextPaymentInfo.remainingBalanceForNextPeriod,
+      carryOverAmount: nextPaymentInfo.carryOverAmount
     },
     currentPeriod: {
       ...currentPeriod,
@@ -432,10 +621,10 @@ export const getPaymentSummary = (tenant) => {
       periodEndFormatted: currentPeriod.periodEnd.toLocaleDateString()
     },
     paymentHistory: {
-      totalPaid,
+      totalPaid: totalPaidRounded,
       expectedTotal: Math.max(0, expectedTotal),
       outstandingBalance: rentStartStart > todayStart ? 0 : outstandingBalance,
-      paymentsMade: paymentReports.length,
+      paymentsMade: nonCreditPayments.length,
       expectedPaymentsCount: Math.max(0, expectedPaymentsCount),
       lastPaymentDate: nextPaymentInfo.lastPaymentDate,
       lastPaymentDateFormatted: nextPaymentInfo.lastPaymentDate ? 
