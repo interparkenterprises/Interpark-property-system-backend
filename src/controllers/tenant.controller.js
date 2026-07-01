@@ -778,6 +778,12 @@ export const getNextPaymentsByProperty = async (req, res) => {
     // Calculate next payment for each tenant
     const tenantsWithNextPayment = [];
     const now = new Date();
+    
+    // Create a Nairobi timezone date for accurate day calculations
+    const nairobiNow = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+    // Reset to start of day for accurate day difference calculation
+    const nairobiTodayStart = new Date(nairobiNow);
+    nairobiTodayStart.setHours(0, 0, 0, 0);
 
     for (const tenant of tenants) {
       // Calculate rent info with escalation
@@ -793,10 +799,49 @@ export const getNextPaymentsByProperty = async (req, res) => {
       const isOverdue = paymentSummary.nextPayment?.isOverdue || false;
       
       if (nextDueDate) {
+        // Create a Nairobi timezone date for the due date
         const dueDateObj = new Date(nextDueDate);
+        const dueDateInNairobi = new Date(dueDateObj.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+        const dueDateStart = new Date(dueDateInNairobi);
+        dueDateStart.setHours(0, 0, 0, 0);
         
-        // Calculate days until due (negative if overdue)
-        const daysUntilDue = Math.ceil((dueDateObj - now) / (1000 * 60 * 60 * 24));
+        // Calculate days until due using Nairobi timezone dates
+        const diffTime = dueDateStart - nairobiTodayStart;
+        const daysUntilDue = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        
+        // Determine if overdue based on Nairobi timezone
+        const isOverdueInNairobi = nairobiTodayStart > dueDateStart;
+        
+        // Determine status with grace period consideration
+        let status = paymentSummary.status;
+        let statusDisplay = status;
+        
+        // If the payment is due today, show appropriate status
+        if (daysUntilDue === 0) {
+          statusDisplay = 'DUE_TODAY';
+        } else if (isOverdueInNairobi) {
+          statusDisplay = 'OVERDUE';
+        } else if (daysUntilDue <= 5 && daysUntilDue > 0) {
+          // Grace period indicator (days 1-5 before due)
+          statusDisplay = 'GRACE_PERIOD_SOON';
+        }
+        
+        // Calculate grace period end (5th of the month)
+        const gracePeriodEnd = new Date(dueDateObj);
+        gracePeriodEnd.setDate(5);
+        gracePeriodEnd.setHours(23, 59, 59, 999);
+        const gracePeriodEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+        const gracePeriodEndStart = new Date(gracePeriodEndInNairobi);
+        gracePeriodEndStart.setHours(0, 0, 0, 0);
+        
+        const isInGracePeriod = !isOverdueInNairobi && nairobiTodayStart > dueDateStart && nairobiTodayStart <= gracePeriodEndStart;
+        
+        // Calculate days until grace period ends
+        let daysUntilGraceEnd = null;
+        if (isInGracePeriod || (!isOverdueInNairobi && daysUntilDue <= 0)) {
+          const graceDiffTime = gracePeriodEndStart - nairobiTodayStart;
+          daysUntilGraceEnd = Math.ceil(graceDiffTime / (1000 * 60 * 60 * 24));
+        }
         
         tenantsWithNextPayment.push({
           id: tenant.id,
@@ -814,8 +859,17 @@ export const getNextPaymentsByProperty = async (req, res) => {
           },
           payment: {
             dueDate: paymentSummary.nextPayment.dueDateFormatted,
+            dueDateRaw: nextDueDate,
             daysUntilDue: daysUntilDue,
-            isOverdue: isOverdue,
+            isOverdue: isOverdueInNairobi,
+            isInGracePeriod: isInGracePeriod,
+            daysUntilGraceEnd: daysUntilGraceEnd,
+            gracePeriodEnd: gracePeriodEndInNairobi.toLocaleDateString('en-US', { 
+              timeZone: 'Africa/Nairobi',
+              month: 'long',
+              day: 'numeric',
+              year: 'numeric'
+            }),
             amount: {
               rent: paymentBreakdown.rent.paymentByPolicy,
               serviceCharge: paymentBreakdown.serviceCharge.paymentByPolicy,
@@ -823,7 +877,7 @@ export const getNextPaymentsByProperty = async (req, res) => {
               vatOnServiceCharge: paymentBreakdown.serviceCharge.vatAmount,
               total: paymentBreakdown.total.paymentByPolicy
             },
-            status: paymentSummary.status,
+            status: statusDisplay,
             policy: tenant.paymentPolicy
           },
           rent: {
@@ -845,11 +899,13 @@ export const getNextPaymentsByProperty = async (req, res) => {
     // Sort by days until due (most urgent first)
     tenantsWithNextPayment.sort((a, b) => a.payment.daysUntilDue - b.payment.daysUntilDue);
 
-    // Calculate summary statistics
+    // Calculate summary statistics with Nairobi timezone
     const summary = {
       total: tenantsWithNextPayment.length,
       overdue: tenantsWithNextPayment.filter(t => t.payment.isOverdue).length,
-      upcoming: tenantsWithNextPayment.filter(t => !t.payment.isOverdue).length,
+      inGracePeriod: tenantsWithNextPayment.filter(t => t.payment.isInGracePeriod).length,
+      dueToday: tenantsWithNextPayment.filter(t => t.payment.daysUntilDue === 0).length,
+      upcoming: tenantsWithNextPayment.filter(t => !t.payment.isOverdue && t.payment.daysUntilDue > 0).length,
       amounts: {
         outstanding: tenantsWithNextPayment.reduce((sum, t) => 
           sum + (t.payment.isOverdue ? t.payment.amount.total : 0), 0),

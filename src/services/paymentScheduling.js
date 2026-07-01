@@ -1,3 +1,5 @@
+// services/paymentScheduling.js
+
 import { calculateEscalatedRent, calculatePaymentByPolicy, calculateServiceCharge, calculateVAT } from './rentCalculation.js';
 
 /**
@@ -73,8 +75,54 @@ const getMonthStart = (date) => {
 };
 
 /**
+ * Calculate the grace period end date for any payment policy
+ * Grace period always ends on the 5th of the month at 11:59:59 PM
+ * 
+ * @param {Date} dueDate - The due date (1st of the month at end of day)
+ * @param {string} paymentPolicy - MONTHLY, QUARTERLY, or ANNUAL
+ * @param {Date} rentStartDate - The rent start date
+ * @param {number} periodIndex - The index of the current period
+ * @returns {Date} - Grace period end date (5th of the month at 11:59:59 PM)
+ */
+const calculateGracePeriodEnd = (dueDate, paymentPolicy, rentStartDate, periodIndex = 0) => {
+  const policyMonths = getPolicyMonths(paymentPolicy);
+  
+  // For all payment policies, the grace period ends on the 5th of the month
+  // that the payment period starts in
+  let periodStartDate;
+  
+  if (paymentPolicy === 'MONTHLY') {
+    // For monthly, the period start is the month of the due date
+    periodStartDate = new Date(dueDate);
+    periodStartDate.setDate(1);
+  } else {
+    // For quarterly/annual, calculate the period start based on rent start + period index
+    periodStartDate = new Date(rentStartDate);
+    periodStartDate.setMonth(periodStartDate.getMonth() + (periodIndex * policyMonths));
+    periodStartDate.setDate(1);
+  }
+  
+  // Set to the 5th of that month at 11:59:59 PM
+  const graceEnd = new Date(
+    periodStartDate.getFullYear(),
+    periodStartDate.getMonth(),
+    5,
+    23, 59, 59, 999
+  );
+  
+  // If the 5th falls before the due date (shouldn't happen for monthly),
+  // but for safety, if due date is after the 5th, use the next month's 5th
+  // This would only happen if there's a data issue
+  if (graceEnd < dueDate) {
+    graceEnd.setMonth(graceEnd.getMonth() + 1);
+  }
+  
+  return graceEnd;
+};
+
+/**
  * Calculate the next payment due date based on payment history and policy
- * Due date is always at the end of the day (11:59:59 PM)
+ * Due date is always the 1st of the month (at 11:59:59 PM) with grace period until the 5th
  */
 export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const { paymentPolicy, rentStart } = tenant;
@@ -85,14 +133,19 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   
   // If rent hasn't started yet, next due date is rent start date
   if (rentStartDate > currentDateEndOfDay) {
+    const nextDueDate = setToEndOfDay(rentStartDate);
+    const gracePeriodEnd = calculateGracePeriodEnd(nextDueDate, paymentPolicy, rentStartDate, 0);
+    
     return {
-      nextDueDate: setToEndOfDay(rentStartDate),
+      nextDueDate,
+      gracePeriodEnd,
       isOverdue: false,
+      isInGracePeriod: false,
       paymentsBehind: 0,
       paymentsMade: paymentReports.length,
       expectedPayments: 0,
       lastPaymentDate: paymentReports.length > 0 ? new Date(paymentReports[paymentReports.length - 1].datePaid) : null,
-      timeRemaining: calculateTimeRemaining(setToEndOfDay(rentStartDate), currentDateEndOfDay),
+      timeRemaining: calculateTimeRemaining(nextDueDate, currentDateEndOfDay),
       totalDuePerPeriod: 0,
       totalPaidAllPeriods: 0,
       fullyPaidPeriods: 0,
@@ -253,7 +306,6 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   
   // Determine the next due date
   let nextDueDate;
-  let isOverdue = false;
   let nextPeriodIndex = 0;
   
   // Find the first period that is not fully paid
@@ -277,8 +329,80 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     nextDueDate = setToEndOfDay(nextDate);
   }
   
-  isOverdue = calculateIfOverdue(nextDueDate, currentDateEndOfDay);
-  const timeRemaining = calculateTimeRemaining(nextDueDate, currentDateEndOfDay);
+  // =============================================
+  // GRACE PERIOD IMPLEMENTATION FOR ALL PAYMENT POLICIES
+  // Rent is due on the 1st of the month (at 11:59:59 PM)
+  // Grace period extends until the 5th of the month (at 11:59:59 PM)
+  // Overdue starts from the 6th of the month
+  // =============================================
+  
+  // Calculate grace period end using the helper function
+  const gracePeriodEnd = calculateGracePeriodEnd(
+    nextDueDate, 
+    paymentPolicy, 
+    rentStartDate, 
+    nextPeriodIndex
+  );
+  
+  // Determine if the payment is in grace period or overdue
+  const currentDateMidnight = setToStartOfDay(today);
+  const gracePeriodEndMidnight = setToStartOfDay(gracePeriodEnd);
+  const dueDateMidnight = setToStartOfDay(nextDueDate);
+  
+  // Overdue if current date is strictly after grace period end date
+  const isOverdue = currentDateMidnight > gracePeriodEndMidnight;
+  
+  // Check if currently in grace period (after due date but before grace period end)
+  const isInGracePeriod = !isOverdue && currentDateMidnight > dueDateMidnight;
+  
+  // Calculate time remaining with grace period consideration
+  let timeRemaining;
+  if (isOverdue) {
+    // Calculate how many days overdue past the grace period
+    const overdueDays = Math.abs(Math.floor((currentDateMidnight - gracePeriodEndMidnight) / (1000 * 60 * 60 * 24)));
+    timeRemaining = {
+      isOverdue: true,
+      isInGracePeriod: false,
+      days: -overdueDays,
+      hours: 0,
+      minutes: 0,
+      formatted: `Overdue by ${overdueDays} day${overdueDays > 1 ? 's' : ''} (grace period ended)`
+    };
+  } else if (isInGracePeriod) {
+    // Calculate days remaining in grace period
+    const daysRemaining = Math.floor((gracePeriodEndMidnight - currentDateMidnight) / (1000 * 60 * 60 * 24));
+    timeRemaining = {
+      isOverdue: false,
+      isInGracePeriod: true,
+      days: daysRemaining,
+      hours: 0,
+      minutes: 0,
+      formatted: `Grace period: ${daysRemaining} day${daysRemaining > 1 ? 's' : ''} remaining`
+    };
+  } else {
+    // Regular time remaining until due date
+    const diffTime = dueDateMidnight - currentDateMidnight;
+    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+    if (diffDays === 0) {
+      timeRemaining = {
+        isOverdue: false,
+        isInGracePeriod: false,
+        days: 0,
+        hours: 0,
+        minutes: 0,
+        formatted: 'Due today'
+      };
+    } else {
+      timeRemaining = {
+        isOverdue: false,
+        isInGracePeriod: false,
+        days: diffDays,
+        hours: 0,
+        minutes: 0,
+        formatted: `${diffDays} day${diffDays > 1 ? 's' : ''} remaining`
+      };
+    }
+  }
   
   let remainingBalanceForNextPeriod = 0;
   if (nextPeriodIndex < allPeriods.length) {
@@ -289,7 +413,9 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   
   return {
     nextDueDate,
+    gracePeriodEnd,
     isOverdue,
+    isInGracePeriod,
     paymentsBehind,
     paymentsMade: nonCreditPayments.length,
     expectedPayments: periodsSinceStart,
@@ -320,20 +446,52 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
 };
 
 /**
- * Calculate if a payment is overdue
- * Payment is overdue if current date is after the due date
- * (Tenant has until end of due date to pay)
- * @param {Date} dueDate - The due date (set to end of day)
+ * Calculate if a payment is overdue (with grace period)
+ * Payment is overdue if current date is after the grace period end date (5th of the month)
+ * @param {Date} dueDate - The due date (1st of the month at end of day)
  * @param {Date} currentDate - Current date (set to end of day)
- * @returns {boolean}
+ * @param {string} paymentPolicy - Payment policy
+ * @param {Date} rentStartDate - Rent start date
+ * @param {number} periodIndex - The current period index
+ * @returns {Object} - Overdue status with grace period info
  */
-const calculateIfOverdue = (dueDate, currentDate) => {
-  // Compare dates by resetting to midnight and comparing
+export const calculateOverdueStatus = (dueDate, currentDate, paymentPolicy, rentStartDate, periodIndex = 0) => {
   const dueDateMidnight = setToStartOfDay(dueDate);
   const currentDateMidnight = setToStartOfDay(currentDate);
   
-  // If current date is strictly after due date, it's overdue
-  return currentDateMidnight > dueDateMidnight;
+  // Calculate grace period end using the helper
+  const gracePeriodEnd = calculateGracePeriodEnd(dueDate, paymentPolicy, rentStartDate, periodIndex);
+  const gracePeriodEndMidnight = setToStartOfDay(gracePeriodEnd);
+  
+  // Overdue if current date is strictly after grace period end date
+  const isOverdue = currentDateMidnight > gracePeriodEndMidnight;
+  
+  // Check if in grace period (after due date but before grace period end)
+  const isInGracePeriod = !isOverdue && currentDateMidnight > dueDateMidnight;
+  
+  // Calculate days into grace period or overdue
+  let daysIntoPeriod = 0;
+  let formattedStatus = '';
+  
+  if (isOverdue) {
+    daysIntoPeriod = Math.floor((currentDateMidnight - gracePeriodEndMidnight) / (1000 * 60 * 60 * 24));
+    formattedStatus = `Overdue by ${daysIntoPeriod} day${daysIntoPeriod > 1 ? 's' : ''} (grace period ended)`;
+  } else if (isInGracePeriod) {
+    daysIntoPeriod = Math.floor((currentDateMidnight - dueDateMidnight) / (1000 * 60 * 60 * 24));
+    formattedStatus = `In grace period (day ${daysIntoPeriod + 1} of 5)`;
+  } else {
+    const daysUntilDue = Math.floor((dueDateMidnight - currentDateMidnight) / (1000 * 60 * 60 * 24));
+    formattedStatus = daysUntilDue === 0 ? 'Due today' : `${daysUntilDue} day${daysUntilDue > 1 ? 's' : ''} until due`;
+  }
+  
+  return {
+    isOverdue,
+    isInGracePeriod,
+    gracePeriodEnd,
+    daysIntoPeriod,
+    formattedStatus,
+    dueDate
+  };
 };
 
 /**
@@ -569,7 +727,14 @@ export const getPaymentSummary = (tenant) => {
   } else if (totalPaidRounded === 0 && expectedTotal > 0) {
     status = 'UNPAID';
   } else if (outstandingBalance > 0) {
-    status = 'PARTIALLY_PAID';
+    // Check if in grace period before marking as overdue
+    if (nextPaymentInfo.isOverdue) {
+      status = 'OVERDUE';
+    } else if (nextPaymentInfo.isInGracePeriod) {
+      status = 'IN_GRACE_PERIOD';
+    } else {
+      status = 'PARTIALLY_PAID';
+    }
   } else if (outstandingBalance < 0) {
     status = 'OVERPAID';
   } else {
@@ -579,6 +744,8 @@ export const getPaymentSummary = (tenant) => {
       status = 'PAID';
     } else if (nextPaymentInfo.isOverdue) {
       status = 'OVERDUE';
+    } else if (nextPaymentInfo.isInGracePeriod) {
+      status = 'IN_GRACE_PERIOD';
     } else {
       status = 'UP_TO_DATE';
     }
@@ -586,14 +753,8 @@ export const getPaymentSummary = (tenant) => {
   
   // Get next payment period
   const nextPaymentDate = nextPaymentInfo.nextDueDate;
+  const gracePeriodEnd = nextPaymentInfo.gracePeriodEnd;
   const nextPaymentPeriod = nextPaymentDate ? getCurrentBillingPeriod(nextPaymentDate, tenant) : null;
-  
-  const gracePeriodDays = 0;
-  const gracePeriodEnd = nextPaymentDate ? new Date(nextPaymentDate) : null;
-  if (gracePeriodEnd && gracePeriodDays > 0) {
-    gracePeriodEnd.setDate(gracePeriodEnd.getDate() + gracePeriodDays);
-    gracePeriodEnd.setHours(23, 59, 59, 999);
-  }
   
   return {
     paymentPolicy: tenant.paymentPolicy,
@@ -607,6 +768,7 @@ export const getPaymentSummary = (tenant) => {
       dueDateTime: nextPaymentDate ? nextPaymentDate.toLocaleString() : null,
       amount: totalDuePerPeriod,
       isOverdue: nextPaymentInfo.isOverdue,
+      isInGracePeriod: nextPaymentInfo.isInGracePeriod,
       timeRemaining: nextPaymentInfo.timeRemaining,
       paymentsBehind: nextPaymentInfo.paymentsBehind,
       gracePeriodEnd: gracePeriodEnd,
