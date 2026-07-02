@@ -1277,7 +1277,7 @@ export const updateTenant = async (req, res) => {
       }
     }
 
-    // Validate escalation frequency - NEW: Added BI_ENNIAL
+    // Validate escalation frequency
     let normalizedEscalationFrequency = undefined;
     if (escalationFrequency !== undefined) {
       if (escalationFrequency === null) {
@@ -1382,108 +1382,127 @@ export const updateTenant = async (req, res) => {
     }
 
     // =============================================
-    // HANDLE SERVICE CHARGE UPDATE - UPDATED WITH VAT SUPPORT
+    // HANDLE SERVICE CHARGE UPDATE - FIXED VERSION
     // =============================================
-    if (serviceCharge) {
-      // Validate type if provided
-      let normalizedType = undefined;
-      if (serviceCharge.type !== undefined) {
-        const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
-        normalizedType = serviceCharge.type.toUpperCase();
-        if (!validTypes.includes(normalizedType)) {
-          return res.status(400).json({
-            message: `Invalid service charge type. Must be: ${validTypes.join(", ")}`,
+    if (serviceCharge !== undefined) {
+      // Case 1: serviceCharge is null or explicitly wants to remove it
+      if (serviceCharge === null) {
+        // Delete the service charge if it exists
+        if (existingTenant.serviceCharge) {
+          await prisma.serviceCharge.delete({
+            where: { tenantId: req.params.id },
           });
         }
-      }
-
-      // Validate service charge VAT type
-      let normalizedServiceVatType = undefined;
-      if (serviceCharge.vatType !== undefined) {
-        const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
-        normalizedServiceVatType = serviceCharge.vatType.toUpperCase();
-        if (!validVatTypes.includes(normalizedServiceVatType)) {
-          return res.status(400).json({
-            message: `Invalid service charge VAT type. Must be: ${validVatTypes.join(", ")}`,
-          });
-        }
-      }
-
-      // Validate service charge VAT rate
-      let parsedServiceVatRate = undefined;
-      if (serviceCharge.vatRate !== undefined) {
-        if (serviceCharge.vatRate === null) {
-          parsedServiceVatRate = 0;
-        } else {
-          parsedServiceVatRate = parseFloat(serviceCharge.vatRate);
-          if (isNaN(parsedServiceVatRate) || parsedServiceVatRate < 0 || parsedServiceVatRate > 100) {
+      } 
+      // Case 2: serviceCharge is an object (update or create)
+      else if (serviceCharge && typeof serviceCharge === 'object') {
+        // Validate type if provided
+        let normalizedType = undefined;
+        if (serviceCharge.type !== undefined) {
+          const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
+          normalizedType = serviceCharge.type.toUpperCase();
+          if (!validTypes.includes(normalizedType)) {
             return res.status(400).json({
-              message: "Service charge VAT rate must be between 0 and 100",
+              message: `Invalid service charge type. Must be: ${validTypes.join(", ")}`,
             });
           }
         }
-      }
 
-      // Build update data with CORRECT field names
-      const serviceChargeUpdateData = {};
-      
-      if (normalizedType !== undefined) {
-        serviceChargeUpdateData.type = normalizedType;
-      }
-      
-      if (serviceCharge.fixedAmount !== undefined) {
-        serviceChargeUpdateData.fixedAmount = serviceCharge.fixedAmount !== null 
-          ? parseFloat(serviceCharge.fixedAmount) 
-          : null;
-      }
-      
-      if (serviceCharge.percentage !== undefined) {
-        serviceChargeUpdateData.percentage = serviceCharge.percentage !== null 
-          ? parseFloat(serviceCharge.percentage) 
-          : null;
-      }
-      
-      if (serviceCharge.perSqFtRate !== undefined) {
-        serviceChargeUpdateData.perSqFtRate = serviceCharge.perSqFtRate !== null 
-          ? parseFloat(serviceCharge.perSqFtRate) 
-          : null;
-      }
+        // Validate service charge VAT type
+        let normalizedServiceVatType = undefined;
+        if (serviceCharge.vatType !== undefined) {
+          const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
+          normalizedServiceVatType = serviceCharge.vatType.toUpperCase();
+          if (!validVatTypes.includes(normalizedServiceVatType)) {
+            return res.status(400).json({
+              message: `Invalid service charge VAT type. Must be: ${validVatTypes.join(", ")}`,
+            });
+          }
+        }
 
-      // Add VAT fields
-      if (normalizedServiceVatType !== undefined) {
-        serviceChargeUpdateData.vatType = normalizedServiceVatType;
-      }
-      
-      if (parsedServiceVatRate !== undefined) {
-        serviceChargeUpdateData.vatRate = parsedServiceVatRate;
-      }
+        // Validate service charge VAT rate
+        let parsedServiceVatRate = undefined;
+        if (serviceCharge.vatRate !== undefined) {
+          if (serviceCharge.vatRate === null) {
+            parsedServiceVatRate = 0;
+          } else {
+            parsedServiceVatRate = parseFloat(serviceCharge.vatRate);
+            if (isNaN(parsedServiceVatRate) || parsedServiceVatRate < 0 || parsedServiceVatRate > 100) {
+              return res.status(400).json({
+                message: "Service charge VAT rate must be between 0 and 100",
+              });
+            }
+          }
+        }
 
-      // If VAT type is NOT_APPLICABLE, force vatRate = 0
-      if (normalizedServiceVatType === "NOT_APPLICABLE") {
-        serviceChargeUpdateData.vatRate = 0;
-      }
+        // Build update data with CORRECT field names
+        const serviceChargeUpdateData = {};
+        
+        if (normalizedType !== undefined) {
+          serviceChargeUpdateData.type = normalizedType;
+        }
+        
+        if (serviceCharge.fixedAmount !== undefined) {
+          serviceChargeUpdateData.fixedAmount = serviceCharge.fixedAmount !== null 
+            ? parseFloat(serviceCharge.fixedAmount) 
+            : null;
+        }
+        
+        if (serviceCharge.percentage !== undefined) {
+          serviceChargeUpdateData.percentage = serviceCharge.percentage !== null 
+            ? parseFloat(serviceCharge.percentage) 
+            : null;
+        }
+        
+        if (serviceCharge.perSqFtRate !== undefined) {
+          serviceChargeUpdateData.perSqFtRate = serviceCharge.perSqFtRate !== null 
+            ? parseFloat(serviceCharge.perSqFtRate) 
+            : null;
+        }
 
-      // Update or create service charge
-      if (Object.keys(serviceChargeUpdateData).length > 0) {
-        if (existingTenant.serviceCharge) {
-          // Update existing
-          await prisma.serviceCharge.update({
+        // Add VAT fields
+        if (normalizedServiceVatType !== undefined) {
+          serviceChargeUpdateData.vatType = normalizedServiceVatType;
+        }
+        
+        if (parsedServiceVatRate !== undefined) {
+          serviceChargeUpdateData.vatRate = parsedServiceVatRate;
+        }
+
+        // If VAT type is NOT_APPLICABLE, force vatRate = 0
+        if (normalizedServiceVatType === "NOT_APPLICABLE") {
+          serviceChargeUpdateData.vatRate = 0;
+        }
+
+        // Update or create service charge
+        if (Object.keys(serviceChargeUpdateData).length > 0) {
+          // Check if we need to create or update
+          const existingServiceCharge = await prisma.serviceCharge.findUnique({
             where: { tenantId: req.params.id },
-            data: serviceChargeUpdateData,
           });
-        } else if (normalizedType) {
-          // Create new with all required fields
-          await prisma.serviceCharge.create({
-            data: {
+
+          if (existingServiceCharge) {
+            // Update existing
+            await prisma.serviceCharge.update({
+              where: { tenantId: req.params.id },
+              data: serviceChargeUpdateData,
+            });
+          } else {
+            // Create new - ensure we have required fields
+            const createData = {
               tenantId: req.params.id,
-              type: normalizedType,
+              type: serviceChargeUpdateData.type || 'FIXED',
               fixedAmount: serviceChargeUpdateData.fixedAmount ?? null,
               percentage: serviceChargeUpdateData.percentage ?? null,
               perSqFtRate: serviceChargeUpdateData.perSqFtRate ?? null,
-              vatType: serviceChargeUpdateData.vatType ?? "NOT_APPLICABLE",
+              vatType: serviceChargeUpdateData.vatType || "NOT_APPLICABLE",
               vatRate: serviceChargeUpdateData.vatRate ?? 0,
-            },
-          });
+            };
+            
+            await prisma.serviceCharge.create({
+              data: createData,
+            });
+          }
         }
       }
     }

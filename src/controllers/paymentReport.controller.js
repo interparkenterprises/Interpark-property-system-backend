@@ -1056,9 +1056,7 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       });
     }
 
-    // =============================================
-    // FIX: Get tenants with their invoices AND payment reports
-    // =============================================
+    // Get tenants with their invoices AND payment reports
     const tenants = await prisma.tenant.findMany({
       where: {
         unit: {
@@ -1075,10 +1073,8 @@ export const getPropertyRentPaymentReport = async (req, res) => {
             sizeSqFt: true
           }
         },
-        // Include INVOICES (this is the key missing piece)
         invoices: {
           where: {
-            // Include rent invoices that are NOT fully paid
             status: {
               in: ['UNPAID', 'PARTIAL', 'OVERDUE']
             }
@@ -1097,14 +1093,16 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         },
         paymentReports: {
           where: {
-            status: { notIn: ['CREDIT', 'PREPAID'] }
+            status: { notIn: ['PREPAID'] }  // Include CREDIT reports
           },
           select: {
             amountPaid: true,
             totalDue: true,
             arrears: true,
             status: true,
-            paymentPeriod: true
+            paymentPeriod: true,
+            id: true,
+            datePaid: true
           }
         }
       }
@@ -1178,39 +1176,68 @@ export const getPropertyRentPaymentReport = async (req, res) => {
     let fullyPaidCount = 0;
     let partialPaidCount = 0;
     let unpaidCount = 0;
+    let creditCount = 0;
 
-    // =============================================
-    // FIX: Process tenants with both paymentReports AND invoices
-    // =============================================
+    // Process tenants with both paymentReports AND invoices
     for (const tenant of tenants) {
       const tenantReports = tenant.paymentReports || [];
       const tenantInvoices = tenant.invoices || [];
       
-      // Calculate from paymentReports
-      const tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
-      const tenantExpected = tenantReports.reduce((sum, report) => sum + report.totalDue, 0);
-      const tenantArrearsFromReports = tenantReports.reduce((sum, report) => sum + report.arrears, 0);
+      // Calculate paid amount from reports (including CREDIT reports)
+      let tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
       
-      // Calculate from invoices - this is the missing piece!
+      // Calculate expected amount from reports
+      let tenantExpected = tenantReports.reduce((sum, report) => {
+        if (report.status === 'CREDIT') {
+          return sum; // We'll handle CREDIT separately
+        }
+        return sum + report.totalDue;
+      }, 0);
+      
+      // Calculate arrears from reports (CREDIT = negative)
+      let tenantArrearsFromReports = 0;
+      for (const report of tenantReports) {
+        if (report.status === 'CREDIT') {
+          // CREDIT reduces arrears (overpayment)
+          tenantArrearsFromReports -= report.amountPaid;
+        } else {
+          tenantArrearsFromReports += report.arrears;
+        }
+      }
+      
       const invoiceTotalDue = tenantInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
       const invoiceTotalPaid = tenantInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
       const invoiceTotalBalance = tenantInvoices.reduce((sum, inv) => sum + inv.balance, 0);
       
-      // Combined totals (take the larger/more accurate from invoices)
-      const totalDue = Math.max(tenantExpected, invoiceTotalDue);
+      // Calculate total due (combine invoices and reports)
+      let totalDue = invoiceTotalDue;
+      // Add report totals (excluding CREDIT reports)
+      for (const report of tenantReports) {
+        if (report.status !== 'CREDIT') {
+          totalDue += report.totalDue;
+        }
+      }
+      
+      // Calculate total paid
       const totalPaid = tenantPaid + invoiceTotalPaid;
-      const totalArrearsForTenant = Math.max(tenantArrearsFromReports, invoiceTotalBalance);
+      
+      // Calculate total arrears (negative for credit)
+      let totalArrearsForTenant = invoiceTotalBalance + tenantArrearsFromReports;
+      
+      // If there are only CREDIT reports and no invoices, arrears should be negative
+      if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
+        const totalCredit = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0);
+        totalArrearsForTenant = -totalCredit;
+        totalDue = 0; // No actual due amount
+      }
       
       totalRentCollected += totalPaid;
       totalRentExpected += totalDue;
       totalArrears += totalArrearsForTenant;
       
-      // =============================================
-      // FIX: Determine status based on invoices, not just paymentReports
-      // =============================================
+      // Determine tenant status
       let tenantStatus = 'PAID';
       
-      // Check if there are any unpaid invoices
       const hasUnpaidInvoices = tenantInvoices.some(inv => 
         inv.status === 'UNPAID' || inv.status === 'OVERDUE'
       );
@@ -1227,22 +1254,27 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         report.status === 'PARTIAL'
       );
       
-      // Determine status with priority: UNPAID > PARTIAL > PAID
-      if (hasUnpaidInvoices || hasUnpaidPaymentReports) {
+      const hasCreditReports = tenantReports.some(report => 
+        report.status === 'CREDIT'
+      );
+      
+      // Only CREDIT reports with no invoices
+      if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
+        tenantStatus = 'CREDIT';
+        creditCount++;
+      } else if (hasUnpaidInvoices || hasUnpaidPaymentReports) {
         tenantStatus = 'UNPAID';
         unpaidCount++;
       } else if (hasPartialInvoices || hasPartialPaymentReports) {
         tenantStatus = 'PARTIAL';
         partialPaidCount++;
       } else {
-        // Check if tenant has any paymentReports or invoices
         const hasAnyRecords = tenantReports.length > 0 || tenantInvoices.length > 0;
         if (hasAnyRecords) {
           fullyPaidCount++;
         }
       }
       
-      // Check for overdue (based on invoices)
       const hasOverdue = tenantInvoices.some(inv => 
         (inv.status === 'UNPAID' || inv.status === 'OVERDUE') && 
         new Date(inv.dueDate) < new Date()
@@ -1252,7 +1284,7 @@ export const getPropertyRentPaymentReport = async (req, res) => {
 
     const collectionRate = totalRentExpected > 0 
       ? (totalRentCollected / totalRentExpected) * 100 
-      : 0;
+      : totalRentCollected > 0 ? 100 : 0;
 
     const monthlyTrends = {};
     paymentReports.forEach(report => {
@@ -1271,73 +1303,169 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         };
       }
       
-      monthlyTrends[monthKey].expected += report.totalDue;
+      // For CREDIT reports, adjust the expected and arrears
+      let expectedAmount = report.totalDue;
+      let arrearsAmount = report.arrears;
+      
+      if (report.status === 'CREDIT') {
+        // For CREDIT: expected is 0 in the report, but we should show it as 0
+        // The arrears should be negative (overpayment)
+        expectedAmount = 0;
+        arrearsAmount = -report.amountPaid;
+      }
+      
+      monthlyTrends[monthKey].expected += expectedAmount;
       monthlyTrends[monthKey].collected += report.amountPaid;
-      monthlyTrends[monthKey].arrears += report.arrears;
+      monthlyTrends[monthKey].arrears += arrearsAmount;
       monthlyTrends[monthKey].reportCount++;
     });
 
-    // =============================================
-    // FIX: Include ALL tenants with outstanding balances,
-    // not just those with paymentReports
-    // =============================================
+    // Include ALL tenants with outstanding balances or credits
     const tenantOutstanding = tenants.map(tenant => {
       const tenantReports = tenant.paymentReports || [];
       const tenantInvoices = tenant.invoices || [];
       
-      const totalDue = Math.max(
-        tenantReports.reduce((sum, r) => sum + r.totalDue, 0),
-        tenantInvoices.reduce((sum, inv) => sum + inv.totalDue, 0)
-      );
+      // Calculate total due
+      let totalDue = tenantInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
+      for (const report of tenantReports) {
+        if (report.status !== 'CREDIT') {
+          totalDue += report.totalDue;
+        }
+      }
       
+      // Calculate total paid
       const totalPaid = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0) +
                         tenantInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
       
-      const tenantArrears = Math.max(
-        tenantReports.reduce((sum, r) => sum + r.arrears, 0),
-        tenantInvoices.reduce((sum, inv) => sum + inv.balance, 0)
-      );
+      // Calculate arrears properly
+      let totalArrears = tenantInvoices.reduce((sum, inv) => sum + inv.balance, 0);
       
-      // Determine status from invoices first, then paymentReports
+      // Add payment report adjustments
+      for (const report of tenantReports) {
+        if (report.status === 'CREDIT') {
+          // CREDIT reduces arrears (negative)
+          totalArrears -= report.amountPaid;
+        } else {
+          totalArrears += report.arrears;
+        }
+      }
+      
+      // If only CREDIT reports exist, arrears should be negative
+      if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
+        const totalCredit = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0);
+        totalArrears = -totalCredit;
+        totalDue = 0;
+      }
+      
       let status = 'PAID';
       const hasUnpaidInvoice = tenantInvoices.some(inv => inv.status === 'UNPAID' || inv.status === 'OVERDUE');
       const hasPartialInvoice = tenantInvoices.some(inv => inv.status === 'PARTIAL');
       const latestReport = tenantReports[0];
       
-      if (hasUnpaidInvoice) {
+      // Check if all reports are CREDIT
+      if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
+        status = 'CREDIT';
+      } else if (hasUnpaidInvoice) {
         status = 'UNPAID';
       } else if (hasPartialInvoice) {
         status = 'PARTIAL';
-      } else if (latestReport) {
-        status = latestReport.status;
+      } else if (latestReport && latestReport.status === 'PARTIAL') {
+        status = 'PARTIAL';
+      } else if (latestReport && latestReport.status === 'UNPAID') {
+        status = 'UNPAID';
       }
       
-      // Include all tenants with outstanding balance OR arrears
-      const hasOutstanding = tenantArrears > 0 || (totalDue - totalPaid) > 0;
-      
-      // Also include tenants with UNPAID invoices even if balance is 0 (edge case)
+      const hasOutstanding = totalArrears > 0;
       const hasUnpaidStatus = status === 'UNPAID' || status === 'PARTIAL';
+      const hasCredit = totalArrears < 0 || status === 'CREDIT';
       
-      if (hasOutstanding || hasUnpaidStatus) {
+      // Include if: has outstanding balance OR is unpaid/partial OR has credit
+      if (hasOutstanding || hasUnpaidStatus || hasCredit || tenantReports.length > 0) {
         return {
           tenantId: tenant.id,
           tenantName: tenant.fullName,
           unitNo: tenant.unit?.unitNo || 'N/A',
           unitType: tenant.unit?.type || 'N/A',
-          expectedTotal: totalDue,
-          paidTotal: totalPaid,
-          outstandingBalance: totalDue - totalPaid,
-          arrears: tenantArrears,
+          expectedTotal: parseFloat(totalDue.toFixed(2)),
+          paidTotal: parseFloat(totalPaid.toFixed(2)),
+          outstandingBalance: parseFloat((totalDue - totalPaid).toFixed(2)),
+          arrears: parseFloat(totalArrears.toFixed(2)),
           lastPaymentDate: tenantReports[0]?.paymentPeriod || null,
           paymentStatus: status,
-          // Add invoice details for debugging
           invoiceCount: tenantInvoices.length,
-          invoiceStatuses: tenantInvoices.map(inv => inv.status)
+          invoiceStatuses: tenantInvoices.map(inv => inv.status),
+          creditAmount: totalArrears < 0 ? Math.abs(parseFloat(totalArrears.toFixed(2))) : 0
         };
       }
       
       return null;
-    }).filter(Boolean); // Remove null entries
+    }).filter(Boolean);
+
+    // =============================================
+    // FIX: Correct expectedAmount and amountPaid for CREDIT reports
+    // =============================================
+    const paymentReportsWithCorrectedAmounts = [];
+
+    for (const report of paymentReports) {
+      let expectedAmount = report.totalDue;
+      let arrears = report.arrears;
+      let correctedAmountPaid = report.amountPaid;
+      
+      // For CREDIT reports, we need to handle them differently
+      if (report.status === 'CREDIT') {
+        try {
+          // Get the tenant's actual expected charges for this period
+          const tenant = report.tenant;
+          
+          // Use the paymentPeriod from the report
+          const periodDate = new Date(report.paymentPeriod);
+          
+          // Calculate expected charges for this period
+          const expected = await computeExpectedChargesForPolicy(
+            report.tenantId,
+            periodDate,
+            tenant.paymentPolicy || 'MONTHLY'
+          );
+          
+          expectedAmount = expected.totalDue;
+          
+          // For CREDIT: The amountPaid in the report is just the overpayment amount
+          // We need to add the expected amount to get the total amount paid
+          // The total amount paid = expectedAmount + overpaymentAmount
+          correctedAmountPaid = expectedAmount + report.amountPaid;
+          
+          // arrears should be negative (overpayment)
+          // arrears = expectedAmount - totalPaid = -overpaymentAmount
+          arrears = parseFloat((expectedAmount - correctedAmountPaid).toFixed(2));
+          
+          console.log(`CREDIT report ${report.id}: Expected ${expectedAmount}, Overpayment ${report.amountPaid}, Total Paid ${correctedAmountPaid}, Arrears ${arrears} (negative = overpayment) for tenant ${tenant.fullName}`);
+        } catch (error) {
+          console.error(`Error calculating expected amount for CREDIT report ${report.id}:`, error);
+          // Fallback: use the report's totalDue (which is 0 for CREDIT)
+          expectedAmount = report.totalDue;
+          correctedAmountPaid = report.amountPaid;
+          arrears = parseFloat((-report.amountPaid).toFixed(2));
+        }
+      }
+      
+      paymentReportsWithCorrectedAmounts.push({
+        id: report.id,
+        tenantName: report.tenant.fullName,
+        unitNo: report.tenant.unit?.unitNo || 'N/A',
+        paymentPeriod: report.paymentPeriod,
+        expectedAmount: parseFloat(expectedAmount.toFixed(2)),
+        amountPaid: parseFloat(correctedAmountPaid.toFixed(2)),
+        arrears: parseFloat(arrears.toFixed(2)),
+        status: report.status,
+        invoiceCount: report.invoices.length,
+        datePaid: report.datePaid
+      });
+    }
+
+    // Calculate total credit amount
+    const totalCredit = tenantOutstanding
+      .filter(t => t.creditAmount > 0)
+      .reduce((sum, t) => sum + t.creditAmount, 0);
 
     res.json({
       success: true,
@@ -1349,32 +1477,28 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         },
         summary: {
           totalTenants: tenants.length,
-          totalRentCollected,
-          totalRentExpected,
-          totalArrears,
+          totalRentCollected: parseFloat(totalRentCollected.toFixed(2)),
+          totalRentExpected: parseFloat(totalRentExpected.toFixed(2)),
+          totalArrears: parseFloat(totalArrears.toFixed(2)),
+          totalCredit: parseFloat(totalCredit.toFixed(2)),
           collectionRate: parseFloat(collectionRate.toFixed(2)),
           collectionRateStatus: collectionRate >= 90 ? 'EXCELLENT' : collectionRate >= 75 ? 'GOOD' : collectionRate >= 50 ? 'AVERAGE' : 'POOR',
           paymentBreakdown: {
             fullyPaid: fullyPaidCount,
             partiallyPaid: partialPaidCount,
             unpaid: unpaidCount,
-            overdue: totalOverdueCount
+            overdue: totalOverdueCount,
+            credit: creditCount
           }
         },
-        monthlyTrends: Object.values(monthlyTrends),
-        tenantOutstanding,
-        paymentReports: paymentReports.map(report => ({
-          id: report.id,
-          tenantName: report.tenant.fullName,
-          unitNo: report.tenant.unit?.unitNo || 'N/A',
-          paymentPeriod: report.paymentPeriod,
-          expectedAmount: report.totalDue,
-          amountPaid: report.amountPaid,
-          arrears: report.arrears,
-          status: report.status,
-          invoiceCount: report.invoices.length,
-          datePaid: report.datePaid
+        monthlyTrends: Object.values(monthlyTrends).map(trend => ({
+          ...trend,
+          expected: parseFloat(trend.expected.toFixed(2)),
+          collected: parseFloat(trend.collected.toFixed(2)),
+          arrears: parseFloat(trend.arrears.toFixed(2))
         })),
+        tenantOutstanding,
+        paymentReports: paymentReportsWithCorrectedAmounts,
         pagination: {
           page: parseInt(page),
           limit: parseInt(take),
