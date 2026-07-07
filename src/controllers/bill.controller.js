@@ -581,13 +581,65 @@ export const updateBill = async (req, res) => {
       return res.status(404).json({ error: 'Bill not found.' });
     }
 
-    // Recalculate derived values if relevant fields are updated
+    // Process date fields properly
     let finalUpdates = { ...updates };
+    
+    // Handle dueDate field
+    if (updates.dueDate) {
+      // Try to parse the date
+      const parsedDate = new Date(updates.dueDate);
+      
+      // Check if the date is valid
+      if (isNaN(parsedDate.getTime())) {
+        return res.status(400).json({ 
+          error: 'Invalid date format for dueDate',
+          message: 'dueDate must be a valid date string (ISO-8601 format recommended)'
+        });
+      }
+      
+      // Use the parsed date
+      finalUpdates.dueDate = parsedDate;
+    } else if (updates.dueDate === null) {
+      // If explicitly set to null, keep it null
+      finalUpdates.dueDate = null;
+    }
+
+    // Also handle issuedAt if it's being updated
+    if (updates.issuedAt) {
+      const parsedDate = new Date(updates.issuedAt);
+      if (isNaN(parsedDate.getTime())) {
+        return res.status(400).json({ 
+          error: 'Invalid date format for issuedAt',
+          message: 'issuedAt must be a valid date string (ISO-8601 format recommended)'
+        });
+      }
+      finalUpdates.issuedAt = parsedDate;
+    }
+
+    // Remove any fields that shouldn't be updated directly
+    // (like id, createdAt, etc.)
+    delete finalUpdates.id;
+    delete finalUpdates.createdAt;
+    delete finalUpdates.updatedAt;
+
+    // Recalculate derived values if relevant fields are updated
     if (updates.currentReading !== undefined || updates.previousReading !== undefined || updates.chargePerUnit !== undefined) {
       const prevRead = updates.previousReading ?? existingBill.previousReading;
       const currRead = updates.currentReading ?? existingBill.currentReading;
       const chargePerUnit = updates.chargePerUnit ?? existingBill.chargePerUnit;
       const vatRate = updates.vatRate ?? existingBill.vatRate;
+
+      // Validate readings
+      if (currRead <= prevRead) {
+        return res.status(400).json({
+          error: 'Current reading must be greater than previous reading.',
+          details: {
+            previousReading: prevRead,
+            currentReading: currRead,
+            difference: currRead - prevRead
+          }
+        });
+      }
 
       const units = currRead - prevRead;
       const totalAmount = units * chargePerUnit;
@@ -626,6 +678,15 @@ export const updateBill = async (req, res) => {
     res.status(200).json(updatedBill);
   } catch (error) {
     console.error('Error updating bill:', error);
+    
+    // Handle Prisma validation errors
+    if (error.code === 'P2006') {
+      return res.status(400).json({
+        error: 'Invalid data provided',
+        details: 'Please check that all dates are in the correct format (ISO-8601)'
+      });
+    }
+    
     res.status(500).json({ error: 'Internal Server Error' });
   }
 };
