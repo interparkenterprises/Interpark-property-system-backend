@@ -1,5 +1,8 @@
 import prisma from "../lib/prisma.js";
 import permissionService from "../services/permissionService.js";
+import fs from 'fs';
+import path from 'path';
+import { deleteDocument, fileExists, getFilePath } from '../utils/uploadHelper.js';
 
 import { 
   calculateEscalatedRent,  
@@ -1794,5 +1797,433 @@ export const getTenantFinancials = async (req, res) => {
   } catch (error) {
     console.error('Get tenant financials error:', error);
     res.status(400).json({ message: error.message });
+  }
+};
+
+// Helper functions
+const isAdmin = (userRole) => userRole === 'ADMIN';
+
+// @desc    Get all attachments for a tenant
+// @route   GET /api/tenants/:tenantId/attachments
+// @access  Private
+export const getAttachments = async (req, res) => {
+  try {
+    const { tenantId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check tenant access
+    const { hasAccess } = await checkUserTenantAccess(userId, userRole, tenantId, 'view');
+    if (!hasAccess) {
+      return res.status(403).json({
+        message: 'Access denied. You do not have permission to view attachments for this tenant.',
+        requiredPermission: 'VIEW_TENANT'
+      });
+    }
+
+    const attachments = await prisma.attachment.findMany({
+      where: { tenantId },
+      include: {
+        uploadedBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+      },
+      orderBy: { uploadedAt: 'desc' },
+    });
+
+    // Get base URL from request - use the actual request host
+    const protocol = req.protocol || 'http';
+    const host = req.get('host') || 'localhost:5000';
+    const baseUrl = `${protocol}://${host}`;
+
+    // Add permission flags and preview/download URLs to each attachment
+    const attachmentsWithPermissions = attachments.map(attachment => {
+      // Get the filename
+      let fileName = attachment.fileName || attachment.url;
+      if (fileName.includes('/') || fileName.includes('\\')) {
+        fileName = fileName.replace(/\\/g, '/').split('/').pop();
+      }
+      
+      return {
+        ...attachment,
+        // Use relative paths for API endpoints (will be resolved by the frontend)
+        previewUrl: `/api/tenants/attachments/${attachment.id}/preview`,
+        downloadUrl: `/api/tenants/attachments/${attachment.id}/download`,
+        // Use frontend URL for file display
+        url: `/uploads/${fileName}`,
+        canEdit: isAdmin(userRole),
+        canDelete: isAdmin(userRole),
+        canDownload: true,
+        canPreview: true
+      };
+    });
+
+    res.json({
+      success: true,
+      count: attachments.length,
+      data: attachmentsWithPermissions
+    });
+  } catch (error) {
+    console.error('Error fetching attachments:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch attachments',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Upload a new attachment for a tenant
+// @route   POST /api/tenants/:tenantId/attachments
+// @access  Private (Managers and Admins only)
+export const uploadAttachment = async (req, res) => {
+  try {
+    const { tenantId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Check if user has edit permission for this tenant
+    const { hasAccess } = await checkUserTenantAccess(userId, userRole, tenantId, 'edit');
+    if (!hasAccess) {
+      return res.status(403).json({
+        message: 'Access denied. You do not have permission to upload attachments for this tenant.',
+        requiredPermission: 'EDIT_TENANT'
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'No file uploaded'
+      });
+    }
+
+    const { originalname, filename, path: filePath, mimetype, size } = req.file;
+
+    // Store only the filename (not the full path)
+    const storedFileName = filename;
+
+    // Create attachment record in database
+    const attachment = await prisma.attachment.create({
+      data: {
+        name: originalname,
+        fileName: storedFileName,
+        url: storedFileName,
+        mimeType: mimetype,
+        size: size,
+        tenantId,
+        uploadedById: userId,
+      },
+    });
+
+    // Use relative paths for the frontend
+    res.status(201).json({
+      success: true,
+      message: 'Attachment uploaded successfully',
+      data: {
+        ...attachment,
+        url: `/uploads/${storedFileName}`,
+        previewUrl: `/api/tenants/attachments/${attachment.id}/preview`,
+        downloadUrl: `/api/tenants/attachments/${attachment.id}/download`,
+        canEdit: isAdmin(userRole),
+        canDelete: isAdmin(userRole),
+        canDownload: true,
+        canPreview: true
+      }
+    });
+  } catch (error) {
+    console.error('Error uploading attachment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to upload attachment',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Preview an attachment in browser
+// @route   GET /api/tenants/attachments/:attachmentId/preview
+// @access  Private (Everyone with view access)
+export const previewAttachment = async (req, res) => {
+  try {
+    const { attachmentId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    const attachment = await prisma.attachment.findUnique({
+      where: { id: attachmentId }
+    });
+
+    if (!attachment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attachment not found'
+      });
+    }
+
+    // Check if user has view permission for the tenant
+    const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'view');
+    if (!hasAccess) {
+      return res.status(403).json({
+        message: 'Access denied. You do not have permission to preview this attachment.',
+        requiredPermission: 'VIEW_TENANT'
+      });
+    }
+
+    // Get the filename from the URL or fileName field
+    let fileName = attachment.fileName || attachment.url;
+    // If it contains path separators, extract just the filename
+    if (fileName.includes('/') || fileName.includes('\\')) {
+      fileName = fileName.replace(/\\/g, '/').split('/').pop();
+    }
+    
+    // Check if file exists in the uploads directory
+    const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+    const fullPath = path.resolve(uploadDir, fileName); // Use path.resolve() for absolute path
+    
+    console.log('Preview - Looking for file at:', fullPath);
+    
+    if (!fs.existsSync(fullPath)) {
+      console.error('Preview - File not found at path:', fullPath);
+      return res.status(404).json({
+        success: false,
+        message: 'File not found on server'
+      });
+    }
+
+    // Set headers for preview
+    const fileExtension = attachment.name.split('.').pop().toLowerCase();
+    const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(fileExtension);
+    const isPdf = fileExtension === 'pdf';
+
+    if (isImage || isPdf) {
+      res.setHeader('Content-Type', attachment.mimeType || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${attachment.name}"`);
+      return res.sendFile(fullPath); // Now fullPath is absolute
+    } else {
+      // For all other files, redirect to download
+      return res.redirect(`${process.env.BASE_URL || 'http://localhost:5000'}/api/tenants/attachments/${attachmentId}/download`);
+    }
+  } catch (error) {
+    console.error('Error previewing attachment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to preview attachment',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Update an attachment (rename) - ADMIN ONLY
+// @route   PUT /api/tenants/attachments/:attachmentId
+// @access  Private
+export const updateAttachment = async (req, res) => {
+  try {
+    const { attachmentId } = req.params;
+    const { name } = req.body;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    if (!isAdmin(userRole)) {
+      return res.status(403).json({
+        message: 'Access denied. Only admins can edit attachments.',
+        requiredPermission: 'ADMIN'
+      });
+    }
+
+    const attachment = await prisma.attachment.findUnique({
+      where: { id: attachmentId }
+    });
+
+    if (!attachment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attachment not found'
+      });
+    }
+
+    const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'edit');
+    if (!hasAccess) {
+      return res.status(403).json({
+        message: 'Access denied. You do not have permission to edit attachments for this tenant.',
+        requiredPermission: 'EDIT_TENANT'
+      });
+    }
+
+    if (!name || typeof name !== 'string' || name.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Attachment name is required and must be a non-empty string'
+      });
+    }
+
+    const updatedAttachment = await prisma.attachment.update({
+      where: { id: attachmentId },
+      data: { name: name.trim() }
+    });
+
+    const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
+
+    res.json({
+      success: true,
+      message: 'Attachment updated successfully',
+      data: {
+        ...updatedAttachment,
+        previewUrl: `${baseUrl}/api/tenants/attachments/${updatedAttachment.id}/preview`,
+        downloadUrl: `${baseUrl}/api/tenants/attachments/${updatedAttachment.id}/download`,
+        canEdit: true,
+        canDelete: true,
+        canDownload: true,
+        canPreview: true
+      }
+    });
+  } catch (error) {
+    console.error('Error updating attachment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update attachment',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Delete an attachment - ADMIN ONLY
+// @route   DELETE /api/tenants/attachments/:attachmentId
+// @access  Private
+export const deleteAttachment = async (req, res) => {
+  try {
+    const { attachmentId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    if (!isAdmin(userRole)) {
+      return res.status(403).json({
+        message: 'Access denied. Only admins can delete attachments.',
+        requiredPermission: 'ADMIN'
+      });
+    }
+
+    const attachment = await prisma.attachment.findUnique({
+      where: { id: attachmentId }
+    });
+
+    if (!attachment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attachment not found'
+      });
+    }
+
+    const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'delete');
+    if (!hasAccess) {
+      return res.status(403).json({
+        message: 'Access denied. You do not have permission to delete attachments for this tenant.',
+        requiredPermission: 'DELETE_TENANT'
+      });
+    }
+
+    // Get the filename from the URL or fileName field
+    let fileName = attachment.fileName || attachment.url;
+    if (fileName.includes('/') || fileName.includes('\\')) {
+      fileName = fileName.replace(/\\/g, '/').split('/').pop();
+    }
+    
+    // Delete the file from storage
+    try {
+      const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+      const fullPath = path.resolve(uploadDir, fileName);
+      
+      console.log('Deleting file at:', fullPath);
+      
+      if (fs.existsSync(fullPath)) {
+        fs.unlinkSync(fullPath);
+        console.log('File deleted successfully');
+      } else {
+        console.log('File not found at:', fullPath);
+      }
+    } catch (fsError) {
+      console.error('Error deleting file from filesystem:', fsError);
+      // Continue with database deletion even if file deletion fails
+    }
+
+    await prisma.attachment.delete({
+      where: { id: attachmentId }
+    });
+
+    res.json({
+      success: true,
+      message: 'Attachment deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting attachment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete attachment',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Download an attachment - EVERYONE with view access
+// @route   GET /api/tenants/attachments/:attachmentId/download
+// @access  Private
+export const downloadAttachment = async (req, res) => {
+  try {
+    const { attachmentId } = req.params;
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    const attachment = await prisma.attachment.findUnique({
+      where: { id: attachmentId }
+    });
+
+    if (!attachment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Attachment not found'
+      });
+    }
+
+    // Check if user has view permission for the tenant
+    const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'view');
+    if (!hasAccess) {
+      return res.status(403).json({
+        message: 'Access denied. You do not have permission to download this attachment.',
+        requiredPermission: 'VIEW_TENANT'
+      });
+    }
+
+    // Get the filename from the URL or fileName field
+    let fileName = attachment.fileName || attachment.url;
+    if (fileName.includes('/') || fileName.includes('\\')) {
+      fileName = fileName.replace(/\\/g, '/').split('/').pop();
+    }
+    
+    // Check if file exists
+    const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+    const fullPath = path.resolve(uploadDir, fileName); // Use path.resolve() for absolute path
+    
+    console.log('Download - Looking for file at:', fullPath);
+    
+    if (!fs.existsSync(fullPath)) {
+      console.error('Download - File not found at path:', fullPath);
+      return res.status(404).json({
+        success: false,
+        message: 'File not found on server'
+      });
+    }
+
+    res.download(fullPath, attachment.name);
+  } catch (error) {
+    console.error('Error downloading attachment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to download attachment',
+      error: error.message
+    });
   }
 };

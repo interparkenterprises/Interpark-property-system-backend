@@ -36,6 +36,7 @@ model User {
   activationRequests ActivationRequest[]
   demandLetters      DemandLetter[]
   createdLeads       Lead[]              @relation(name: "CreatedLeads")
+  attachments         Attachment[]
 
   // Manager-User Relations
   createdByManager User?  @relation("ManagerCreatedUsers", fields: [createdByManagerId], references: [id])
@@ -394,7 +395,6 @@ model Tenant {
   fullName            String
   KRAPin              String               @unique
   POBox               String?
-  email               String?              @unique
   paymentPolicy       PaymentPolicy
   escalationFrequency EscalationFrequency?
   escalationRate      Float?
@@ -402,14 +402,16 @@ model Tenant {
   updatedAt           DateTime             @updatedAt
   vatRate             Float?               @default(0)
   vatType             VATType              @default(NOT_APPLICABLE)
+  email               String?              @unique
   bills               Bill[]
   billInvoices        BillInvoice[]
+  demandLetters       DemandLetter[]
   incomes             Income[]
   invoices            Invoice[]
+  attachments         Attachment[]
   paymentReports      PaymentReport[]
   serviceCharge       ServiceCharge?
   unit                Unit                 @relation(fields: [unitId], references: [id])
-  demandLetters       DemandLetter[]
 }
 
 model ServiceCharge {
@@ -757,6 +759,28 @@ model ActivationRequest {
   @@index([managerId])
   @@index([status])
   @@index([startDate])
+}
+
+model Attachment {
+  id           String   @id @default(uuid())
+
+  name         String
+  fileName     String
+  url          String
+  mimeType     String
+  size         Int
+
+  tenantId     String
+  uploadedById String
+
+  uploadedAt   DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant       Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  uploadedBy   User   @relation(fields: [uploadedById], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([uploadedById])
 }
 
 enum ActivationStatus {
