@@ -36,7 +36,7 @@ model User {
   activationRequests ActivationRequest[]
   demandLetters      DemandLetter[]
   createdLeads       Lead[]              @relation(name: "CreatedLeads")
-  attachments         Attachment[]
+  attachments        Attachment[]
 
   // Manager-User Relations
   createdByManager User?  @relation("ManagerCreatedUsers", fields: [createdByManagerId], references: [id])
@@ -54,12 +54,13 @@ model User {
   managedPermissionsBy  ManagedPermission[]        @relation("ManagerPermission")
 
   // NEW: Employee relations
-  employeesCreated       Employee[]      @relation("EmployeeCreator")
-  salaryPaymentsRecorded SalaryPayment[] @relation("PaymentRecorder")
+  employeesCreated           Employee[]                  @relation("EmployeeCreator")
+  salaryPaymentsRecorded     SalaryPayment[]             @relation("PaymentRecorder")
   // NEW: Add these relation fields for task assignments and approvals
-  assignedTasks          ToDo[]          @relation("AssignedTasks")
-  approvedTasks          ToDo[]          @relation("ApprovedTasks")
-  reviewedTasks          ToDo[]          @relation("ReviewedTasks")
+  assignedTasks              ToDo[]                      @relation("AssignedTasks")
+  approvedTasks              ToDo[]                      @relation("ApprovedTasks")
+  reviewedTasks              ToDo[]                      @relation("ReviewedTasks")
+  serviceProviderAttachments ServiceProviderAttachment[]
 }
 
 model Landlord {
@@ -421,8 +422,8 @@ model ServiceCharge {
   fixedAmount Float?
   percentage  Float?
   perSqFtRate Float?            @map("perSqFtRate")
-  vatType     VATType           @default(NOT_APPLICABLE)  // NEW
-  vatRate     Float?            @default(0)               // NEW
+  vatType     VATType           @default(NOT_APPLICABLE) // NEW
+  vatRate     Float?            @default(0) // NEW
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   tenant      Tenant            @relation(fields: [tenantId], references: [id])
@@ -539,6 +540,9 @@ model ServiceProvider {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
   property        Property        @relation(fields: [propertyId], references: [id])
+
+  // NEW: Attachments relation
+  attachments ServiceProviderAttachment[]
 }
 
 model Bill {
@@ -762,25 +766,53 @@ model ActivationRequest {
 }
 
 model Attachment {
-  id           String   @id @default(uuid())
+  id String @id @default(uuid())
 
-  name         String
-  fileName     String
-  url          String
-  mimeType     String
-  size         Int
+  name     String
+  fileName String
+  url      String
+  mimeType String
+  size     Int
 
   tenantId     String
   uploadedById String
 
-  uploadedAt   DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  uploadedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
-  tenant       Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  uploadedBy   User   @relation(fields: [uploadedById], references: [id], onDelete: Cascade)
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  uploadedBy User   @relation(fields: [uploadedById], references: [id], onDelete: Cascade)
 
   @@index([tenantId])
   @@index([uploadedById])
+}
+
+model ServiceProviderAttachment {
+  id                String   @id @default(uuid())
+  serviceProviderId String
+  fileName          String
+  fileUrl           String
+  fileType          String // e.g., "PDF", "DOC", "IMG", "ZIP"
+  fileSize          Int // Size in bytes
+  description       String?
+  uploadedAt        DateTime @default(now())
+  uploadedById      String
+  isActive          Boolean  @default(true)
+
+  // Optional: Add metadata for better tracking
+  category   String? // e.g., "CONTRACT", "CERTIFICATE", "INVOICE", "LICENSE"
+  version    String? // e.g., "v1", "v2"
+  expiryDate DateTime? // If attachment has expiry date (like certificates)
+
+  serviceProvider ServiceProvider @relation(fields: [serviceProviderId], references: [id], onDelete: Cascade)
+  uploadedBy      User            @relation(fields: [uploadedById], references: [id])
+
+  @@unique([serviceProviderId, fileName])
+  @@index([serviceProviderId])
+  @@index([uploadedById])
+  @@index([isActive])
+  @@index([category])
+  @@index([expiryDate])
 }
 
 enum ActivationStatus {
@@ -818,7 +850,7 @@ model ToDo {
   priority    TaskPriority @default(MEDIUM)
   dueDate     DateTime?
   createdAt   DateTime     @default(now())
-  updatedAt   DateTime?     @updatedAt
+  updatedAt   DateTime?    @updatedAt
   completedAt DateTime?
 
   // Task assignment fields
@@ -988,7 +1020,7 @@ enum VATType {
 enum EscalationFrequency {
   ANNUALLY
   BI_ANNUALLY
-  BI_ENNIAL  // NEW: Every two years
+  BI_ENNIAL // NEW: Every two years
 }
 
 enum ServiceChargeType {

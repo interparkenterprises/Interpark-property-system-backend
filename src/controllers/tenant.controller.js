@@ -1237,6 +1237,7 @@ export const updateTenant = async (req, res) => {
       vatRate,
       vatType,
       serviceCharge,
+      unitId, // Allow unit change
     } = req.body;
 
     // Fetch existing tenant
@@ -1244,12 +1245,105 @@ export const updateTenant = async (req, res) => {
       where: { id: req.params.id },
       include: {
         serviceCharge: true,
-        unit: true,
+        unit: {
+          include: {
+            property: true
+          }
+        },
       },
     });
 
     if (!existingTenant) {
       return res.status(404).json({ message: "Tenant not found" });
+    }
+
+    // =============================================
+    // HANDLE UNIT TRANSFER
+    // =============================================
+    let targetUnit = null;
+    let unitPriceWarning = null;
+
+    if (unitId && unitId !== existingTenant.unitId) {
+      // Fetch the target unit with tenant relation
+      targetUnit = await prisma.unit.findUnique({
+        where: { id: unitId },
+        include: {
+          property: true,
+          tenant: true // Include the tenant relation to check if occupied
+        }
+      });
+
+      if (!targetUnit) {
+        return res.status(404).json({ message: "Target unit not found" });
+      }
+
+      // Verify the target unit is in the same property
+      if (targetUnit.propertyId !== existingTenant.unit.propertyId) {
+        return res.status(400).json({
+          message: "Cannot move tenant to a unit in a different property. Please update property separately."
+        });
+      }
+
+      // DEBUG: Log the actual unit status from database
+      console.log('Target Unit Status:', {
+        id: targetUnit.id,
+        status: targetUnit.status,
+        hasTenantRelation: !!targetUnit.tenant,
+        tenantName: targetUnit.tenant?.fullName || 'No tenant'
+      });
+
+      // IMPORTANT: Check if the unit is occupied
+      // A unit is OCCUPIED if status is 'OCCUPIED' OR it has a tenant relation
+      const isUnitOccupied = targetUnit.status === 'OCCUPIED' || targetUnit.tenant !== null;
+      
+      if (isUnitOccupied) {
+        // Provide detailed error message to help debug
+        let detailedMessage = "Target unit is not vacant.";
+        const reasons = [];
+        
+        if (targetUnit.status === 'OCCUPIED') {
+          reasons.push(`Unit status is 'OCCUPIED'`);
+        }
+        if (targetUnit.tenant !== null) {
+          reasons.push(`Unit has tenant: ${targetUnit.tenant.fullName}`);
+        }
+        
+        if (reasons.length > 0) {
+          detailedMessage += ` (${reasons.join(', ')})`;
+        }
+        
+        return res.status(400).json({
+          message: detailedMessage,
+          unitStatus: targetUnit.status,
+          hasTenant: !!targetUnit.tenant,
+          tenantName: targetUnit.tenant?.fullName || null
+        });
+      }
+
+      // Double-check if target unit has any tenant relation (extra safety)
+      const existingTenantInTarget = await prisma.tenant.findFirst({
+        where: { unitId: targetUnit.id }
+      });
+
+      if (existingTenantInTarget) {
+        return res.status(400).json({
+          message: `Target unit is already assigned to another tenant: ${existingTenantInTarget.fullName}`
+        });
+      }
+
+      // Check for unit price difference
+      const currentUnitRent = existingTenant.rent || existingTenant.unit.rentAmount;
+      const newUnitRent = targetUnit.rentAmount;
+
+      if (newUnitRent !== currentUnitRent) {
+        unitPriceWarning = {
+          message: `The rent for the new unit (${newUnitRent}) is different from your current rent (${currentUnitRent}).`,
+          currentRent: currentUnitRent,
+          newRent: newUnitRent,
+          difference: newUnitRent - currentUnitRent,
+          differenceType: newUnitRent > currentUnitRent ? 'increase' : 'decrease'
+        };
+      }
     }
 
     // Check email uniqueness
@@ -1327,15 +1421,46 @@ export const updateTenant = async (req, res) => {
       parsedVatRate = 0;
     }
 
-    // Rent
+    // Determine the final rent value
+    let finalRent = undefined;
     let parsedRent = undefined;
-    if (rent !== undefined) {
+
+    // If unit is being changed, the rent should default to the target unit's rent
+    // UNLESS the user explicitly provides a new rent value in the request
+    if (unitId && unitId !== existingTenant.unitId && targetUnit) {
+      if (rent !== undefined) {
+        // User explicitly provided a rent value, use that
+        parsedRent = parseFloat(rent);
+        if (isNaN(parsedRent) || parsedRent < 0) {
+          return res.status(400).json({
+            message: "Rent must be a positive number",
+          });
+        }
+        finalRent = parsedRent;
+        
+        // Also update the target unit's rent to match if different
+        if (targetUnit.rentAmount !== parsedRent) {
+          await prisma.unit.update({
+            where: { id: targetUnit.id },
+            data: { rentAmount: parsedRent }
+          });
+        }
+      } else {
+        // Use the target unit's rent
+        finalRent = targetUnit.rentAmount;
+      }
+    } else if (rent !== undefined) {
+      // No unit change, but rent is being updated
       parsedRent = parseFloat(rent);
       if (isNaN(parsedRent) || parsedRent < 0) {
         return res.status(400).json({
           message: "Rent must be a positive number",
         });
       }
+      finalRent = parsedRent;
+    } else {
+      // No changes to rent
+      finalRent = existingTenant.rent;
     }
 
     // Build updateData
@@ -1346,7 +1471,7 @@ export const updateTenant = async (req, res) => {
       KRAPin,
       POBox,
       leaseTerm,
-      rent: parsedRent,
+      rent: finalRent,
       escalationRate: escalationRate != null
         ? escalationRate === null
           ? null
@@ -1361,31 +1486,104 @@ export const updateTenant = async (req, res) => {
       vatType: normalizedVatType,
     };
 
+    // If unit is being changed, update the unitId in tenant data
+    if (unitId && unitId !== existingTenant.unitId) {
+      updateData.unitId = unitId;
+    }
+
     // Remove undefined fields
     Object.keys(updateData).forEach((key) => {
       if (updateData[key] === undefined) delete updateData[key];
     });
 
-    // Apply update
-    const updatedTenant = await prisma.tenant.update({
-      where: { id: req.params.id },
-      data: updateData,
-      include: {
-        unit: { include: { property: true } },
-        serviceCharge: true,
-      },
-    });
+    // =============================================
+    // EXECUTE UNIT TRANSFER (with transaction)
+    // =============================================
+    let updatedTenant;
+    let oldUnitId = existingTenant.unitId;
 
-    // Update unit rent if changed
-    if (rent !== undefined && parsedRent !== existingTenant.rent) {
-      await prisma.unit.update({
-        where: { id: existingTenant.unitId },
-        data: { rentAmount: parsedRent },
+    if (unitId && unitId !== existingTenant.unitId && targetUnit) {
+      // Re-check unit status right before the transaction to avoid race conditions
+      const freshTargetUnit = await prisma.unit.findUnique({
+        where: { id: targetUnit.id },
+        include: {
+          tenant: true
+        }
       });
+
+      if (freshTargetUnit) {
+        const isOccupied = freshTargetUnit.status === 'OCCUPIED' || freshTargetUnit.tenant !== null;
+        
+        if (isOccupied) {
+          return res.status(400).json({
+            message: "Target unit is no longer vacant. It may have been occupied during the process.",
+            unitStatus: freshTargetUnit.status,
+            hasTenant: !!freshTargetUnit.tenant,
+            tenantName: freshTargetUnit.tenant?.fullName || null
+          });
+        }
+      }
+
+      // Use a transaction to ensure data consistency
+      updatedTenant = await prisma.$transaction(async (tx) => {
+        // 1. Free up the old unit (set to VACANT)
+        await tx.unit.update({
+          where: { id: oldUnitId },
+          data: { 
+            status: 'VACANT'
+          }
+        });
+
+        // 2. Update the new unit to OCCUPIED
+        await tx.unit.update({
+          where: { id: targetUnit.id },
+          data: { 
+            status: 'OCCUPIED'
+          }
+        });
+
+        // 3. Update the tenant with the new unit and rent
+        const updated = await tx.tenant.update({
+          where: { id: req.params.id },
+          data: updateData,
+          include: {
+            unit: { include: { property: true } },
+            serviceCharge: true,
+          },
+        });
+
+        // 4. If rent is being updated, also update the unit's rent amount
+        if (updateData.rent !== undefined) {
+          await tx.unit.update({
+            where: { id: targetUnit.id },
+            data: { rentAmount: updateData.rent }
+          });
+        }
+
+        return updated;
+      });
+    } else {
+      // Regular update (no unit change)
+      updatedTenant = await prisma.tenant.update({
+        where: { id: req.params.id },
+        data: updateData,
+        include: {
+          unit: { include: { property: true } },
+          serviceCharge: true,
+        },
+      });
+
+      // Update unit rent if changed and no unit change
+      if (rent !== undefined && parsedRent !== existingTenant.rent) {
+        await prisma.unit.update({
+          where: { id: existingTenant.unitId },
+          data: { rentAmount: parsedRent },
+        });
+      }
     }
 
     // =============================================
-    // HANDLE SERVICE CHARGE UPDATE - FIXED VERSION
+    // HANDLE SERVICE CHARGE UPDATE
     // =============================================
     if (serviceCharge !== undefined) {
       // Case 1: serviceCharge is null or explicitly wants to remove it
@@ -1518,7 +1716,29 @@ export const updateTenant = async (req, res) => {
       },
     });
 
-    res.json(finalTenant);
+    // Prepare response with unit transfer information
+    const response = {
+      ...finalTenant,
+      unitTransfer: null
+    };
+
+    if (unitId && unitId !== existingTenant.unitId) {
+      response.unitTransfer = {
+        oldUnitId: oldUnitId,
+        newUnitId: unitId,
+        oldUnitRent: existingTenant.rent || existingTenant.unit.rentAmount,
+        newUnitRent: targetUnit?.rentAmount || finalTenant.rent,
+        status: 'completed',
+        priceWarning: unitPriceWarning
+      };
+    }
+
+    // If there's a price warning, include it prominently
+    if (unitPriceWarning) {
+      response.priceWarning = unitPriceWarning;
+    }
+
+    res.json(response);
   } catch (error) {
     console.error("Update tenant error:", error);
     res.status(500).json({ message: "Server error", error: error.message });
