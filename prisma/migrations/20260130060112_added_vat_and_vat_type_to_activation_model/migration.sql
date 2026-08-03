@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "ActivationRequest" ADD COLUMN     "vat" DOUBLE PRECISION DEFAULT 16,
+ADD COLUMN     "vatType" "VATType" NOT NULL DEFAULT 'NOT_APPLICABLE';
