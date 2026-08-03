@@ -52,3 +52,31 @@ export async function generateBillInvoiceNumber() {
   const sequenceStr = String(sequence).padStart(6, '0');
   return `BILL-INV-${year}${month}-${sequenceStr}`;
 }
+
+// NEW: Generate Other Income Invoice Number
+export async function generateOtherIncomeInvoiceNumber() {
+  const year = new Date().getFullYear();
+  const month = String(new Date().getMonth() + 1).padStart(2, '0');
+  
+  // Find the last other income invoice for this year-month
+  const lastInvoice = await prisma.otherIncome.findFirst({
+    where: {
+      invoiceNumber: {
+        startsWith: `OINV-${year}${month}-`
+      }
+    },
+    orderBy: {
+      invoiceNumber: 'desc'
+    }
+  });
+
+  let sequence = 1;
+  if (lastInvoice) {
+    const parts = lastInvoice.invoiceNumber.split('-');
+    const lastSequence = parseInt(parts[parts.length - 1]);
+    sequence = lastSequence + 1;
+  }
+
+  const sequenceStr = String(sequence).padStart(6, '0');
+  return `OINV-${year}${month}-${sequenceStr}`;
+}

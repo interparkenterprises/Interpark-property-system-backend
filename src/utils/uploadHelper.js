@@ -1,3 +1,4 @@
+
 import { writeFile, mkdir, unlink } from 'fs/promises';
 import { join, dirname, normalize } from 'path';
 import { existsSync } from 'fs';
@@ -20,8 +21,9 @@ export const uploadDocument = async (buffer, filePath) => {
     // Write file
     await writeFile(fullPath, buffer);
 
-    const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
-    const documentUrl = `${baseUrl}/uploads/${filePath}`;
+    // Store only the relative path, not the full URL
+    // This prevents IP address issues
+    const documentUrl = `/uploads/${filePath}`;
 
     return { url: documentUrl, fullPath };
   } catch (error) {

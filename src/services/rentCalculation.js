@@ -361,3 +361,141 @@ export const calculateTotalPayment = (tenant, monthlyRent, paymentPolicy) => {
     paymentPolicy
   };
 };
+
+// =============================================
+// WITHHOLDING TAX FUNCTIONS
+// =============================================
+
+/**
+ * Calculate withholding tax (WHT) on rent
+ * Withholding tax is calculated on the rent amount (excluding VAT)
+ * @param {number} amount - The base amount (rent excluding VAT)
+ * @param {number} withholdingRate - Withholding tax rate as percentage
+ * @param {boolean} isExempt - Whether tenant is exempt from withholding tax
+ * @returns {Object} - Withholding tax details
+ */
+export const calculateWithholdingTax = (amount, withholdingRate, isExempt = false) => {
+  // If exempt or no rate, return zero
+  if (isExempt || !withholdingRate || withholdingRate === 0 || !amount || amount === 0) {
+    return {
+      amount: 0,
+      rate: withholdingRate || 0,
+      taxableAmount: amount,
+      applicable: false,
+      isExempt: isExempt
+    };
+  }
+
+  const whtAmount = (amount * withholdingRate) / 100;
+  
+  return {
+    amount: parseFloat(whtAmount.toFixed(2)),
+    rate: withholdingRate,
+    taxableAmount: amount,
+    applicable: true,
+    isExempt: false
+  };
+};
+
+/**
+ * Calculate withholding VAT (WH VAT)
+ * Withholding VAT is calculated on the VAT amount
+ * @param {number} vatAmount - The VAT amount
+ * @param {number} withholdingVatRate - Withholding VAT rate as percentage
+ * @param {boolean} isExempt - Whether tenant is exempt from withholding VAT
+ * @returns {Object} - Withholding VAT details
+ */
+export const calculateWithholdingVat = (vatAmount, withholdingVatRate, isExempt = false) => {
+  if (isExempt || !withholdingVatRate || withholdingVatRate === 0 || !vatAmount || vatAmount === 0) {
+    return {
+      amount: 0,
+      rate: withholdingVatRate || 0,
+      taxableAmount: vatAmount,
+      applicable: false,
+      isExempt: isExempt
+    };
+  }
+
+  const whVatAmount = (vatAmount * withholdingVatRate) / 100;
+  
+  return {
+    amount: parseFloat(whVatAmount.toFixed(2)),
+    rate: withholdingVatRate,
+    taxableAmount: vatAmount,
+    applicable: true,
+    isExempt: false
+  };
+};
+
+/**
+ * Calculate total payment with withholding taxes
+ * @param {Object} tenant - Tenant object with withholding tax fields
+ * @param {number} monthlyRent - Current monthly rent amount
+ * @param {string} paymentPolicy - MONTHLY, QUARTERLY, or ANNUAL
+ * @returns {Object} - Complete payment breakdown with withholding taxes
+ */
+export const calculateTotalPaymentWithWithholding = (tenant, monthlyRent, paymentPolicy) => {
+  // Get base calculations
+  const basePayment = calculateTotalPayment(tenant, monthlyRent, paymentPolicy);
+  
+  // Get base rent (excluding VAT) for WHT calculation
+  const baseRent = basePayment.rent.baseRent || monthlyRent;
+  const rentPaymentByPolicy = basePayment.rent.paymentByPolicy;
+  const vatOnRent = basePayment.rent.vatAmount;
+  const policyMonths = getPolicyMonths(paymentPolicy);
+  
+  // Calculate withholding tax on rent (based on base rent excluding VAT)
+  const wht = calculateWithholdingTax(
+    baseRent * policyMonths,
+    tenant.withholdingTaxRate || 0,
+    tenant.isWithholdingTaxExempt || false
+  );
+  
+  // Calculate withholding VAT on VAT amount
+  const whVat = calculateWithholdingVat(
+    vatOnRent,
+    tenant.withholdingVatRate || 0,
+    tenant.isWithholdingTaxExempt || false
+  );
+  
+  // Net amounts after withholding
+  const netRent = rentPaymentByPolicy - wht.amount;
+  const netVat = vatOnRent - whVat.amount;
+  const netServiceCharge = basePayment.serviceCharge.totalByPolicy;
+  const netServiceChargeVat = basePayment.serviceCharge.vatAmount;
+  
+  // Total payable (amount tenant actually pays after withholding)
+  const totalPayable = netRent + netVat + netServiceCharge + netServiceChargeVat;
+  
+  // Amounts withheld (to be remitted to tax authorities)
+  const totalWithheld = wht.amount + whVat.amount;
+  
+  return {
+    ...basePayment,
+    withholdingTax: {
+      rent: wht,
+      vat: whVat,
+      totalWithheld: parseFloat(totalWithheld.toFixed(2)),
+      netPayable: parseFloat(totalPayable.toFixed(2)),
+      breakdown: {
+        rentBaseAmount: baseRent * policyMonths,
+        rentVatAmount: vatOnRent,
+        whtRate: tenant.withholdingTaxRate || 0,
+        whVatRate: tenant.withholdingVatRate || 0,
+        isExempt: tenant.isWithholdingTaxExempt || false
+      }
+    }
+  };
+};
+
+/**
+ * Get net payment amount after withholding taxes
+ * @param {Object} tenant - Tenant object
+ * @param {number} monthlyRent - Current monthly rent
+ * @param {string} paymentPolicy - Payment policy
+ * @returns {number} - Net payment amount
+ */
+export const getNetPaymentWithWithholding = (tenant, monthlyRent, paymentPolicy) => {
+  const calculation = calculateTotalPaymentWithWithholding(tenant, monthlyRent, paymentPolicy);
+  return calculation.withholdingTax.netPayable;
+};

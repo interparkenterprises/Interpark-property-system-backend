@@ -98,38 +98,81 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
   let serviceChargeAmount = serviceChargeBase;
 
   if (scVatType === 'EXCLUSIVE') {
-    // EXCLUSIVE: base amount + VAT = total
     vatOnServiceCharge = (serviceChargeBase * scVatRate) / 100;
     serviceChargeExclusive = serviceChargeBase;
     serviceChargeInclusive = serviceChargeBase + vatOnServiceCharge;
-    serviceChargeAmount = serviceChargeInclusive; // FIX: Use inclusive amount
+    serviceChargeAmount = serviceChargeInclusive;
   } else if (scVatType === 'INCLUSIVE') {
-    // INCLUSIVE: the base amount is the INCLUSIVE total
-    // We need to extract VAT from it
     vatOnServiceCharge = (serviceChargeBase * scVatRate) / (100 + scVatRate);
     serviceChargeExclusive = serviceChargeBase - vatOnServiceCharge;
     serviceChargeInclusive = serviceChargeBase;
-    serviceChargeAmount = serviceChargeInclusive; // Already inclusive
+    serviceChargeAmount = serviceChargeInclusive;
   } else {
-    // NOT_APPLICABLE: no VAT
     vatOnServiceCharge = 0;
     serviceChargeExclusive = serviceChargeBase;
     serviceChargeInclusive = serviceChargeBase;
     serviceChargeAmount = serviceChargeBase;
   }
 
-  // Calculate Total Due
-  let totalDue;
+  // =============================================
+  // WITHHOLDING TAX CALCULATIONS
+  // =============================================
+  const isExempt = tenant.isWithholdingTaxExempt || false;
+  const withholdingTaxRate = tenant.withholdingTaxRate || 0;
+  const withholdingVatRate = tenant.withholdingVatRate || 0;
+
+  // Calculate WHT on base rent (excluding VAT)
+  const wht = calculateWithholdingTaxOnAmount(
+    expectedRent, // Use base rent (excluding VAT)
+    withholdingTaxRate,
+    isExempt
+  );
+
+  // Calculate WH VAT on VAT amount
+  const whVat = calculateWithholdingVatOnVat(
+    vatOnRent,
+    withholdingVatRate,
+    isExempt
+  );
+
+  // Calculate Total Due (WITH withholding tax deductions)
+  let totalDueWithoutWithholding;
+  let totalDueWithWithholding;
 
   if (rentVatType === 'EXCLUSIVE') {
     // Rent (exclusive) + VAT on Rent + Service Charge (inclusive of its VAT)
-    totalDue = expectedRent + vatOnRent + serviceChargeAmount;
+    totalDueWithoutWithholding = expectedRent + vatOnRent + serviceChargeAmount;
+    // After withholding: net rent + net VAT + service charge
+    const netRent = expectedRent - wht.amount;
+    const netVat = vatOnRent - whVat.amount;
+    totalDueWithWithholding = netRent + netVat + serviceChargeAmount;
   } else if (rentVatType === 'INCLUSIVE') {
     // Rent (inclusive) + Service Charge (inclusive of its VAT)
-    totalDue = expectedRent + serviceChargeAmount;
+    // For inclusive VAT, WHT is calculated on the base rent (excluding VAT)
+    const baseRentForWHT = getBaseRent(expectedRent, rentVatType, rentVatRate);
+    const whtInclusive = calculateWithholdingTaxOnAmount(
+      baseRentForWHT,
+      withholdingTaxRate,
+      isExempt
+    );
+    const whVatInclusive = calculateWithholdingVatOnVat(
+      vatOnRent,
+      withholdingVatRate,
+      isExempt
+    );
+    totalDueWithoutWithholding = expectedRent + serviceChargeAmount;
+    const netRent = expectedRent - whtInclusive.amount;
+    const netVat = vatOnRent - whVatInclusive.amount;
+    totalDueWithWithholding = netRent + netVat + serviceChargeAmount;
   } else {
     // NOT_APPLICABLE: rent + service charge
-    totalDue = expectedRent + serviceChargeBase;
+    totalDueWithoutWithholding = expectedRent + serviceChargeBase;
+    const whtNoVat = calculateWithholdingTaxOnAmount(
+      expectedRent,
+      withholdingTaxRate,
+      isExempt
+    );
+    totalDueWithWithholding = (expectedRent - whtNoVat.amount) + serviceChargeBase;
   }
 
   const totalVat = vatOnRent + vatOnServiceCharge;
@@ -163,10 +206,26 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
       hasRentVat: rentVatType !== 'NOT_APPLICABLE' && rentVatRate > 0,
       hasServiceChargeVat: scVatType !== 'NOT_APPLICABLE' && scVatRate > 0
     },
-    totalDue: parseFloat(totalDue.toFixed(2)),
+    totalDue: parseFloat(totalDueWithWithholding.toFixed(2)),
+    totalDueWithoutWithholding: parseFloat(totalDueWithoutWithholding.toFixed(2)),
+    withholdingTax: {
+      rent: {
+        amount: wht.amount,
+        rate: wht.rate,
+        applicable: wht.applicable,
+        isExempt: wht.isExempt
+      },
+      vat: {
+        amount: whVat.amount,
+        rate: whVat.rate,
+        applicable: whVat.applicable,
+        isExempt: whVat.isExempt
+      },
+      totalWithheld: parseFloat((wht.amount + whVat.amount).toFixed(2)),
+      isExempt: isExempt
+    },
     periodStart: periodStartOfMonth,
     periodEnd: periodEndOfMonth,
-    // Add calculation summary for verification
     calculationSummary: {
       rentAmount: parseFloat(expectedRent.toFixed(2)),
       baseRentUsed: parseFloat(baseRent.toFixed(2)),
@@ -175,7 +234,11 @@ async function computeExpectedCharges(tenantId, periodStart = null) {
       vatOnRent: parseFloat(vatOnRent.toFixed(2)),
       vatOnServiceCharge: parseFloat(vatOnServiceCharge.toFixed(2)),
       totalVat: parseFloat(totalVat.toFixed(2)),
-      totalDue: parseFloat(totalDue.toFixed(2))
+      totalDue: parseFloat(totalDueWithWithholding.toFixed(2)),
+      totalDueWithoutWithholding: parseFloat(totalDueWithoutWithholding.toFixed(2)),
+      withholdingTaxRate: withholdingTaxRate,
+      withholdingVatRate: withholdingVatRate,
+      isExempt: isExempt
     }
   };
 }
@@ -209,6 +272,10 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
   let serviceChargeVat = 0;
   let totalVat = 0;
   let totalDue = 0;
+  let totalDueWithoutWithholding = 0;
+  let totalWithholdingTax = 0;
+  let totalWithholdingVat = 0;
+  let totalWithheld = 0;
   const monthlyBreakdown = [];
 
   let rentVatType = 'NOT_APPLICABLE';
@@ -217,6 +284,9 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
   let scVatRate = 0;
   let scType = null;
   let scPercentage = null;
+  let isExempt = false;
+  let whtRate = 0;
+  let whVatRate = 0;
 
   for (let i = 0; i < periodMonths; i++) {
     const monthDate = new Date(normalizedStart.getFullYear(), normalizedStart.getMonth() + i, 1);
@@ -230,6 +300,10 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
     serviceChargeVat += monthly.serviceCharge.vatAmount;
     totalVat += monthly.vat.total;
     totalDue += monthly.totalDue;
+    totalDueWithoutWithholding += monthly.totalDueWithoutWithholding || monthly.totalDue;
+    totalWithholdingTax += monthly.withholdingTax?.rent?.amount || 0;
+    totalWithholdingVat += monthly.withholdingTax?.vat?.amount || 0;
+    totalWithheld += monthly.withholdingTax?.totalWithheld || 0;
 
     // Capture metadata from first month
     if (i === 0) {
@@ -239,6 +313,9 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
       scVatRate = monthly.serviceCharge.vatRate;
       scType = monthly.serviceCharge.type;
       scPercentage = monthly.serviceCharge.percentage;
+      isExempt = monthly.withholdingTax?.isExempt || false;
+      whtRate = monthly.withholdingTax?.rent?.rate || 0;
+      whVatRate = monthly.withholdingTax?.vat?.rate || 0;
     }
 
     monthlyBreakdown.push({
@@ -263,7 +340,9 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
         hasRentVat: monthly.vat.hasRentVat,
         hasServiceChargeVat: monthly.vat.hasServiceChargeVat
       },
-      totalDue: monthly.totalDue
+      withholdingTax: monthly.withholdingTax,
+      totalDue: monthly.totalDue,
+      totalDueWithoutWithholding: monthly.totalDueWithoutWithholding || monthly.totalDue
     });
   }
 
@@ -277,7 +356,6 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
     periodEnd,
     paymentPeriodLabel: formatPaymentPeriodLabel(normalizedStart, periodEnd, paymentPolicy),
     monthlyEquivalent: parseFloat((totalDue / periodMonthsNum).toFixed(2)),
-    // Rent summary
     rent: {
       amount: parseFloat(rentAmount.toFixed(2)),
       monthly: parseFloat((rentAmount / periodMonthsNum).toFixed(2)),
@@ -287,13 +365,12 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
       monthlyVat: parseFloat((rentVat / periodMonthsNum).toFixed(2)),
       totalWithVat: parseFloat((rentAmount + rentVat).toFixed(2))
     },
-    // Service Charge summary with clear VAT distinction
     serviceCharge: {
-      amount: parseFloat(serviceChargeAmount.toFixed(2)), // Base amount
+      amount: parseFloat(serviceChargeAmount.toFixed(2)),
       monthly: parseFloat((serviceChargeAmount / periodMonthsNum).toFixed(2)),
-      exclusiveAmount: parseFloat(serviceChargeExclusive.toFixed(2)), // Exclusive of VAT
+      exclusiveAmount: parseFloat(serviceChargeExclusive.toFixed(2)),
       monthlyExclusive: parseFloat((serviceChargeExclusive / periodMonthsNum).toFixed(2)),
-      inclusiveAmount: parseFloat(serviceChargeInclusive.toFixed(2)), // Inclusive of VAT
+      inclusiveAmount: parseFloat(serviceChargeInclusive.toFixed(2)),
       monthlyInclusive: parseFloat((serviceChargeInclusive / periodMonthsNum).toFixed(2)),
       vatType: scVatType,
       vatRate: scVatRate,
@@ -303,7 +380,6 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
       type: scType,
       percentage: scPercentage
     },
-    // VAT breakdown - clear distinction between rent and service charge
     vat: {
       total: parseFloat(totalVat.toFixed(2)),
       monthlyTotal: parseFloat((totalVat / periodMonthsNum).toFixed(2)),
@@ -322,8 +398,68 @@ async function computeExpectedChargesForPolicy(tenantId, periodStart = null, pay
         hasVat: scVatType !== 'NOT_APPLICABLE' && scVatRate > 0
       }
     },
+    withholdingTax: {
+      rent: {
+        amount: parseFloat(totalWithholdingTax.toFixed(2)),
+        monthly: parseFloat((totalWithholdingTax / periodMonthsNum).toFixed(2)),
+        rate: whtRate,
+        applicable: whtRate > 0 && !isExempt
+      },
+      vat: {
+        amount: parseFloat(totalWithholdingVat.toFixed(2)),
+        monthly: parseFloat((totalWithholdingVat / periodMonthsNum).toFixed(2)),
+        rate: whVatRate,
+        applicable: whVatRate > 0 && !isExempt
+      },
+      totalWithheld: parseFloat(totalWithheld.toFixed(2)),
+      monthlyWithheld: parseFloat((totalWithheld / periodMonthsNum).toFixed(2)),
+      isExempt: isExempt
+    },
     totalDue: parseFloat(totalDue.toFixed(2)),
+    totalDueWithoutWithholding: parseFloat(totalDueWithoutWithholding.toFixed(2)),
     monthlyBreakdown
+  };
+}
+
+// Helper: Calculate withholding tax on a given amount
+function calculateWithholdingTaxOnAmount(baseAmount, withholdingRate, isExempt = false) {
+  if (isExempt || !withholdingRate || withholdingRate === 0 || !baseAmount || baseAmount === 0) {
+    return {
+      amount: 0,
+      rate: withholdingRate || 0,
+      applicable: false,
+      isExempt
+    };
+  }
+
+  const whtAmount = (baseAmount * withholdingRate) / 100;
+  
+  return {
+    amount: parseFloat(whtAmount.toFixed(2)),
+    rate: withholdingRate,
+    applicable: true,
+    isExempt
+  };
+}
+
+// Helper: Calculate withholding VAT on VAT amount
+function calculateWithholdingVatOnVat(vatAmount, withholdingVatRate, isExempt = false) {
+  if (isExempt || !withholdingVatRate || withholdingVatRate === 0 || !vatAmount || vatAmount === 0) {
+    return {
+      amount: 0,
+      rate: withholdingVatRate || 0,
+      applicable: false,
+      isExempt
+    };
+  }
+
+  const whVatAmount = (vatAmount * withholdingVatRate) / 100;
+  
+  return {
+    amount: parseFloat(whVatAmount.toFixed(2)),
+    rate: withholdingVatRate,
+    applicable: true,
+    isExempt
   };
 }
 
@@ -1093,7 +1229,7 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         },
         paymentReports: {
           where: {
-            status: { notIn: ['PREPAID'] }  // Include CREDIT reports
+            status: { notIn: ['PREPAID'] }
           },
           select: {
             amountPaid: true,
@@ -1178,6 +1314,18 @@ export const getPropertyRentPaymentReport = async (req, res) => {
     let unpaidCount = 0;
     let creditCount = 0;
 
+    // Helper function to safely get period key from a date
+    const getPeriodKey = (date) => {
+      if (!date) return null;
+      try {
+        const d = typeof date === 'string' ? new Date(date) : date;
+        if (isNaN(d.getTime())) return null;
+        return d.toISOString().slice(0, 7);
+      } catch (e) {
+        return null;
+      }
+    };
+
     // Process tenants with both paymentReports AND invoices
     for (const tenant of tenants) {
       const tenantReports = tenant.paymentReports || [];
@@ -1186,49 +1334,121 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       // Calculate paid amount from reports (including CREDIT reports)
       let tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
       
-      // Calculate expected amount from reports
-      let tenantExpected = tenantReports.reduce((sum, report) => {
-        if (report.status === 'CREDIT') {
-          return sum; // We'll handle CREDIT separately
-        }
-        return sum + report.totalDue;
-      }, 0);
-      
       // Calculate arrears from reports (CREDIT = negative)
       let tenantArrearsFromReports = 0;
       for (const report of tenantReports) {
         if (report.status === 'CREDIT') {
-          // CREDIT reduces arrears (overpayment)
           tenantArrearsFromReports -= report.amountPaid;
         } else {
           tenantArrearsFromReports += report.arrears;
         }
       }
       
-      const invoiceTotalDue = tenantInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
       const invoiceTotalPaid = tenantInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
       const invoiceTotalBalance = tenantInvoices.reduce((sum, inv) => sum + inv.balance, 0);
       
-      // Calculate total due (combine invoices and reports)
-      let totalDue = invoiceTotalDue;
-      // Add report totals (excluding CREDIT reports)
+      // =============================================
+      // FIX: Calculate total due by unique periods
+      // =============================================
+      let totalDue = 0;
+      
+      // Get all unique periods from both invoices and reports
+      const allPeriods = new Set();
+      
+      // Add invoice periods
+      for (const inv of tenantInvoices) {
+        const periodKey = getPeriodKey(inv.paymentPeriod);
+        if (periodKey) allPeriods.add(periodKey);
+      }
+      
+      // Add report periods
       for (const report of tenantReports) {
-        if (report.status !== 'CREDIT') {
-          totalDue += report.totalDue;
+        const periodKey = getPeriodKey(report.paymentPeriod);
+        if (periodKey) allPeriods.add(periodKey);
+      }
+      
+      // For each unique period, get the expected amount
+      for (const periodKey of allPeriods) {
+        let periodExpected = 0;
+        
+        // Check if there's an invoice for this period
+        const invoiceForPeriod = tenantInvoices.find(inv => {
+          const invPeriod = getPeriodKey(inv.paymentPeriod);
+          return invPeriod === periodKey;
+        });
+        
+        if (invoiceForPeriod) {
+          // Use invoice total due if available
+          periodExpected = invoiceForPeriod.totalDue;
+        } else {
+          // Otherwise, use report total due (excluding CREDIT)
+          const reportForPeriod = tenantReports.find(report => {
+            const reportPeriod = getPeriodKey(report.paymentPeriod);
+            return reportPeriod === periodKey && report.status !== 'CREDIT';
+          });
+          if (reportForPeriod) {
+            periodExpected = reportForPeriod.totalDue;
+          }
         }
+        
+        totalDue += periodExpected;
       }
       
       // Calculate total paid
       const totalPaid = tenantPaid + invoiceTotalPaid;
       
       // Calculate total arrears (negative for credit)
-      let totalArrearsForTenant = invoiceTotalBalance + tenantArrearsFromReports;
+      let totalArrearsForTenant = 0;
+      
+      // Get all unique periods for arrears calculation
+      const allArrearsPeriods = new Set();
+      
+      for (const inv of tenantInvoices) {
+        const periodKey = getPeriodKey(inv.paymentPeriod);
+        if (periodKey) allArrearsPeriods.add(periodKey);
+      }
+      
+      for (const report of tenantReports) {
+        const periodKey = getPeriodKey(report.paymentPeriod);
+        if (periodKey) allArrearsPeriods.add(periodKey);
+      }
+      
+      // For each unique period, get the arrears
+      for (const periodKey of allArrearsPeriods) {
+        let periodArrears = 0;
+        
+        // Check if there's an invoice for this period
+        const invoiceForPeriod = tenantInvoices.find(inv => {
+          const invPeriod = getPeriodKey(inv.paymentPeriod);
+          return invPeriod === periodKey;
+        });
+        
+        if (invoiceForPeriod) {
+          // Use invoice balance if available
+          periodArrears = invoiceForPeriod.balance;
+        } else {
+          // Otherwise, use report arrears
+          const reportForPeriod = tenantReports.find(report => {
+            const reportPeriod = getPeriodKey(report.paymentPeriod);
+            return reportPeriod === periodKey;
+          });
+          if (reportForPeriod) {
+            if (reportForPeriod.status === 'CREDIT') {
+              periodArrears = -reportForPeriod.amountPaid;
+            } else {
+              periodArrears = reportForPeriod.arrears;
+            }
+          }
+        }
+        
+        totalArrearsForTenant += periodArrears;
+      }
       
       // If there are only CREDIT reports and no invoices, arrears should be negative
       if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
         const totalCredit = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0);
         totalArrearsForTenant = -totalCredit;
-        totalDue = 0; // No actual due amount
+        totalDue = 0;
       }
       
       totalRentCollected += totalPaid;
@@ -1252,10 +1472,6 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       
       const hasPartialPaymentReports = tenantReports.some(report => 
         report.status === 'PARTIAL'
-      );
-      
-      const hasCreditReports = tenantReports.some(report => 
-        report.status === 'CREDIT'
       );
       
       // Only CREDIT reports with no invoices
@@ -1308,8 +1524,6 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       let arrearsAmount = report.arrears;
       
       if (report.status === 'CREDIT') {
-        // For CREDIT: expected is 0 in the report, but we should show it as 0
-        // The arrears should be negative (overpayment)
         expectedAmount = 0;
         arrearsAmount = -report.amountPaid;
       }
@@ -1320,34 +1534,97 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       monthlyTrends[monthKey].reportCount++;
     });
 
-    // Include ALL tenants with outstanding balances or credits
+    // =============================================
+    // FIX: Calculate tenant outstanding using unique periods
+    // =============================================
     const tenantOutstanding = tenants.map(tenant => {
       const tenantReports = tenant.paymentReports || [];
       const tenantInvoices = tenant.invoices || [];
       
-      // Calculate total due
-      let totalDue = tenantInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
+      // Calculate total due by unique periods
+      let totalDue = 0;
+      
+      // Get all unique periods from both invoices and reports
+      const allPeriods = new Set();
+      
+      for (const inv of tenantInvoices) {
+        const periodKey = getPeriodKey(inv.paymentPeriod);
+        if (periodKey) allPeriods.add(periodKey);
+      }
+      
       for (const report of tenantReports) {
-        if (report.status !== 'CREDIT') {
-          totalDue += report.totalDue;
+        const periodKey = getPeriodKey(report.paymentPeriod);
+        if (periodKey) allPeriods.add(periodKey);
+      }
+      
+      // For each unique period, get the expected amount
+      for (const periodKey of allPeriods) {
+        let periodExpected = 0;
+        
+        const invoiceForPeriod = tenantInvoices.find(inv => {
+          const invPeriod = getPeriodKey(inv.paymentPeriod);
+          return invPeriod === periodKey;
+        });
+        
+        if (invoiceForPeriod) {
+          periodExpected = invoiceForPeriod.totalDue;
+        } else {
+          const reportForPeriod = tenantReports.find(report => {
+            const reportPeriod = getPeriodKey(report.paymentPeriod);
+            return reportPeriod === periodKey && report.status !== 'CREDIT';
+          });
+          if (reportForPeriod) {
+            periodExpected = reportForPeriod.totalDue;
+          }
         }
+        
+        totalDue += periodExpected;
       }
       
       // Calculate total paid
       const totalPaid = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0) +
                         tenantInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
       
-      // Calculate arrears properly
-      let totalArrears = tenantInvoices.reduce((sum, inv) => sum + inv.balance, 0);
+      // Calculate total arrears by unique periods
+      let totalArrears = 0;
       
-      // Add payment report adjustments
+      const allArrearsPeriods = new Set();
+      
+      for (const inv of tenantInvoices) {
+        const periodKey = getPeriodKey(inv.paymentPeriod);
+        if (periodKey) allArrearsPeriods.add(periodKey);
+      }
+      
       for (const report of tenantReports) {
-        if (report.status === 'CREDIT') {
-          // CREDIT reduces arrears (negative)
-          totalArrears -= report.amountPaid;
+        const periodKey = getPeriodKey(report.paymentPeriod);
+        if (periodKey) allArrearsPeriods.add(periodKey);
+      }
+      
+      for (const periodKey of allArrearsPeriods) {
+        let periodArrears = 0;
+        
+        const invoiceForPeriod = tenantInvoices.find(inv => {
+          const invPeriod = getPeriodKey(inv.paymentPeriod);
+          return invPeriod === periodKey;
+        });
+        
+        if (invoiceForPeriod) {
+          periodArrears = invoiceForPeriod.balance;
         } else {
-          totalArrears += report.arrears;
+          const reportForPeriod = tenantReports.find(report => {
+            const reportPeriod = getPeriodKey(report.paymentPeriod);
+            return reportPeriod === periodKey;
+          });
+          if (reportForPeriod) {
+            if (reportForPeriod.status === 'CREDIT') {
+              periodArrears = -reportForPeriod.amountPaid;
+            } else {
+              periodArrears = reportForPeriod.arrears;
+            }
+          }
         }
+        
+        totalArrears += periodArrears;
       }
       
       // If only CREDIT reports exist, arrears should be negative
@@ -1362,7 +1639,6 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       const hasPartialInvoice = tenantInvoices.some(inv => inv.status === 'PARTIAL');
       const latestReport = tenantReports[0];
       
-      // Check if all reports are CREDIT
       if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
         status = 'CREDIT';
       } else if (hasUnpaidInvoice) {
@@ -1379,7 +1655,6 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       const hasUnpaidStatus = status === 'UNPAID' || status === 'PARTIAL';
       const hasCredit = totalArrears < 0 || status === 'CREDIT';
       
-      // Include if: has outstanding balance OR is unpaid/partial OR has credit
       if (hasOutstanding || hasUnpaidStatus || hasCredit || tenantReports.length > 0) {
         return {
           tenantId: tenant.id,
@@ -1411,37 +1686,19 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       let arrears = report.arrears;
       let correctedAmountPaid = report.amountPaid;
       
-      // For CREDIT reports, we need to handle them differently
       if (report.status === 'CREDIT') {
         try {
-          // Get the tenant's actual expected charges for this period
           const tenant = report.tenant;
-          
-          // Use the paymentPeriod from the report
           const periodDate = new Date(report.paymentPeriod);
+          const rentAmount = tenant.rent || 0;
+          const serviceCharge = tenant.serviceCharge || 0;
+          const totalExpected = rentAmount + serviceCharge;
           
-          // Calculate expected charges for this period
-          const expected = await computeExpectedChargesForPolicy(
-            report.tenantId,
-            periodDate,
-            tenant.paymentPolicy || 'MONTHLY'
-          );
-          
-          expectedAmount = expected.totalDue;
-          
-          // For CREDIT: The amountPaid in the report is just the overpayment amount
-          // We need to add the expected amount to get the total amount paid
-          // The total amount paid = expectedAmount + overpaymentAmount
+          expectedAmount = totalExpected;
           correctedAmountPaid = expectedAmount + report.amountPaid;
-          
-          // arrears should be negative (overpayment)
-          // arrears = expectedAmount - totalPaid = -overpaymentAmount
           arrears = parseFloat((expectedAmount - correctedAmountPaid).toFixed(2));
-          
-          console.log(`CREDIT report ${report.id}: Expected ${expectedAmount}, Overpayment ${report.amountPaid}, Total Paid ${correctedAmountPaid}, Arrears ${arrears} (negative = overpayment) for tenant ${tenant.fullName}`);
         } catch (error) {
           console.error(`Error calculating expected amount for CREDIT report ${report.id}:`, error);
-          // Fallback: use the report's totalDue (which is 0 for CREDIT)
           expectedAmount = report.totalDue;
           correctedAmountPaid = report.amountPaid;
           arrears = parseFloat((-report.amountPaid).toFixed(2));
@@ -1517,7 +1774,6 @@ export const getPropertyRentPaymentReport = async (req, res) => {
     });
   }
 };
-
 // @desc    Get payment report for a whole property (Bills - Water & Electricity)
 // @route   GET /api/payments/property/:propertyId/bills-report
 // @access  Private
@@ -2101,6 +2357,9 @@ export const createPaymentReport = async (req, res) => {
       
       if (invoicesToProcess.length === 0) {
         if (createMissingInvoices) {
+          // =============================================
+          // FIXED: Use computeExpectedChargesForPolicy which now includes withholding tax
+          // =============================================
           const expected = await computeExpectedChargesForPolicy(
             tenantId,
             paymentPeriodDate,
@@ -2109,9 +2368,7 @@ export const createPaymentReport = async (req, res) => {
           
           const invoiceNumber = await generateInvoiceNumber();
           
-          // =============================================
-          // FIXED: Extract numeric values from the expected object
-          // =============================================
+          // Extract values - now using totalDue (WITH withholding tax)
           const rentAmount = typeof expected.rent === 'object' 
             ? expected.rent.amount || expected.rent.monthly || 0
             : expected.rent || 0;
@@ -2124,7 +2381,10 @@ export const createPaymentReport = async (req, res) => {
             ? expected.vat.total || expected.vat.monthlyTotal || 0
             : expected.vat || 0;
           
+          // CRITICAL: Use totalDue (WITH withholding tax) for the invoice
           const totalDueAmount = expected.totalDue || 0;
+          const totalDueWithoutWithholding = expected.totalDueWithoutWithholding || totalDueAmount;
+          const totalWithheld = expected.withholdingTax?.totalWithheld || 0;
           
           const newInvoice = await prisma.invoice.create({
             data: {
@@ -2136,19 +2396,23 @@ export const createPaymentReport = async (req, res) => {
               rent: rentAmount,
               serviceCharge: serviceChargeAmount,
               vat: vatAmount,
-              totalDue: totalDueAmount,
+              totalDue: totalDueAmount, // Already includes withholding tax deduction
               amountPaid: 0,
               balance: totalDueAmount,
               status: 'UNPAID',
               paymentPolicy: tenant.paymentPolicy || 'MONTHLY',
-              notes: `Auto-generated ${(tenant.paymentPolicy || 'MONTHLY')} invoice for payment recording. Monthly equivalent: Ksh ${expected.monthlyEquivalent?.toFixed(2) || totalDueAmount.toFixed(2)}`
+              notes: `Auto-generated ${(tenant.paymentPolicy || 'MONTHLY')} invoice. ` +
+                     `Original amount without withholding: ${totalDueWithoutWithholding.toFixed(2)}, ` +
+                     `Withholding tax: ${totalWithheld.toFixed(2)}. ` +
+                     `Monthly equivalent: ${expected.monthlyEquivalent?.toFixed(2) || totalDueAmount.toFixed(2)}` +
+                     (expected.withholdingTax?.isExempt ? ' (Tenant exempt from withholding tax)' : '')
             }
           });
           
           invoicesToProcess = [newInvoice];
           totalInvoiceBalance = totalDueAmount;
           paymentPeriodStr = newInvoice.paymentPeriod;
-          console.log(`Created new ${tenant.paymentPolicy || 'MONTHLY'} invoice for payment: ${newInvoice.invoiceNumber}`);
+          console.log(`Created new ${tenant.paymentPolicy || 'MONTHLY'} invoice for payment: ${newInvoice.invoiceNumber} (With withholding tax: ${totalDueAmount})`);
         } else {
           return res.status(400).json({
             success: false,
@@ -2226,7 +2490,7 @@ export const createPaymentReport = async (req, res) => {
       if (overpaymentAmount > 0) paymentNotes.push(`Overpayment: Ksh ${overpaymentAmount.toFixed(2)}`);
 
       // =============================================
-      // FIXED: Calculate totals as numbers
+      // Calculate totals from invoices
       // =============================================
       const totalRent = invoicesToProcess.reduce((sum, inv) => {
         const rentValue = typeof inv.rent === 'number' ? inv.rent : 0;
@@ -2373,6 +2637,7 @@ export const createPaymentReport = async (req, res) => {
         }
 
         if (remainingOverpayment > 0) {
+          // Use the withholding tax adjusted charges for future periods
           const currentPolicyCharges = await computeExpectedChargesForPolicy(
             tenantId,
             paymentPeriodDate || new Date(),
@@ -2381,7 +2646,7 @@ export const createPaymentReport = async (req, res) => {
 
           const { periods, remainder } = calculateCoveredBillingPeriods(
             remainingOverpayment,
-            currentPolicyCharges.totalDue
+            currentPolicyCharges.totalDue // This already includes withholding tax
           );
           
           let futureDate = new Date(
@@ -2400,13 +2665,15 @@ export const createPaymentReport = async (req, res) => {
                 rent: expected.rent.amount || expected.rent || 0,
                 serviceCharge: expected.serviceCharge.amount || expected.serviceCharge || 0,
                 vat: expected.vat.total || expected.vat || 0,
-                totalDue: expected.totalDue,
+                totalDue: expected.totalDue, // WITH withholding tax
                 amountPaid: 0,
                 arrears: 0,
                 status: 'PREPAID',
                 paymentPeriod: expected.periodStart,
                 datePaid: new Date(),
-                notes: `Covered by overpayment from ${paymentPeriodStr}. Prepaid ${paymentPolicy} period: ${expected.paymentPeriodLabel}. Original payment: ${parsedAmountPaid}`
+                notes: `Covered by overpayment from ${paymentPeriodStr}. Prepaid ${paymentPolicy} period: ${expected.paymentPeriodLabel}. ` +
+                       `Original payment: ${parsedAmountPaid}. ` +
+                       `Withholding tax applied: ${expected.withholdingTax?.totalWithheld?.toFixed(2) || '0.00'}`
               }
             });
             
@@ -2937,7 +3204,22 @@ export const previewPayment = async (req, res) => {
         ...preview,
         existingCredit: creditBalance,
         netDueAfterCredit: Math.max(0, parseFloat((preview.totalDue - creditBalance).toFixed(2))),
-        totalAvailable: parseFloat((preview.totalDue + creditBalance).toFixed(2))
+        totalAvailable: parseFloat((preview.totalDue + creditBalance).toFixed(2)),
+        // Include withholding tax summary
+        withholdingTaxSummary: {
+          totalWithheld: preview.withholdingTax?.totalWithheld || 0,
+          monthlyWithheld: preview.withholdingTax?.monthlyWithheld || 0,
+          isExempt: preview.withholdingTax?.isExempt || false,
+          rentRate: preview.withholdingTax?.rent?.rate || 0,
+          vatRate: preview.withholdingTax?.vat?.rate || 0,
+          rentWithheld: preview.withholdingTax?.rent?.amount || 0,
+          vatWithheld: preview.withholdingTax?.vat?.amount || 0,
+          note: preview.withholdingTax?.isExempt 
+            ? 'Tenant is exempt from withholding tax' 
+            : preview.withholdingTax?.rent?.rate > 0 || preview.withholdingTax?.vat?.rate > 0
+              ? 'Withholding tax applied to this payment'
+              : 'No withholding tax configured'
+        }
       }
     });
   } catch (error) {

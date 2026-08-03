@@ -61,6 +61,11 @@ model User {
   approvedTasks              ToDo[]                      @relation("ApprovedTasks")
   reviewedTasks              ToDo[]                      @relation("ReviewedTasks")
   serviceProviderAttachments ServiceProviderAttachment[]
+
+    // NEW: Other Income Relations - ADD THESE LINES
+  otherIncomesCreated        OtherIncome[]               @relation("OtherIncomeCreator")
+  otherIncomesManaged        OtherIncome[]               @relation("OtherIncomeManager")
+  otherIncomeAttachments     OtherIncomeAttachment[]     @relation("OtherIncomeAttachmentUploader")
 }
 
 model Landlord {
@@ -404,6 +409,11 @@ model Tenant {
   vatRate             Float?               @default(0)
   vatType             VATType              @default(NOT_APPLICABLE)
   email               String?              @unique
+  // ========== WITHHOLDING TAX FIELDS ==========
+  withholdingTaxRate     Float?   @default(0)  // Percentage (e.g., 5 for 5%)
+  withholdingVatRate     Float?   @default(0)  // Percentage (e.g., 2 for 2%)
+  isWithholdingTaxExempt Boolean  @default(false) // Exempt from withholding tax
+  // ============================================
   bills               Bill[]
   billInvoices        BillInvoice[]
   demandLetters       DemandLetter[]
@@ -459,6 +469,105 @@ model Income {
   createdAt  DateTime        @default(now())
   property   Property?       @relation(fields: [propertyId], references: [id])
   tenant     Tenant?         @relation(fields: [tenantId], references: [id])
+}
+
+// ============== OTHER INCOME MODELS ==============
+
+model OtherIncome {
+  id           String              @id @default(uuid())
+  invoiceNumber String             @unique
+  title        String              // e.g., "Consultancy Services - XYZ Property Valuation"
+  description  String?             // Detailed description of the service
+  amount       Float               // Base amount
+  vatRate      Float?              // VAT percentage (e.g., 16)
+  vatAmount    Float?              // Calculated VAT amount
+  vatType      VATType             @default(NOT_APPLICABLE) // INCLUSIVE, EXCLUSIVE, NOT_APPLICABLE
+  totalAmount  Float               // Amount + VAT (if applicable)
+  
+  // Income categorization
+  category     OtherIncomeCategory @default(CONSULTANCY)
+  subCategory  String?             // Custom sub-category
+  
+  // Client information
+  clientName   String
+  clientEmail  String?
+  clientPhone  String?
+  clientAddress String?
+  clientCompany String?
+  
+  // Invoice details
+  issueDate    DateTime            @default(now())
+  dueDate      DateTime?
+  status       InvoiceStatus       @default(UNPAID)
+  paidDate     DateTime?
+  
+  // Payment details
+  paymentMethod String?            // e.g., "BANK_TRANSFER", "MPESA"
+  transactionRef String?
+  
+  // Bank details for payment
+  bankName      String?
+  accountName   String?
+  accountNumber String?
+  branch        String?
+  bankCode      String?
+  swiftCode     String?
+  currency      String             @default("KES")
+  
+  // Manager/User association - FIX THE RELATION NAMES
+  managerId    String              // User who manages/owns this income
+  manager      User                @relation("OtherIncomeManager", fields: [managerId], references: [id])
+  
+  // File attachments
+  pdfUrl       String?             // Generated PDF invoice URL
+  attachments  OtherIncomeAttachment[]
+  
+  // Audit fields
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  createdById  String
+  createdBy    User                @relation("OtherIncomeCreator", fields: [createdById], references: [id])
+
+  @@index([managerId])
+  @@index([status])
+  @@index([category])
+  @@index([issueDate])
+  @@index([invoiceNumber])
+  @@index([clientName])
+  @@index([createdById])
+}
+
+model OtherIncomeAttachment {
+  id             String   @id @default(uuid())
+  otherIncomeId  String
+  fileName       String
+  fileUrl        String
+  fileType       String   // e.g., "PDF", "DOC", "IMG"
+  fileSize       Int      // Size in bytes
+  description    String?
+  uploadedAt     DateTime @default(now())
+  uploadedById   String
+  isActive       Boolean  @default(true)
+
+  otherIncome    OtherIncome @relation(fields: [otherIncomeId], references: [id], onDelete: Cascade)
+  uploadedBy     User        @relation("OtherIncomeAttachmentUploader", fields: [uploadedById], references: [id])
+
+  @@index([otherIncomeId])
+  @@index([uploadedById])
+  @@index([isActive])
+}
+
+// Additional enum for categorization
+enum OtherIncomeCategory {
+  CONSULTANCY           // Property valuation, market analysis, advisory
+  PROPERTY_SALES        // Brokerage, sales commission
+  LEASING              // Lease negotiation fees
+  PROJECT_MANAGEMENT   // Renovation supervision, construction management
+  REFERRAL             // Referral fees from other providers
+  DOCUMENTATION        // Document preparation, legal paperwork
+  INSPECTION           // Property inspection services
+  TRAINING             // Training services
+  OTHER                // Custom category
 }
 
 model Invoice {
