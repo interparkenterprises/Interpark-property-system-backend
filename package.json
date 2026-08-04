@@ -4,6 +4,9 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
+    "test": "node --test",
+    "seed:analytics": "node prisma/seedAnalytics.js",
+    "seed:analytics:cleanup": "node prisma/cleanupAnalyticsSeed.js",
     "start": "node server.js",
     "dev": "nodemon server.js",
     "scheduler": "node src/jobs/reminderJob.js",
