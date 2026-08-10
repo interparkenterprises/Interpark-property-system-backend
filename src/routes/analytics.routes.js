@@ -10,7 +10,14 @@ import {
   getReceivablesSummary,
   getReceivablesTrend,
   getRevenueByProperty,
-  getTenantsSummary
+  getTenantsSummary,
+  getBillInvoiceAnalytics,
+  getServiceProviderAnalytics,
+  getCommissionAnalytics,
+  getDemandLetterAnalytics,
+  getTenantAnalytics,
+  getOtherIncomeAnalytics,
+  getEmployeeAnalytics
 } from '../controllers/analytics.controller.js';
 
 const router = express.Router();
@@ -58,5 +65,12 @@ router.get(
   requireAnalyticsPermissions('VIEW_TENANTS'),
   getTenantsSummary
 );
+router.get('/bill-invoices/summary', requireAnalyticsPermissions('VIEW_BILL_INVOICES'), getBillInvoiceAnalytics);
+router.get('/service-providers/summary', requireAnalyticsPermissions('VIEW_SERVICE_PROVIDERS'), getServiceProviderAnalytics);
+router.get('/commissions/summary', requireAnalyticsPermissions('VIEW_COMMISSIONS'), getCommissionAnalytics);
+router.get('/demand-letters/summary', requireAnalyticsPermissions('VIEW_DEMAND_LETTERS'), getDemandLetterAnalytics);
+router.get('/tenants/insights', requireAnalyticsPermissions('VIEW_TENANTS'), getTenantAnalytics);
+router.get('/other-income/summary', authorize('ADMIN', 'MANAGER'), getOtherIncomeAnalytics);
+router.get('/employees/summary', authorize('ADMIN', 'MANAGER'), getEmployeeAnalytics);
 
 export default router;

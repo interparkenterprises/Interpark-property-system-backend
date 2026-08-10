@@ -129,3 +129,30 @@ test('empty service datasets return zeros and null rates, not errors', async () 
     collectionRate: null, invoiceCount: 0, openInvoiceCount: 0
   });
 });
+
+test('bill invoice analytics applies property scope and keeps utility overdue separate from rent arrears', async () => {
+  let query;
+  const database = {
+    property: { findMany: async () => [] },
+    billInvoice: { findMany: async args => { query = args; return [{
+      id: 'bill-1', grandTotal: 1000, amountPaid: 400, balance: 600, status: 'PARTIAL', billType: 'WATER',
+      issueDate: new Date('2026-08-01T00:00:00Z'), dueDate: new Date('2026-08-02T00:00:00Z'),
+      tenant: { unit: { property: { id: PROPERTY_ONE, name: 'Property One' } } }
+    }]; } }
+  };
+  const service = new AnalyticsService(database, { getAccessiblePropertyIds: async () => [PROPERTY_ONE] });
+  const response = await service.getBillInvoiceAnalytics(USER, filters());
+  assert.deepEqual(query.where.tenant.unit.propertyId.in, [PROPERTY_ONE]);
+  assert.equal(response.data.summary.billed, 1000);
+  assert.equal(response.data.summary.paid, 400);
+  assert.equal(response.data.summary.overdueBillBalance, 600);
+  assert.equal(response.data.summary.collectionRate, 40);
+  assert.equal(response.data.byProperty[0].propertyId, PROPERTY_ONE);
+  assert.equal(response.meta.dataQuality.currentArrearsSource, 'Invoice');
+});
+
+test('manager-only sources reject property attribution instead of guessing', async () => {
+  const service = new AnalyticsService({}, { getAccessiblePropertyIds: async () => [PROPERTY_ONE] });
+  await assert.rejects(service.getOtherIncomeAnalytics({ id: 'manager-1', role: 'MANAGER' }, filters({ propertyId: PROPERTY_ONE })), AnalyticsAccessError);
+  await assert.rejects(service.getEmployeeAnalytics({ id: 'manager-1', role: 'MANAGER' }, filters({ propertyId: PROPERTY_ONE })), AnalyticsAccessError);
+});
