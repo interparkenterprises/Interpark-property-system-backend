@@ -728,7 +728,7 @@ export class AnalyticsService {
       invoiceDateFilter.issueDate = { gte: filters.start, lt: filters.endExclusive };
     }
     
-    const [tenants, units, invoices] = await Promise.all([
+    const [tenants, units, openInvoices, openBillInvoices] = await Promise.all([
       this.prisma.tenant.findMany({
         where: tenantWhereClause,
         select: {
@@ -741,7 +741,11 @@ export class AnalyticsService {
           unit: { select: { status: true } },
           invoices: {
             where: invoiceDateFilter,
-            select: { id: true, status: true, balance: true, totalDue: true }
+            select: { id: true, status: true, balance: true, totalDue: true, amountPaid: true, dueDate: true }
+          },
+          billInvoices: {
+            where: invoiceDateFilter,
+            select: { id: true, status: true, balance: true, grandTotal: true, amountPaid: true, dueDate: true }
           }
         }
       }),
@@ -749,21 +753,45 @@ export class AnalyticsService {
         where: { propertyId: { in: propertyIds } },
         select: { id: true, status: true, tenant: { select: { id: true } } }
       }),
+      // Get all open invoices (not date filtered) to check for arrears
       this.prisma.invoice.findMany({
         where: {
           tenant: { unit: { propertyId: { in: propertyIds } } },
-          ...invoiceDateFilter
+          status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] },
+          balance: { gt: 0 }
         },
-        select: { id: true, tenantId: true, status: true, totalDue: true, amountPaid: true }
+        select: { id: true, tenantId: true, status: true, balance: true, totalDue: true, amountPaid: true, dueDate: true }
+      }),
+      this.prisma.billInvoice.findMany({
+        where: {
+          tenant: { unit: { propertyId: { in: propertyIds } } },
+          status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] },
+          balance: { gt: 0 }
+        },
+        select: { id: true, tenantId: true, status: true, balance: true, grandTotal: true, amountPaid: true, dueDate: true }
       })
     ]);
 
+    // Calculate tenants with arrears (based on open invoices with balance > 0)
+    const tenantIdsWithArrears = new Set();
+    
+    // Add tenants with rent invoice arrears
+    for (const invoice of openInvoices) {
+      if (invoice.tenantId) {
+        tenantIdsWithArrears.add(invoice.tenantId);
+      }
+    }
+    
+    // Add tenants with bill invoice arrears
+    for (const billInvoice of openBillInvoices) {
+      if (billInvoice.tenantId) {
+        tenantIdsWithArrears.add(billInvoice.tenantId);
+      }
+    }
+    
     const lifecycleData = calculateTenantLifecycle(tenants, units);
     
-    const tenantsWithArrears = tenants.filter(t => 
-      t.invoices.some(i => i.status === 'OVERDUE' && i.balance > 0)
-    );
-    
+    // Calculate paying tenants (tenants who have made payments)
     const payingTenants = tenants.filter(t =>
       t.invoices.some(i => i.status === 'PAID' || i.amountPaid > 0)
     );
@@ -776,12 +804,42 @@ export class AnalyticsService {
       );
     }
 
+    // Calculate average invoice balance correctly
+    let totalBalance = 0;
+    let tenantsWithBalance = 0;
+    
+    for (const tenant of tenants) {
+      // Check rent invoices
+      let tenantBalance = 0;
+      for (const invoice of tenant.invoices) {
+        if (invoice.status !== 'PAID' && invoice.status !== 'CANCELLED') {
+          const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
+          if (balance > 0) {
+            tenantBalance += balance;
+          }
+        }
+      }
+      // Check bill invoices
+      for (const billInvoice of tenant.billInvoices) {
+        if (billInvoice.status !== 'PAID' && billInvoice.status !== 'CANCELLED') {
+          const balance = billInvoice.balance || (billInvoice.grandTotal - billInvoice.amountPaid);
+          if (balance > 0) {
+            tenantBalance += balance;
+          }
+        }
+      }
+      if (tenantBalance > 0) {
+        totalBalance += tenantBalance;
+        tenantsWithBalance++;
+      }
+    }
+
     return envelope({
       summary: lifecycleData.summary,
-      tenantsWithArrears: tenantsWithArrears.length,
+      tenantsWithArrears: tenantIdsWithArrears.size,
       payingTenants: payingTenants.length,
-      averageInvoiceBalance: tenants.length > 0 ? 
-        rounded(tenants.reduce((sum, t) => sum + (t.invoices.reduce((s, i) => s + i.balance, 0) / (t.invoices.length || 1)), 0) / tenants.length) : null,
+      averageInvoiceBalance: tenantsWithBalance > 0 ? 
+        rounded(totalBalance / tenantsWithBalance) : 0,
       newTenantsTrend: trend(
         newTenants,
         row => row.createdAt,
