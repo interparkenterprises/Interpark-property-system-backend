@@ -120,7 +120,7 @@ const calculateGracePeriodEnd = (dueDate, paymentPolicy, rentStartDate, periodIn
 
 /**
  * Calculate the next payment due date based on payment history and policy
- * UPDATED: Now includes withholding tax calculations
+ * UPDATED: Now checks invoice status for accurate outstanding balance
  */
 export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const { paymentPolicy, rentStart } = tenant;
@@ -181,6 +181,52 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     paymentsMade = nonCreditPayments.length;
   }
   
+  // =============================================
+  // FIXED: Use invoice data to determine what's actually outstanding
+  // =============================================
+  // Get invoices for this tenant
+  const invoices = tenant.invoices || [];
+  
+  // Calculate total outstanding from invoices (only UNPAID and PARTIAL)
+  let totalOutstandingFromInvoices = 0;
+  let unpaidInvoicesCount = 0;
+  let partialInvoicesCount = 0;
+  let paidInvoicesCount = 0;
+  let invoicePeriods = {};
+  
+  for (const invoice of invoices) {
+    if (invoice.status === 'PAID') {
+      paidInvoicesCount++;
+      continue;
+    } else if (invoice.status === 'PARTIAL') {
+      partialInvoicesCount++;
+      const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
+      totalOutstandingFromInvoices += balance;
+      // Track the period for this invoice
+      if (invoice.paymentPeriod) {
+        const periodKey = new Date(invoice.paymentPeriod).toISOString().slice(0, 7);
+        invoicePeriods[periodKey] = {
+          totalDue: invoice.totalDue,
+          amountPaid: invoice.amountPaid,
+          balance: balance,
+          status: invoice.status
+        };
+      }
+    } else if (invoice.status === 'UNPAID' || invoice.status === 'OVERDUE') {
+      unpaidInvoicesCount++;
+      totalOutstandingFromInvoices += invoice.totalDue;
+      if (invoice.paymentPeriod) {
+        const periodKey = new Date(invoice.paymentPeriod).toISOString().slice(0, 7);
+        invoicePeriods[periodKey] = {
+          totalDue: invoice.totalDue,
+          amountPaid: invoice.amountPaid,
+          balance: invoice.totalDue,
+          status: invoice.status
+        };
+      }
+    }
+  }
+  
   // Calculate expected number of payments by now
   const monthsSinceStart = calculateMonthsDifference(rentStartDate, today);
   const expectedPayments = Math.max(0, Math.floor(monthsSinceStart / policyMonths));
@@ -235,14 +281,10 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     if (reportedTotalDue > 0) {
       // Compare with our calculated value to see if withholding tax was applied
       if (Math.abs(reportedTotalDue - totalDueWithoutWithholding) < 0.01) {
-        // The payment report used the amount WITHOUT withholding tax
-        // This means we should use the original amount
         actualTotalDuePerPeriod = totalDueWithoutWithholding;
       } else if (Math.abs(reportedTotalDue - totalDuePerPeriod) < 0.01) {
-        // The payment report used the amount WITH withholding tax
         actualTotalDuePerPeriod = totalDuePerPeriod;
       } else {
-        // Use the reported value as source of truth
         actualTotalDuePerPeriod = reportedTotalDue;
       }
     }
@@ -268,14 +310,56 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     periodEnd.setDate(periodEnd.getDate() - 1);
     periodEnd.setHours(23, 59, 59, 999);
     
+    // Check if there's an invoice for this period
+    const periodMonthKey = periodMonthStart.toISOString().slice(0, 7);
+    const invoiceForPeriod = invoicePeriods[periodMonthKey];
+    
+    let amountPaid = periodPayments[periodKey] || 0;
+    let isFullyPaid = false;
+    let remainingBalance = actualTotalDuePerPeriod;
+    
+    // If there's an invoice for this period, use its status
+    if (invoiceForPeriod) {
+      if (invoiceForPeriod.status === 'PAID') {
+        isFullyPaid = true;
+        remainingBalance = 0;
+      } else if (invoiceForPeriod.status === 'PARTIAL') {
+        // The invoice is partially paid - there's a remaining balance
+        remainingBalance = invoiceForPeriod.balance;
+        // Check if it's effectively fully paid (balance is 0)
+        if (remainingBalance <= 0.01) {
+          isFullyPaid = true;
+          remainingBalance = 0;
+        }
+      } else if (invoiceForPeriod.status === 'UNPAID' || invoiceForPeriod.status === 'OVERDUE') {
+        // Invoice is unpaid - full amount is outstanding
+        remainingBalance = invoiceForPeriod.totalDue;
+        // But check if payments have been made against it
+        if (amountPaid > 0) {
+          remainingBalance = Math.max(0, invoiceForPeriod.totalDue - amountPaid);
+        }
+      }
+    } else {
+      // No invoice for this period, use payment data
+      const totalAvailable = amountPaid;
+      if (totalAvailable >= actualTotalDuePerPeriod) {
+        isFullyPaid = true;
+        remainingBalance = 0;
+      } else {
+        remainingBalance = actualTotalDuePerPeriod - totalAvailable;
+      }
+    }
+    
     allPeriods.push({
       index: i,
       startDate: new Date(periodMonthStart),
       endDate: periodEnd,
       key: periodKey,
-      amountPaid: periodPayments[periodKey] || 0,
-      isFullyPaid: false,
-      remainingBalance: actualTotalDuePerPeriod
+      amountPaid: amountPaid,
+      isFullyPaid: isFullyPaid,
+      remainingBalance: remainingBalance,
+      hasInvoice: !!invoiceForPeriod,
+      invoiceStatus: invoiceForPeriod?.status || null
     });
   }
   
@@ -286,16 +370,25 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   
   for (let i = 0; i < allPeriods.length; i++) {
     const period = allPeriods[i];
-    const totalAvailable = period.amountPaid + carryOverAmount;
     
-    if (totalAvailable >= actualTotalDuePerPeriod) {
+    // If period is already marked as fully paid, skip
+    if (period.isFullyPaid) {
+      fullyPaidPeriods++;
+      continue;
+    }
+    
+    // Check if any payments made for this period
+    const totalAvailable = period.amountPaid + carryOverAmount;
+    const periodDue = period.remainingBalance || actualTotalDuePerPeriod;
+    
+    if (totalAvailable >= periodDue) {
       period.isFullyPaid = true;
       period.remainingBalance = 0;
-      carryOverAmount = totalAvailable - actualTotalDuePerPeriod;
+      carryOverAmount = totalAvailable - periodDue;
       fullyPaidPeriods++;
     } else {
       period.isFullyPaid = false;
-      period.remainingBalance = actualTotalDuePerPeriod - totalAvailable;
+      period.remainingBalance = periodDue - totalAvailable;
       carryOverAmount = 0;
       if (firstUnpaidPeriodIndex === -1) {
         firstUnpaidPeriodIndex = i;
@@ -303,7 +396,7 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     }
   }
   
-  // Calculate payments behind
+  // Calculate payments behind (only count periods that are not fully paid)
   let paymentsBehind = 0;
   const periodsToCheck = Math.min(periodsSinceStart, allPeriods.length);
   for (let i = 0; i < periodsToCheck; i++) {
@@ -422,6 +515,14 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     remainingBalanceForNextPeriod,
     carryOverAmount,
     isRentStarted: true,
+    // Include invoice summary
+    invoiceSummary: {
+      totalOutstanding: totalOutstandingFromInvoices,
+      unpaidCount: unpaidInvoicesCount,
+      partialCount: partialInvoicesCount,
+      paidCount: paidInvoicesCount,
+      totalCount: invoices.length
+    },
     _debug: {
       periodPayments,
       periodTotalDue,
@@ -430,7 +531,9 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
         key: p.key,
         amountPaid: p.amountPaid,
         isFullyPaid: p.isFullyPaid,
-        remainingBalance: p.remainingBalance
+        remainingBalance: p.remainingBalance,
+        hasInvoice: p.hasInvoice,
+        invoiceStatus: p.invoiceStatus
       })),
       carryOverAmount,
       fullyPaidPeriods,
@@ -614,10 +717,11 @@ export const calculateOverdueStatus = (dueDate, currentDate, paymentPolicy, rent
 };
 
 /**
- * Get payment summary for a tenant (UPDATED with withholding tax)
+ * Get payment summary for a tenant (UPDATED - properly handles partial payments)
  */
 export const getPaymentSummary = (tenant) => {
   const paymentReports = tenant.paymentReports || [];
+  const invoices = tenant.invoices || [];
   const monthlyRent = calculateEscalatedRent(tenant).currentRent;
   
   // Get the next payment info which now includes withholding tax
@@ -634,51 +738,101 @@ export const getPaymentSummary = (tenant) => {
   const totalDueWithoutWithholding = nextPaymentInfo.totalDueWithoutWithholding || 0;
   const totalWithheld = nextPaymentInfo.totalWithheld || 0;
   
-  // Calculate expected total based on number of periods
-  const rentStartDate = new Date(tenant.rentStart);
-  const today = new Date();
-  const rentStartStart = setToStartOfDay(rentStartDate);
-  const todayStart = setToStartOfDay(today);
+  // =============================================
+  // FIXED: Calculate expected total based on INVOICE status
+  // =============================================
+  // Get all invoices for this tenant
+  const tenantInvoices = invoices || [];
   
-  let expectedPaymentsCount = 0;
+  // Calculate total expected from invoices (only UNPAID and PARTIAL)
   let expectedTotal = 0;
+  let outstandingBalance = 0;
+  let fullyPaidInvoices = 0;
+  let partialInvoices = 0;
+  let unpaidInvoices = 0;
   
-  if (rentStartStart <= todayStart) {
-    let monthsDiff = 0;
-    const years = todayStart.getFullYear() - rentStartStart.getFullYear();
-    const months = todayStart.getMonth() - rentStartStart.getMonth();
-    monthsDiff = (years * 12) + months;
-    
-    if (monthsDiff === 0) {
-      expectedPaymentsCount = 1;
-    } else {
-      const completedPeriods = Math.floor(monthsDiff / policyMonths);
-      const hasCurrentPeriod = (monthsDiff % policyMonths) >= 0;
-      expectedPaymentsCount = completedPeriods + (hasCurrentPeriod ? 1 : 0);
+  // Calculate based on invoices (source of truth)
+  for (const invoice of tenantInvoices) {
+    if (invoice.status === 'PAID') {
+      fullyPaidInvoices++;
+      // Fully paid invoices contribute nothing to outstanding balance
+      continue;
+    } else if (invoice.status === 'PARTIAL') {
+      partialInvoices++;
+      // Partial invoice: only the balance is outstanding
+      const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
+      expectedTotal += invoice.totalDue;
+      outstandingBalance += balance;
+    } else if (invoice.status === 'UNPAID' || invoice.status === 'OVERDUE') {
+      unpaidInvoices++;
+      // Unpaid invoice: full amount is outstanding
+      expectedTotal += invoice.totalDue;
+      outstandingBalance += invoice.totalDue;
     }
-    
-    // Use the total due per period (with withholding tax)
-    expectedTotal = expectedPaymentsCount * totalDuePerPeriod;
-  } else {
-    expectedPaymentsCount = 0;
-    expectedTotal = 0;
   }
   
+  // If there are no invoices, use the payment reports as fallback
+  if (tenantInvoices.length === 0) {
+    const rentStartDate = new Date(tenant.rentStart);
+    const today = new Date();
+    const rentStartStart = setToStartOfDay(rentStartDate);
+    const todayStart = setToStartOfDay(today);
+    
+    if (rentStartStart <= todayStart) {
+      let monthsDiff = 0;
+      const years = todayStart.getFullYear() - rentStartStart.getFullYear();
+      const months = todayStart.getMonth() - rentStartStart.getMonth();
+      monthsDiff = (years * 12) + months;
+      
+      let expectedPaymentsCount = 0;
+      if (monthsDiff === 0) {
+        expectedPaymentsCount = 1;
+      } else {
+        const completedPeriods = Math.floor(monthsDiff / policyMonths);
+        const hasCurrentPeriod = (monthsDiff % policyMonths) >= 0;
+        expectedPaymentsCount = completedPeriods + (hasCurrentPeriod ? 1 : 0);
+      }
+      
+      expectedTotal = expectedPaymentsCount * totalDuePerPeriod;
+      outstandingBalance = expectedTotal - totalPaid;
+    } else {
+      expectedTotal = 0;
+      outstandingBalance = 0;
+    }
+  }
+  
+  // Round values
   expectedTotal = parseFloat(expectedTotal.toFixed(2));
   const totalPaidRounded = parseFloat(totalPaid.toFixed(2));
-  
-  // Calculate outstanding balance (with withholding tax considered)
-  let outstandingBalance = expectedTotal - totalPaidRounded;
   outstandingBalance = parseFloat(outstandingBalance.toFixed(2));
   
-  // Determine status
+  // If outstanding balance is very small, treat as zero
+  if (Math.abs(outstandingBalance) < 0.01) {
+    outstandingBalance = 0;
+  }
+  
+  // Determine status based on invoice statuses
   let status = 'UP_TO_DATE';
+  const rentStartDate = new Date(tenant.rentStart);
+  const rentStartStart = setToStartOfDay(rentStartDate);
+  const todayStart = setToStartOfDay(new Date());
+  
   if (rentStartStart > todayStart) {
     status = 'NOT_STARTED';
-  } else if (totalPaidRounded === 0 && expectedTotal === 0) {
+  } else if (tenantInvoices.length === 0 && totalPaidRounded === 0) {
     status = 'NO_PAYMENTS_DUE';
-  } else if (totalPaidRounded === 0 && expectedTotal > 0) {
+  } else if (tenantInvoices.length === 0 && totalPaidRounded > 0) {
+    status = 'UP_TO_DATE';
+  } else if (unpaidInvoices > 0) {
     status = 'UNPAID';
+  } else if (partialInvoices > 0 && outstandingBalance > 0) {
+    if (nextPaymentInfo.isOverdue) {
+      status = 'OVERDUE';
+    } else if (nextPaymentInfo.isInGracePeriod) {
+      status = 'IN_GRACE_PERIOD';
+    } else {
+      status = 'PARTIALLY_PAID';
+    }
   } else if (outstandingBalance > 0) {
     if (nextPaymentInfo.isOverdue) {
       status = 'OVERDUE';
@@ -690,13 +844,10 @@ export const getPaymentSummary = (tenant) => {
   } else if (outstandingBalance < 0) {
     status = 'OVERPAID';
   } else {
+    // All invoices are PAID or there are no outstanding invoices
     const hasPaidReport = nonCreditPayments.some(p => p.status === 'PAID');
-    if (hasPaidReport && nextPaymentInfo.fullyPaidPeriods >= 1) {
+    if (hasPaidReport || fullyPaidInvoices > 0) {
       status = 'PAID';
-    } else if (nextPaymentInfo.isOverdue) {
-      status = 'OVERDUE';
-    } else if (nextPaymentInfo.isInGracePeriod) {
-      status = 'IN_GRACE_PERIOD';
     } else {
       status = 'UP_TO_DATE';
     }
@@ -717,6 +868,13 @@ export const getPaymentSummary = (tenant) => {
     totalDueWithoutWithholding: totalDueWithoutWithholding, // WITHOUT withholding tax
     totalWithheld: totalWithheld, // Amount withheld for tax
     withholdingBreakdown: nextPaymentInfo.withholdingBreakdown,
+    // NEW: Invoice status breakdown
+    invoiceStatus: {
+      fullyPaid: fullyPaidInvoices,
+      partial: partialInvoices,
+      unpaid: unpaidInvoices,
+      total: tenantInvoices.length
+    },
     nextPayment: {
       dueDate: nextPaymentDate,
       dueDateFormatted: nextPaymentDate ? nextPaymentDate.toLocaleDateString() : null,
@@ -742,7 +900,7 @@ export const getPaymentSummary = (tenant) => {
       expectedTotal: Math.max(0, expectedTotal),
       outstandingBalance: rentStartStart > todayStart ? 0 : outstandingBalance,
       paymentsMade: nonCreditPayments.length,
-      expectedPaymentsCount: Math.max(0, expectedPaymentsCount),
+      expectedPaymentsCount: Math.max(0, Math.ceil(expectedTotal / (totalDuePerPeriod || 1))),
       lastPaymentDate: nextPaymentInfo.lastPaymentDate,
       lastPaymentDateFormatted: nextPaymentInfo.lastPaymentDate ? 
         nextPaymentInfo.lastPaymentDate.toLocaleDateString() : null,

@@ -533,12 +533,25 @@ export const getOverdueTenants = async (req, res) => {
 
     // Role-based access control
     if (userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'USER') {
+      // =============================================
+      // FIXED: Include invoices in the query to check actual status
+      // =============================================
       tenants = await prisma.tenant.findMany({
         where: baseWhere,
         include: {
           unit: {
             include: {
               property: true
+            }
+          },
+          invoices: {
+            where: {
+              status: {
+                in: ['UNPAID', 'PARTIAL', 'OVERDUE']
+              }
+            },
+            orderBy: {
+              dueDate: 'asc'
             }
           },
           paymentReports: {
@@ -555,32 +568,66 @@ export const getOverdueTenants = async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Helper function to calculate exact overdue days
+    // =============================================
+    // FIXED: Helper function to calculate exact overdue days based on invoice data
+    // =============================================
     const calculateOverdueDays = (tenant) => {
-      const paymentSummary = getPaymentSummary(tenant);
+      const invoices = tenant.invoices || [];
+      let maxOverdueDays = 0;
       
-      if (!paymentSummary.nextPayment?.isOverdue) {
-        return 0;
-      }
-      
-      // Calculate days based on next due date
-      const nextDueDate = paymentSummary.nextPayment.dueDate;
-      if (nextDueDate) {
-        const dueDateObj = new Date(nextDueDate);
+      // Check each invoice for overdue status
+      for (const invoice of invoices) {
+        // Calculate the actual balance
+        const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
+        
+        // Only consider invoices with balance > 0
+        if (balance <= 0.01) {
+          continue;
+        }
+        
+        // Check if invoice is overdue
+        const dueDate = new Date(invoice.dueDate);
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        dueDateObj.setHours(0, 0, 0, 0);
+        dueDate.setHours(0, 0, 0, 0);
         
-        const diffTime = today - dueDateObj;
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        return diffDays > 0 ? diffDays : 0;
+        if (dueDate < today) {
+          const diffTime = today - dueDate;
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          if (diffDays > maxOverdueDays) {
+            maxOverdueDays = diffDays;
+          }
+        }
       }
       
-      // Fallback: calculate based on payments behind
-      const paymentsBehind = paymentSummary.nextPayment?.paymentsBehind || 0;
-      const paymentPeriod = tenant.paymentPolicy === 'MONTHLY' ? 30 :
-                           tenant.paymentPolicy === 'QUARTERLY' ? 90 : 365;
-      return paymentsBehind * paymentPeriod;
+      return maxOverdueDays;
+    };
+    
+    // Helper function to get the total overdue amount for a tenant
+    const calculateTotalOverdueAmount = (tenant) => {
+      const invoices = tenant.invoices || [];
+      let totalOverdue = 0;
+      
+      for (const invoice of invoices) {
+        const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
+        
+        // Only include invoices with balance > 0
+        if (balance <= 0.01) {
+          continue;
+        }
+        
+        // Check if invoice is overdue
+        const dueDate = new Date(invoice.dueDate);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        dueDate.setHours(0, 0, 0, 0);
+        
+        if (dueDate < today) {
+          totalOverdue += balance;
+        }
+      }
+      
+      return totalOverdue;
     };
     
     // Helper function to get human-readable overdue period
@@ -595,7 +642,20 @@ export const getOverdueTenants = async (req, res) => {
       return `${days} days (Over 6 months)`;
     };
     
-    // Filter tenants with overdue payments and enhance their data
+    // Helper function to get overdue category
+    const getOverdueCategory = (days) => {
+      if (days <= 0) return 'NOT_OVERDUE';
+      if (days <= 7) return '1_WEEK';
+      if (days <= 14) return '2_WEEKS';
+      if (days <= 30) return '1_MONTH';
+      if (days <= 60) return '2_MONTHS';
+      if (days <= 90) return '3_MONTHS';
+      return 'OVER_3_MONTHS';
+    };
+
+    // =============================================
+    // FIXED: Filter tenants with overdue payments based on invoice data
+    // =============================================
     let overdueTenants = tenants
       .map(tenant => {
         const rentInfo = calculateEscalatedRent(tenant);
@@ -603,6 +663,7 @@ export const getOverdueTenants = async (req, res) => {
         const paymentAmount = calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy);
         const paymentSummary = getPaymentSummary(tenant);
         const overdueDays = calculateOverdueDays(tenant);
+        const totalOverdueAmount = calculateTotalOverdueAmount(tenant);
         
         // Calculate service charge based on rent ONLY
         const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
@@ -615,6 +676,13 @@ export const getOverdueTenants = async (req, res) => {
         const vatOnServiceCharge = serviceChargeDetails.vatAmount * getPolicyMonths(tenant.paymentPolicy);
         
         const totalPayment = paymentAmount + vatOnRent + serviceChargeByPolicy + vatOnServiceCharge;
+        
+        // Get invoice details for this tenant
+        const invoices = tenant.invoices || [];
+        const outstandingInvoices = invoices.filter(inv => {
+          const balance = inv.balance || (inv.totalDue - inv.amountPaid);
+          return balance > 0.01;
+        });
         
         return {
           ...tenant,
@@ -635,16 +703,61 @@ export const getOverdueTenants = async (req, res) => {
             paymentPolicy: tenant.paymentPolicy
           },
           paymentSummary,
+          invoiceDetails: {
+            totalInvoices: invoices.length,
+            outstandingInvoices: outstandingInvoices.length,
+            outstandingAmount: outstandingInvoices.reduce((sum, inv) => {
+              const balance = inv.balance || (inv.totalDue - inv.amountPaid);
+              return sum + balance;
+            }, 0),
+            invoices: outstandingInvoices.map(inv => ({
+              id: inv.id,
+              invoiceNumber: inv.invoiceNumber,
+              totalDue: inv.totalDue,
+              amountPaid: inv.amountPaid,
+              balance: inv.balance || (inv.totalDue - inv.amountPaid),
+              status: inv.status,
+              dueDate: inv.dueDate,
+              paymentPeriod: inv.paymentPeriod,
+              daysOverdue: Math.max(0, Math.ceil((new Date() - new Date(inv.dueDate)) / (1000 * 60 * 60 * 24)))
+            }))
+          },
           overdueDetails: {
             daysOverdue: overdueDays,
             periodText: getOverduePeriodText(overdueDays),
-            category: getOverdueCategory(overdueDays)
+            category: getOverdueCategory(overdueDays),
+            totalOverdueAmount: totalOverdueAmount
           }
         };
       })
       .filter(tenant => {
-        // Only include tenants that are overdue
-        if (!tenant.paymentSummary.nextPayment?.isOverdue) {
+        // =============================================
+        // FIXED: Only include tenants that actually have overdue invoices with balance > 0
+        // =============================================
+        const invoices = tenant.invoices || [];
+        
+        // Check if there are any outstanding invoices with balance > 0
+        const hasOutstandingInvoices = invoices.some(inv => {
+          const balance = inv.balance || (inv.totalDue - inv.amountPaid);
+          return balance > 0.01;
+        });
+        
+        if (!hasOutstandingInvoices) {
+          return false;
+        }
+        
+        // Check if any outstanding invoice is overdue
+        const hasOverdueInvoice = invoices.some(inv => {
+          const balance = inv.balance || (inv.totalDue - inv.amountPaid);
+          const dueDate = new Date(inv.dueDate);
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          dueDate.setHours(0, 0, 0, 0);
+          
+          return balance > 0.01 && dueDate < today;
+        });
+        
+        if (!hasOverdueInvoice) {
           return false;
         }
         
@@ -664,10 +777,11 @@ export const getOverdueTenants = async (req, res) => {
         return true;
       });
 
+    // =============================================
     // Calculate summary statistics
+    // =============================================
     const totalOverdueAmount = overdueTenants.reduce((sum, tenant) => {
-      const overdueBalance = tenant.paymentSummary.paymentHistory?.outstandingBalance || 0;
-      return sum + (overdueBalance > 0 ? overdueBalance : 0);
+      return sum + tenant.overdueDetails.totalOverdueAmount;
     }, 0);
 
     const totalOverdueTenants = overdueTenants.length;
@@ -690,16 +804,22 @@ export const getOverdueTenants = async (req, res) => {
       month3: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 60 && t.overdueDetails.daysOverdue <= 90).length,
       more: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 90).length
     };
+    
+    // Calculate total outstanding invoices count
+    const totalOutstandingInvoices = overdueTenants.reduce((sum, tenant) => {
+      return sum + tenant.invoiceDetails.outstandingInvoices;
+    }, 0);
 
     res.json({
       success: true,
       count: totalOverdueTenants,
-      totalOverdueAmount,
+      totalOverdueAmount: parseFloat(totalOverdueAmount.toFixed(2)),
       tenants: overdueTenants,
       summary: {
         totalOverdueTenants,
-        totalOverdueAmount,
-        averageOverdueAmount: totalOverdueTenants > 0 ? totalOverdueAmount / totalOverdueTenants : 0,
+        totalOverdueAmount: parseFloat(totalOverdueAmount.toFixed(2)),
+        averageOverdueAmount: totalOverdueTenants > 0 ? parseFloat((totalOverdueAmount / totalOverdueTenants).toFixed(2)) : 0,
+        totalOutstandingInvoices,
         overdueDaysStats,
         overdueCategories
       },

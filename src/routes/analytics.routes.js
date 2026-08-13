@@ -1,0 +1,205 @@
+import express from 'express';
+import { protect } from '../middleware/authMiddleware.js';
+import { authorize } from '../middleware/roleMiddleware.js';
+import { requireAnalyticsPermissions } from '../middleware/analyticsPermissionMiddleware.js';
+import {
+  getCollectionsTrend,
+  getOccupancySummary,
+  getOverview,
+  getReceivablesStatusDistribution,
+  getReceivablesSummary,
+  getReceivablesTrend,
+  getRevenueByProperty,
+  getTenantsSummary,
+  getBillInvoiceAnalytics,
+  getServiceProviderAnalytics,
+  getCommissionAnalytics,
+  getDemandLetterAnalytics,
+  getTenantAnalytics,
+  getOtherIncomeAnalytics,
+  getEmployeeAnalytics,
+  // New Invoice Analytics
+  getComprehensiveInvoiceAnalytics,
+  getRentInvoiceAnalytics,
+  getBillInvoiceAnalyticsDetailed,
+  getInvoiceAgingReport,
+  getInvoiceReconciliationReport,
+  // Other New Analytics
+  getBillAnalytics,
+  getTenantLifecycleAnalytics,
+  getLeadAnalytics,
+  getDataQualityAnalytics,
+  getPerformanceAnalytics,
+  getVATAnalytics
+} from '../controllers/analytics.controller.js';
+
+const router = express.Router();
+
+router.use(protect);
+router.use(authorize('ADMIN', 'MANAGER', 'USER'));
+
+// ========== EXISTING ROUTES ==========
+router.get(
+  '/overview',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_ARREARS', 'VIEW_UNITS', 'VIEW_TENANTS'),
+  getOverview
+);
+
+router.get(
+  '/receivables/summary',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_ARREARS'),
+  getReceivablesSummary
+);
+
+router.get(
+  '/receivables/status-distribution',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS'),
+  getReceivablesStatusDistribution
+);
+
+router.get(
+  '/receivables/trend',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS'),
+  getReceivablesTrend
+);
+
+router.get(
+  '/collections/trend',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS'),
+  getCollectionsTrend
+);
+
+router.get(
+  '/revenue/by-property',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS'),
+  getRevenueByProperty
+);
+
+router.get(
+  '/occupancy/summary',
+  requireAnalyticsPermissions('VIEW_UNITS'),
+  getOccupancySummary
+);
+
+router.get(
+  '/tenants/summary',
+  requireAnalyticsPermissions('VIEW_TENANTS'),
+  getTenantsSummary
+);
+
+router.get(
+  '/bill-invoices/summary',
+  requireAnalyticsPermissions('VIEW_BILL_INVOICES'),
+  getBillInvoiceAnalytics
+);
+
+router.get(
+  '/service-providers/summary',
+  requireAnalyticsPermissions('VIEW_SERVICE_PROVIDERS'),
+  getServiceProviderAnalytics
+);
+
+router.get(
+  '/commissions/summary',
+  requireAnalyticsPermissions('VIEW_COMMISSIONS'),
+  getCommissionAnalytics
+);
+
+router.get(
+  '/demand-letters/summary',
+  requireAnalyticsPermissions('VIEW_DEMAND_LETTERS'),
+  getDemandLetterAnalytics
+);
+
+router.get(
+  '/tenants/insights',
+  requireAnalyticsPermissions('VIEW_TENANTS'),
+  getTenantAnalytics
+);
+
+router.get(
+  '/other-income/summary',
+  authorize('ADMIN', 'MANAGER'),
+  getOtherIncomeAnalytics
+);
+
+router.get(
+  '/employees/summary',
+  authorize('ADMIN', 'MANAGER'),
+  getEmployeeAnalytics
+);
+
+// ========== NEW INVOICE ANALYTICS ROUTES ==========
+router.get(
+  '/invoices/comprehensive',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_BILL_INVOICES'),
+  getComprehensiveInvoiceAnalytics
+);
+
+router.get(
+  '/invoices/rent',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS'),
+  getRentInvoiceAnalytics
+);
+
+router.get(
+  '/invoices/bill',
+  requireAnalyticsPermissions('VIEW_BILL_INVOICES'),
+  getBillInvoiceAnalyticsDetailed
+);
+
+router.get(
+  '/invoices/aging',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_BILL_INVOICES', 'VIEW_ARREARS'),
+  getInvoiceAgingReport
+);
+
+router.get(
+  '/invoices/reconciliation',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_BILL_INVOICES'),
+  getInvoiceReconciliationReport
+);
+
+// ========== NEW BILL ANALYTICS ROUTES ==========
+router.get(
+  '/bills/summary',
+  requireAnalyticsPermissions('VIEW_BILL_INVOICES'),
+  getBillAnalytics
+);
+
+// ========== NEW TENANT LIFECYCLE ANALYTICS ROUTES ==========
+router.get(
+  '/tenants/lifecycle',
+  requireAnalyticsPermissions('VIEW_TENANTS', 'VIEW_PAYMENT_REPORTS'),
+  getTenantLifecycleAnalytics
+);
+
+// ========== NEW LEAD ANALYTICS ROUTES ==========
+router.get(
+  '/leads/summary',
+  requireAnalyticsPermissions('VIEW_TENANTS'),
+  getLeadAnalytics
+);
+
+// ========== NEW DATA QUALITY ANALYTICS ROUTES ==========
+router.get(
+  '/data-quality',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_TENANTS', 'VIEW_UNITS'),
+  getDataQualityAnalytics
+);
+
+// ========== NEW PERFORMANCE ANALYTICS ROUTES ==========
+router.get(
+  '/performance',
+  requireAnalyticsPermissions('VIEW_TODOS', 'VIEW_DAILY_REPORTS'),
+  getPerformanceAnalytics
+);
+
+// ========== NEW VAT ANALYTICS ROUTES ==========
+router.get(
+  '/vat/summary',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_BILL_INVOICES'),
+  getVATAnalytics
+);
+
+export default router;
