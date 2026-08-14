@@ -4,7 +4,8 @@ import { generateDemandLetterPDF } from '../utils/demandLetterTemplate.js';
 import { uploadDocument } from '../utils/uploadHelper.js';
 import { generateFileName } from '../utils/storage.js';
 import permissionService from "../services/permissionService.js";
-
+import fs from 'fs';
+import path from 'path';
 // ======================================================
 // PERMISSION HELPER FUNCTIONS
 // ======================================================
@@ -380,13 +381,16 @@ export const generateDemandLetter = async (req, res) => {
     // Generate filename and upload
     const fileName = generateFileName(`demand_letter_${letterNumber}`);
     const filePath = `demand-letters/${fileName}`;
-    const documentUrl = await uploadDocument(pdfBuffer, filePath);
+    const uploadResult = await uploadDocument(pdfBuffer, filePath);
+
+    //  FIX: Extract just the URL string
+    const documentUrl = uploadResult.url;
 
     // Update demand letter with document URL and status
     const updatedDemandLetter = await prisma.demandLetter.update({
       where: { id: demandLetter.id },
       data: {
-        documentUrl,
+        documentUrl,  // Now this is a string
         status: 'GENERATED',
         generatedAt: new Date()
       },
@@ -1140,13 +1144,26 @@ export const downloadDemandLetter = async (req, res) => {
       }
     }
 
-    res.json({
-      success: true,
-      data: {
-        documentUrl: demandLetter.documentUrl,
-        letterNumber: demandLetter.letterNumber
-      }
-    });
+    // Get the file path from the document URL
+    const filePath = demandLetter.documentUrl.replace('/uploads/', '');
+    const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+    const fullPath = path.join(uploadDir, filePath);
+
+    // Check if file exists
+    if (!fs.existsSync(fullPath)) {
+      return res.status(404).json({
+        success: false,
+        message: 'PDF file not found on server'
+      });
+    }
+
+    // Set headers for file download
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="demand_letter_${demandLetter.letterNumber}.pdf"`);
+    
+    // Stream the file
+    const fileStream = fs.createReadStream(fullPath);
+    fileStream.pipe(res);
 
   } catch (error) {
     console.error('Error downloading demand letter:', error);
