@@ -1,18 +1,13 @@
 import prisma from '../lib/prisma.js';
-import PDFDocument from 'pdfkit';
 import { uploadToStorage } from '../utils/storage.js';
 import { generateInvoiceNumber } from '../utils/invoiceHelpers.js';
 import fs from 'fs';
 import path from 'path';
 import { existsSync } from 'fs';
-import { fileURLToPath } from 'url';
-import sizeOf from 'image-size';
 import { addBillingPeriod, calculateChargeByPolicy, calculateEscalatedRent } from '../services/rentCalculation.js';
 import permissionService from "../services/permissionService.js";
-
-// Create __dirname equivalent for ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { buildInvoiceHtml, buildInvoiceFooterTemplate } from '../services/pdf/invoicePdf.js';
+import { generatePDF } from '../utils/pdfGenerator.js';
 
 // ======================================================
 // PERMISSION HELPER FUNCTIONS
@@ -85,12 +80,6 @@ async function canViewInvoicesForProperty(userId, userRole, propertyId) {
   }
   
   return permissionService.checkPermission(userId, 'invoice', 'view', propertyId);
-}
-
-// Helper function to convert enum to title case
-function toTitleCase(enumValue) {
-  if (!enumValue) return '';
-  return enumValue.charAt(0).toUpperCase() + enumValue.slice(1).toLowerCase();
 }
 
 const VALID_PAYMENT_POLICIES = ['MONTHLY', 'QUARTERLY', 'ANNUAL'];
@@ -200,7 +189,6 @@ async function deleteFromStorage(fileUrl) {
     const filename = fileUrl.split('/').pop();
     const filePath = path.join(process.cwd(), 'uploads', filename);
     
-    // Use the imported existsSync
     if (existsSync(filePath)) {
       await fs.unlink(filePath);
       console.log(`Deleted file: ${filename}`);
@@ -311,11 +299,17 @@ export const generateInvoice = async (req, res) => {
               }
             }
           }
-        }
+        },
+        paymentReport: true
       }
     });
 
-    const pdfBuffer = await generateInvoicePDF(invoice, tenant);
+    const pdfBuffer = await generatePDF(buildInvoiceHtml(invoice), {
+  displayHeaderFooter: true,
+  headerTemplate: '<div></div>',
+  footerTemplate: buildInvoiceFooterTemplate(),
+  margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+});
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
 
     const updatedInvoice = await prisma.invoice.update({
@@ -345,7 +339,6 @@ export const getInvoicesByTenant = async (req, res) => {
     const { page = 1, limit = 10, status, paymentPolicy } = req.query;
     const skip = (page - 1) * limit;
 
-    // Get tenant to check property access
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
@@ -361,7 +354,6 @@ export const getInvoicesByTenant = async (req, res) => {
 
     const propertyId = tenant.unit?.propertyId;
 
-    // Check permission to view invoices for this tenant
     if (userRole !== 'ADMIN') {
       const canView = await canViewInvoicesForProperty(userId, userRole, propertyId);
       if (!canView) {
@@ -454,7 +446,6 @@ export const getAllInvoices = async (req, res) => {
     
     const skip = (page - 1) * limit;
 
-    // Check base permission
     if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
       const hasViewPermission = await permissionService.hasPermission(
         userId, 
@@ -477,7 +468,6 @@ export const getAllInvoices = async (req, res) => {
       where.paymentPolicy = paymentPolicy;
     }
     
-    // Filter by property with permission check
     if (propertyId) {
       if (userRole !== 'ADMIN') {
         const canView = await canViewInvoicesForProperty(userId, userRole, propertyId);
@@ -494,7 +484,6 @@ export const getAllInvoices = async (req, res) => {
         }
       };
     } else if (userRole === 'MANAGER') {
-      // MANAGER can only see their own properties
       const managedProperties = await prisma.property.findMany({
         where: { managerId: userId },
         select: { id: true }
@@ -507,7 +496,6 @@ export const getAllInvoices = async (req, res) => {
         }
       };
     } else if (userRole !== 'ADMIN') {
-      // USER role - only properties they have access to
       const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
       where.tenant = {
         unit: {
@@ -598,7 +586,6 @@ export const getInvoiceById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Invoice not found' });
     }
 
-    // Check permission to view this invoice
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
@@ -659,7 +646,6 @@ export const updateInvoiceStatus = async (req, res) => {
 
     const propertyId = invoice.tenant?.unit?.propertyId;
 
-    // Check permission to update invoice
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
@@ -732,7 +718,8 @@ export const downloadInvoice = async (req, res) => {
               }
             }
           }
-        }
+        },
+        paymentReport: true
       }
     });
 
@@ -740,7 +727,6 @@ export const downloadInvoice = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Invoice not found' });
     }
 
-    // Check permission to download invoice
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
@@ -763,8 +749,13 @@ export const downloadInvoice = async (req, res) => {
       }
     }
 
-    // Generate PDF if not exists or regenerate
-    const pdfBuffer = await generateInvoicePDF(invoice, invoice.tenant);
+    // Generate PDF using the same template as WhatsApp sends
+    const pdfBuffer = await generatePDF(buildInvoiceHtml(invoice), {
+  displayHeaderFooter: true,
+  headerTemplate: '<div></div>',
+  footerTemplate: buildInvoiceFooterTemplate(),
+  margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+});
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${invoice.invoiceNumber}.pdf"`);
@@ -791,7 +782,6 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
       });
     }
 
-    // Fetch payment report with tenant details
     const paymentReport = await prisma.paymentReport.findUnique({
       where: { id: paymentReportId },
       include: {
@@ -818,7 +808,6 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
 
     const propertyId = paymentReport.tenant?.unit?.propertyId;
 
-    // Check permission to generate invoice
     if (userRole !== 'ADMIN') {
       const canManage = await canManageInvoiceForProperty(userId, userRole, propertyId);
       if (!canManage) {
@@ -842,7 +831,6 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
       }
     }
 
-    // Check if payment status is PARTIAL
     if (paymentReport.status !== 'PARTIAL') {
       return res.status(400).json({ 
         success: false, 
@@ -850,7 +838,6 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
       });
     }
 
-    // Check if balance exists
     if (paymentReport.arrears <= 0) {
       return res.status(400).json({ 
         success: false, 
@@ -860,31 +847,21 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
 
     const tenant = paymentReport.tenant;
 
-    // Use values from the payment report
     const rent = paymentReport.rent;
     const serviceCharge = paymentReport.serviceCharge || 0;
     const vat = paymentReport.vat || 0;
     const balance = paymentReport.arrears;
 
-    // Generate unique invoice number
     const invoiceNumber = await generateInvoiceNumber();
 
-    // FIX: Convert paymentPeriod to a string
-    // If paymentReport.paymentPeriod is a Date, format it to a readable string
     let paymentPeriod;
     if (paymentReport.paymentPeriod) {
-      // Convert Date to string format (e.g., "June 2026" or "June 1, 2026 - June 30, 2026")
       const paymentDate = new Date(paymentReport.paymentPeriod);
-      
-      // Use the existing buildPaymentPeriodLabel function to get a consistent format
-      // Pass the tenant's payment policy to get the correct period label
       paymentPeriod = buildPaymentPeriodLabel(paymentDate, tenant.paymentPolicy || 'MONTHLY');
     } else {
-      // Fallback to current month if no payment period
       paymentPeriod = buildPaymentPeriodLabel(new Date(), tenant.paymentPolicy || 'MONTHLY');
     }
 
-    // Create invoice record for the balance with paymentPolicy
     const invoice = await prisma.invoice.create({
       data: {
         invoiceNumber,
@@ -892,7 +869,7 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
         paymentReportId: paymentReportId,
         issueDate: new Date(),
         dueDate: new Date(dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)),
-        paymentPeriod: paymentPeriod, // Now this is a String, not a Date
+        paymentPeriod: paymentPeriod,
         rent,
         serviceCharge,
         vat,
@@ -917,13 +894,16 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
       }
     });
 
-    // Generate PDF
-    const pdfBuffer = await generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport);
+    // Generate PDF using the same template as WhatsApp sends
+    const pdfBuffer = await generatePDF(buildInvoiceHtml(invoice), {
+  displayHeaderFooter: true,
+  headerTemplate: '<div></div>',
+  footerTemplate: buildInvoiceFooterTemplate(),
+  margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+});
     
-    // Upload PDF to storage
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
 
-    // Update invoice with PDF URL
     const updatedInvoice = await prisma.invoice.update({
       where: { id: invoice.id },
       data: { pdfUrl }
@@ -950,7 +930,6 @@ export const getPartialPayments = async (req, res) => {
     const { propertyId, page = 1, limit = 10 } = req.query;
     const skip = (page - 1) * limit;
 
-    // Check base permission
     if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
       const hasViewPermission = await permissionService.hasPermission(
         userId, 
@@ -971,7 +950,6 @@ export const getPartialPayments = async (req, res) => {
       }
     };
 
-    // Filter by property if provided
     if (propertyId) {
       if (userRole !== 'ADMIN') {
         const canView = await canViewInvoicesForProperty(userId, userRole, propertyId);
@@ -1095,7 +1073,6 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
 
     const propertyId = invoice.tenant?.unit?.propertyId;
 
-    // Check permission to update invoice
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
@@ -1178,7 +1155,6 @@ export const deleteInvoice = async (req, res) => {
       force = false 
     } = req.body;
     
-    // Find invoice with comprehensive related data
     const invoice = await prisma.invoice.findUnique({
       where: { id },
       include: {
@@ -1236,7 +1212,6 @@ export const deleteInvoice = async (req, res) => {
 
     const propertyId = invoice.tenant?.unit?.property?.id;
 
-    // Check permission to delete invoice
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
@@ -1260,9 +1235,8 @@ export const deleteInvoice = async (req, res) => {
       }
     }
     
-    // Check age for safety
     const invoiceAge = Date.now() - new Date(invoice.createdAt).getTime();
-    const maxAge = 60 * 24 * 60 * 60 * 1000; // 60 days
+    const maxAge = 60 * 24 * 60 * 60 * 1000;
     
     if (!force && invoiceAge > maxAge && userRole !== 'ADMIN') {
       return res.status(400).json({
@@ -1293,9 +1267,7 @@ export const deleteInvoice = async (req, res) => {
       unlinkedRecords: 0
     };
     
-    // Start transaction for comprehensive cleanup
     await prisma.$transaction(async (tx) => {
-      // 1. Delete the main invoice PDF
       if (invoice.pdfUrl) {
         try {
           const fileName = invoice.pdfUrl.split('/').pop();
@@ -1311,11 +1283,9 @@ export const deleteInvoice = async (req, res) => {
         }
       }
       
-      // 2. Handle payment report and related data
       if (invoice.paymentReportId && invoice.paymentReport && (deletePaymentReport || cascadeDelete)) {
         const paymentReport = invoice.paymentReport;
         
-        // 2a. Delete receipt PDF
         if (paymentReport.receiptUrl) {
           try {
             await deleteFromStorage(paymentReport.receiptUrl);
@@ -1326,7 +1296,6 @@ export const deleteInvoice = async (req, res) => {
           }
         }
         
-        // 2b. Delete related income records
         if (deleteIncome || cascadeDelete) {
           const incomeRecords = await tx.income.findMany({
             where: { 
@@ -1357,7 +1326,6 @@ export const deleteInvoice = async (req, res) => {
           }
         }
         
-        // 2c. Delete commission records
         if (deleteCommissions || cascadeDelete) {
           await tx.managerCommission.deleteMany({
             where: {
@@ -1369,7 +1337,6 @@ export const deleteInvoice = async (req, res) => {
           });
         }
         
-        // 2d. Delete related bill invoices
         if ((deleteBillInvoices || cascadeDelete) && paymentReport.billInvoices.length > 0) {
           for (const billInvoice of paymentReport.billInvoices) {
             if (billInvoice.pdfUrl) {
@@ -1396,7 +1363,6 @@ export const deleteInvoice = async (req, res) => {
           }
         }
         
-        // 2e. Delete related invoices
         if ((deleteRelatedInvoices || cascadeDelete) && paymentReport.invoices.length > 0) {
           for (const relatedInvoice of paymentReport.invoices) {
             if (relatedInvoice.id !== invoice.id) {
@@ -1425,7 +1391,6 @@ export const deleteInvoice = async (req, res) => {
           }
         }
         
-        // 2f. Delete payment report
         await tx.paymentReport.delete({
           where: { id: paymentReport.id }
         });
@@ -1437,7 +1402,6 @@ export const deleteInvoice = async (req, res) => {
         };
       }
       
-      // 3. Delete the main invoice
       await tx.invoice.delete({
         where: { id }
       });
@@ -1491,7 +1455,6 @@ export const deleteInvoicePDF = async (req, res) => {
 
     const propertyId = invoice.tenant?.unit?.propertyId;
 
-    // Check permission to delete PDF
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
@@ -1522,7 +1485,6 @@ export const deleteInvoicePDF = async (req, res) => {
       });
     }
     
-    // Delete PDF file from storage
     const filePath = path.join(
       process.cwd(), 
       'uploads', 
@@ -1534,7 +1496,6 @@ export const deleteInvoicePDF = async (req, res) => {
       await fs.promises.unlink(filePath);
     }
     
-    // Update invoice to remove PDF URL
     await prisma.invoice.update({
       where: { id },
       data: { pdfUrl: null }
@@ -1552,374 +1513,3 @@ export const deleteInvoicePDF = async (req, res) => {
     });
   }
 };
-
-// ======================================================
-// PDF GENERATION FUNCTIONS
-// ======================================================
-
-// Helper function to generate Invoice PDF
-async function generateInvoicePDF(invoice, tenant) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
-      const chunks = [];
-
-      doc.on('data', (chunk) => chunks.push(chunk));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
-
-      // Letterhead image handling
-      const projectRoot = process.cwd();
-      const possiblePaths = [
-        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
-      ];
-
-      let letterheadPath = null;
-      let imageLoaded = false;
-
-      for (const possiblePath of possiblePaths) {
-        if (fs.existsSync(possiblePath)) {
-          const stats = fs.statSync(possiblePath);
-          if (stats.size > 0) {
-            letterheadPath = possiblePath;
-            console.log(`✓ Letterhead found: ${possiblePath}`);
-            break;
-          }
-        }
-      }
-
-      if (letterheadPath) {
-        try {
-          const imageBuffer = fs.readFileSync(letterheadPath);
-          const dimensions = sizeOf(imageBuffer);
-          const maxWidth = doc.page.width - 100;
-          const scale = maxWidth / dimensions.width;
-          const scaledHeight = dimensions.height * scale;
-          const finalHeight = Math.min(scaledHeight, 120);
-          const finalWidth = finalHeight !== scaledHeight
-            ? (dimensions.width * finalHeight) / dimensions.height
-            : maxWidth;
-          const xPosition = 50 + (maxWidth - finalWidth) / 2;
-
-          doc.image(imageBuffer, xPosition, 30, { width: finalWidth });
-          doc.y = 30 + finalHeight + 20;
-          imageLoaded = true;
-        } catch (err) {
-          console.warn('✗ Letterhead failed to load:', err.message);
-        }
-      }
-
-      if (!imageLoaded) {
-        doc.y = 100;
-        doc.fontSize(20)
-          .fillColor('#1e293b')
-          .text('INTERPARK ENTERPRISES LIMITED', 50, 50, { align: 'center' });
-      }
-
-      doc.moveDown(2);
-      
-      doc.fontSize(28)
-        .fillColor('#1e293b')
-        .text('Pro Forma Invoice', { align: 'center' })
-        .moveDown(0.3);
-      
-      const propertyName = invoice.tenant.unit?.property?.name || 'N/A';
-      doc.fontSize(14)
-        .fillColor('#005478')
-        .font('Helvetica-Bold')
-        .text(propertyName, { align: 'center' })
-        .font('Helvetica')
-        .moveDown(1);
-
-      const topY = doc.y;
-      
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('BILL TO:', 50, topY, { underline: true });
-
-      doc.fontSize(10)
-        .fillColor('#374151')
-        .text(invoice.tenant.fullName, 50, topY + 25)
-        .text(`Contact: ${invoice.tenant.contact}`, 50, topY + 40)
-        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, topY + 55)
-        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, topY + 70);
-
-      const invoiceDetailsX = 300;
-      
-      doc.fontSize(10)
-        .fillColor('#1e293b')
-        .text(`Invoice Number: ${invoice.invoiceNumber}`, invoiceDetailsX, topY)
-        .text(`Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`, invoiceDetailsX, topY + 15)
-        .text(`Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`, invoiceDetailsX, topY + 30)
-        .text(`Payment Period: ${invoice.paymentPeriod}`, invoiceDetailsX, topY + 45)
-        .text(`Payment Policy: ${toTitleCase(invoice.paymentPolicy)}`, invoiceDetailsX, topY + 60);
-
-      if (tenant.vatRate > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
-        doc.text(`VAT Rate: ${tenant.vatRate}% (${tenant.vatType})`, invoiceDetailsX, topY + 75);
-      }
-
-      doc.moveDown(6);
-      const tableTop = doc.y;
-      const itemX = 50;
-      const descX = 200;
-      const amountX = 450;
-      const rowHeight = 25;
-
-      doc.rect(itemX, tableTop, 500, rowHeight).fill('#005478');
-      doc.fillColor('#fff')
-        .fontSize(11)
-        .text('Item', itemX + 10, tableTop + 8)
-        .text('Description', descX, tableTop + 8)
-        .text('Amount', amountX, tableTop + 8, { width: 80, align: 'right' });
-
-      let currentY = tableTop + rowHeight;
-      doc.fillColor('#1e293b')
-        .fontSize(10)
-        .text('Rent', itemX + 10, currentY + 8)
-        .text(`${toTitleCase(invoice.paymentPolicy)} rent for ${invoice.paymentPeriod}`, descX, currentY + 8)
-        .text(invoice.rent.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 8, { width: 80, align: 'right' });
-
-      currentY += rowHeight;
-
-      if (invoice.serviceCharge > 0) {
-        doc.text('Service Charge', itemX + 10, currentY + 8)
-          .text(`${toTitleCase(invoice.paymentPolicy)} service charge for ${invoice.paymentPeriod}`, descX, currentY + 8)
-          .text(invoice.serviceCharge.toLocaleString('en-US', { minimumFractionDigits: 2 }), amountX, currentY + 8, { width: 80, align: 'right' });
-        currentY += rowHeight;
-      }
-
-      const subtotal = invoice.rent + (invoice.serviceCharge || 0);
-      doc.moveDown(1);
-      doc.text('Subtotal:', descX, currentY + 5)
-        .text(`Ksh ${subtotal.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY + 5, { width: 80, align: 'right' });
-
-      if (invoice.vat > 0 && tenant.vatType !== 'NOT_APPLICABLE') {
-        currentY += 25;
-        doc.text(`VAT (${tenant.vatRate}%):`, descX, currentY)
-          .text(`Ksh ${invoice.vat.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY, { width: 80, align: 'right' });
-      }
-
-      currentY += 35;
-      doc.rect(itemX, currentY, 500, 35).fill('#f8fafc');
-      doc.fontSize(14)
-        .fillColor('#1e293b')
-        .text('TOTAL DUE:', descX, currentY + 10)
-        .fontSize(12)
-        .text(`Ksh ${invoice.totalDue.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX - 20, currentY + 10, { width: 100, align: 'right' });
-
-      const footerY = doc.page.height - 100;
-      doc.rect(50, footerY - 10, 500, 1).fill('#e5e7eb');
-      doc.fontSize(8)
-        .fillColor('#6b7280')
-        .text(
-          'Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke',
-          50, footerY, { align: 'center', width: 500 }
-        );
-
-      doc.end();
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
-
-// Helper function to generate PDF for partial payment balance invoice
-async function generatePartialPaymentInvoicePDF(invoice, tenant, paymentReport) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
-      const chunks = [];
-
-      doc.on('data', (chunk) => chunks.push(chunk));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
-
-      // Letterhead image handling
-      const projectRoot = process.cwd();
-      const possiblePaths = [
-        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
-      ];
-
-      let letterheadPath = null;
-      let imageLoaded = false;
-
-      for (const possiblePath of possiblePaths) {
-        if (fs.existsSync(possiblePath)) {
-          const stats = fs.statSync(possiblePath);
-          if (stats.size > 0) {
-            letterheadPath = possiblePath;
-            break;
-          }
-        }
-      }
-
-      if (letterheadPath) {
-        try {
-          const imageBuffer = fs.readFileSync(letterheadPath);
-          const dimensions = sizeOf(imageBuffer);
-          const maxWidth = doc.page.width - 100;
-          const scale = maxWidth / dimensions.width;
-          const scaledHeight = dimensions.height * scale;
-          const finalHeight = Math.min(scaledHeight, 120);
-          const finalWidth = finalHeight !== scaledHeight
-            ? (dimensions.width * finalHeight) / dimensions.height
-            : maxWidth;
-          const xPosition = 50 + (maxWidth - finalWidth) / 2;
-
-          doc.image(imageBuffer, xPosition, 30, { width: finalWidth });
-          doc.y = 30 + finalHeight + 20;
-          imageLoaded = true;
-        } catch (err) {
-          console.warn('Letterhead failed to load:', err.message);
-        }
-      }
-
-      if (!imageLoaded) {
-        doc.y = 100;
-      }
-
-      doc.moveDown(2);
-      doc.fontSize(28)
-        .fillColor('#dc2626')
-        .text('BALANCE INVOICE', { align: 'center' })
-        .moveDown(0.3);
-      
-      const propertyName = invoice.tenant.unit?.property?.name || 'N/A';
-      doc.fontSize(14)
-        .fillColor('#dc2626')
-        .font('Helvetica-Bold')
-        .text(propertyName, { align: 'center' })
-        .font('Helvetica')
-        .moveDown(0.5);
-
-      const topY = doc.y;
-      
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('BILL TO:', 50, topY, { underline: true });
-
-      doc.fontSize(10)
-        .fillColor('#374151')
-        .text(invoice.tenant.fullName, 50, topY + 25)
-        .text(`Contact: ${invoice.tenant.contact}`, 50, topY + 40)
-        .text(`KRA Pin: ${tenant.KRAPin || 'N/A'}`, 50, topY + 55)
-        .text(`Unit: ${invoice.tenant.unit?.type || 'N/A'}`, 50, topY + 70);
-
-      const invoiceDetailsX = 300;
-      
-      doc.fontSize(10)
-        .fillColor('#1e293b')
-        .text(`Invoice Number: ${invoice.invoiceNumber}`, invoiceDetailsX, topY)
-        .text(`Issue Date: ${new Date(invoice.issueDate).toLocaleDateString('en-US')}`, invoiceDetailsX, topY + 15)
-        .text(`Due Date: ${new Date(invoice.dueDate).toLocaleDateString('en-US')}`, invoiceDetailsX, topY + 30)
-        .text(`Original Payment Period: ${invoice.paymentPeriod}`, invoiceDetailsX, topY + 45)
-        .text(`Payment Policy: ${toTitleCase(invoice.paymentPolicy)}`, invoiceDetailsX, topY + 60);
-
-      const statusWidth = 100;
-      const statusX = invoiceDetailsX + 150;
-      doc.rect(statusX, topY, statusWidth, 25).fillAndStroke('#dc2626', '#dc2626');
-      doc.fillColor('#fff')
-        .fontSize(12)
-        .text('UNPAID', statusX, topY + 7, { width: statusWidth, align: 'center' });
-
-      doc.moveDown(6);
-      const alertY = doc.y;
-      doc.rect(50, alertY, 500, 50).fillAndStroke('#fef3c7', '#f59e0b');
-      doc.fontSize(10)
-        .fillColor('#92400e')
-        .text('⚠️  BALANCE INVOICE - OUTSTANDING PAYMENT', 60, alertY + 8, { bold: true })
-        .text('This invoice represents the outstanding balance from a partial payment.', 60, alertY + 23)
-        .text(`Original Payment Period: ${invoice.paymentPeriod}`, 60, alertY + 38);
-
-      doc.moveDown(3);
-      const summaryY = doc.y;
-      doc.fontSize(12)
-        .fillColor('#1e293b')
-        .text('PAYMENT SUMMARY', { underline: true })
-        .moveDown(0.5);
-
-      doc.rect(50, summaryY + 25, 500, 100).fillAndStroke('#f8fafc', '#e2e8f0');
-      const summaryContentY = summaryY + 45;
-      
-      doc.fontSize(11)
-        .fillColor('#374151')
-        .text('Original Total Due:', 70, summaryContentY)
-        .text(`Ksh ${paymentReport.totalDue.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 450, summaryContentY, { width: 80, align: 'right' });
-
-      doc.fillColor('#10b981')
-        .text('Amount Previously Paid:', 70, summaryContentY + 25)
-        .text(`Ksh ${paymentReport.amountPaid.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 450, summaryContentY + 25, { width: 80, align: 'right' });
-
-      doc.fillColor('#dc2626')
-        .fontSize(12)
-        .text('OUTSTANDING BALANCE:', 70, summaryContentY + 50, { bold: true })
-        .text(`Ksh ${paymentReport.arrears.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 450, summaryContentY + 50, { width: 80, align: 'right', bold: true });
-
-      doc.moveDown(5);
-      const tableTop = doc.y;
-      const itemX = 50;
-      const descX = 200;
-      const amountX = 450;
-      const rowHeight = 25;
-
-      doc.rect(itemX, tableTop, 500, rowHeight).fillAndStroke('#005478', '#005478');
-      doc.fillColor('#fff')
-        .fontSize(11)
-        .text('Item', itemX + 10, tableTop + 8)
-        .text('Description', descX, tableTop + 8)
-        .text('Amount (Ksh)', amountX, tableTop + 8, { width: 80, align: 'right' });
-
-      let currentY = tableTop + rowHeight;
-      doc.fillColor('#1e293b')
-        .fontSize(10)
-        .text('Balance Due', itemX + 10, currentY + 8)
-        .text(`Outstanding amount for ${invoice.paymentPeriod} (${invoice.paymentPolicy})`, descX, currentY + 8)
-        .text(`Ksh ${invoice.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX, currentY + 8, { width: 80, align: 'right' });
-
-      currentY += rowHeight + 15;
-      doc.rect(itemX, currentY, 500, 40).fillAndStroke('#fee2e2', '#dc2626');
-      doc.fontSize(16)
-        .fillColor('#dc2626')
-        .text('TOTAL BALANCE DUE', descX, currentY + 12, { bold: true })
-        .text(`Ksh ${invoice.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, amountX - 10, currentY + 12, { width: 90, align: 'right', bold: true });
-
-      currentY += 60;
-      if (invoice.notes) {
-        doc.fontSize(10)
-          .fillColor('#374151')
-          .text('Notes:', 50, currentY)
-          .moveDown(0.3)
-          .text(invoice.notes, { width: 500, indent: 10 });
-        currentY = doc.y + 20;
-      }
-
-      doc.rect(50, currentY, 500, 40).fillAndStroke('#fef3c7', '#d97706');
-      doc.fontSize(11)
-        .fillColor('#92400e')
-        .text('⚠️  IMPORTANT NOTICE', 60, currentY + 8, { bold: true })
-        .text(`Please settle this ${invoice.paymentPolicy.toLowerCase()} outstanding balance by the due date to avoid additional charges.`, 60, currentY + 25, { width: 480 });
-
-      const footerY = doc.page.height - 100;
-      doc.rect(50, footerY - 10, 500, 1).fillAndStroke('#e5e7eb', '#e5e7eb');
-      doc.fontSize(9)
-        .fillColor('#6b7280')
-        .text('Thank you for your business!', 50, footerY, { align: 'center', width: 500 })
-        .moveDown(0.5)
-        .fontSize(8)
-        .text(
-          'Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke',
-          { align: 'center', width: 500 }
-        );
-
-      doc.end();
-    } catch (error) {
-      reject(error);
-    }
-  });
-}

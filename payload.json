@@ -1,0 +1,10 @@
+{
+  "messaging_product": "whatsapp",
+  "to": "254727783444",
+  "type": "document",
+  "document": {
+    "id": "1022428247076393",
+    "filename": "Payment_Report.pdf",
+    "caption": "Payment Report from Interpark"
+  }
+}

@@ -98,6 +98,7 @@ model Property {
   incomes            Income[]
   leads              Lead[]
   commissions        ManagerCommission[]
+  whatsappLogs  WhatsAppLog[]
   offerLetters       OfferLetter[]
   landlord           Landlord?           @relation(fields: [landlordId], references: [id])
   manager            User?               @relation(fields: [managerId], references: [id])
@@ -413,6 +414,7 @@ model Tenant {
   paymentReports      PaymentReport[]
   serviceCharge       ServiceCharge?
   unit                Unit                 @relation(fields: [unitId], references: [id])
+  whatsappLogs  WhatsAppLog[]
 }
 
 model ServiceCharge {
@@ -916,7 +918,8 @@ model DemandLetter {
   previousInvoiceRef String?
 
   status DemandLetterStatus @default(DRAFT)
-
+  sentAt      DateTime?          
+  sentTo      String?  
   documentUrl String?
   notes       String?
 
@@ -1161,3 +1164,35 @@ enum PaymentMethod {
   MPESA
   CHEQUE
 }
+
+
+model WhatsAppLog {
+  id                String    @id @default(cuid())
+  tenantId          String
+  tenant            Tenant    @relation(fields: [tenantId], references: [id])
+  propertyId        String
+  property          Property  @relation(fields: [propertyId], references: [id])
+  documentType      String    // "Payment Report", "Invoice", "Demand Letter", "Bill Invoices"
+  recipientPhone    String    // Tenant's phone number in international format (e.g., +254712345678)
+  whatsappMessageId String?   // Message ID returned by WhatsApp API
+  mediaUrl          String?   // URL of the uploaded media
+  status            String    @default("pending") // "pending", "sent", "delivered", "failed"
+  errorMessage      String?   // Error details if status is "failed"
+  sentAt            DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([tenantId])
+  @@index([propertyId])
+  @@index([documentType])
+  @@index([sentAt])
+}
+
+// 2. Ensure Tenant model has phone number field (add if missing)
+// In your existing Tenant model, ensure you have:
+// phoneNumber String?   // Tenant's phone number
+// alternativePhone String? // Alternative contact number
+
+// 3. Add WhatsApp-related fields to Tenant model if needed
+// lastWhatsAppSentAt DateTime?
+// whatsAppOptIn     Boolean   @default(false)

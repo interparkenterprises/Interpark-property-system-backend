@@ -311,82 +311,26 @@ export const generateDemandLetter = async (req, res) => {
       }
     });
 
-    // Prepare data for PDF generation
-    const pdfData = {
-      // Property Information
-      propertyName: property.name,
-      propertyAddress: property.address,
-      propertyLRNumber: property.lrNumber,
-      
-      // Landlord Information
-      landlordName: landlord.name,
-      landlordPOBox: landlord.address || 'P.O. Box …………….',
-      landlordPhone: landlord.phone || '……………………',
-      landlordEmail: landlord.email || '…………………………',
-      
-      // Tenant Information
-      tenantName: tenant.fullName,
-      tenantPOBox: tenant.POBox || '………………………',
-      tenantContact: tenant.contact,
-      tenantEmail: tenant.email,
-      
-      // Letter Details
-      letterNumber,
-      issueDate: new Date().toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      }),
-      referenceNumber: demandLetter.referenceNumber,
-      
-      // Financial Information
-      outstandingAmount: parseFloat(outstandingAmount).toLocaleString('en-KE', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }),
-      rentalPeriod,
-      rentAmount: tenant.rent.toLocaleString('en-KE', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }),
-      paymentPolicy: formatPaymentPolicy(tenant.paymentPolicy),
-      dueDate: new Date(dueDate).toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      }),
-      demandPeriod,
-      
-      // Unit Information
-      unitNo: unit.unitNo || 'N/A',
-      
-      // Optional fields
-      partialPayment: partialPayment ? parseFloat(partialPayment).toLocaleString('en-KE', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }) : null,
-      partialPaymentDate: partialPaymentDate ? new Date(partialPaymentDate).toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      }) : null,
-      
-      notes
-    };
-
     // Generate PDF
-    const pdfBuffer = await generateDemandLetterPDF(pdfData);
+    const pdfBuffer = await generateDemandLetterPDF({
+  ...demandLetter,
+  tenant,
+  landlord,
+  property,
+  unit,
+  invoice
+});
 
     // Generate filename and upload
     const fileName = generateFileName(`demand_letter_${letterNumber}`);
     const filePath = `demand-letters/${fileName}`;
-    const documentUrl = await uploadDocument(pdfBuffer, filePath);
+    const uploadResult = await uploadDocument(pdfBuffer, filePath);
 
     // Update demand letter with document URL and status
     const updatedDemandLetter = await prisma.demandLetter.update({
       where: { id: demandLetter.id },
       data: {
-        documentUrl,
+        documentUrl: uploadResult.url,
         status: 'GENERATED',
         generatedAt: new Date()
       },

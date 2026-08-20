@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import errorHandler from './middleware/errorHandler.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -26,6 +25,8 @@ import activationRoutes from './routes/activation.routes.js';
 import demandLetterRoutes from './routes/demandLetter.routes.js';
 import rbacRoutes from './routes/rbac.routes.js';
 import employeeRoutes from './routes/employee.routes.js';
+import whatsappRoutes from './routes/whatsapp.routes.js';
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -65,7 +66,11 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: false }));
 
 // Serve uploaded files
@@ -94,17 +99,24 @@ app.use('/api/activations', activationRoutes);
 app.use('/api/demand-letters', demandLetterRoutes);
 app.use('/api/rbac', rbacRoutes);
 app.use('/api/employees', employeeRoutes);
+app.use('/api/whatsapp', whatsappRoutes);
 // Basic route for health check
 app.get('/api/health', (req, res) => {
   res.json({ message: 'Property Management API is running!' });
 });
 
-// Error handler middleware
-app.use(errorHandler);
+
 
 // Handle undefined routes
 app.use((req, res) => {
   res.status(404).json({ message: 'Route not found' });
+});
+
+app.use((err, req, res, next) => {
+  if (err.response && err.response.data) {
+    console.error('WhatsApp API Error:', err.response.data);
+  }
+  next(err);
 });
 
 export default app;
