@@ -1192,7 +1192,25 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       });
     }
 
-    // Get tenants with their invoices AND payment reports
+    // =============================================
+    // Parse date filters
+    // =============================================
+    let fromDateObj = null;
+    let toDateObj = null;
+    
+    if (dateFrom) {
+      fromDateObj = new Date(dateFrom);
+      fromDateObj.setHours(0, 0, 0, 0);
+    }
+    
+    if (dateTo) {
+      toDateObj = new Date(dateTo);
+      toDateObj.setHours(23, 59, 59, 999);
+    }
+
+    // =============================================
+    // Get all tenants with their invoices and payment reports
+    // =============================================
     const tenants = await prisma.tenant.findMany({
       where: {
         unit: {
@@ -1244,6 +1262,33 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       }
     });
 
+    // =============================================
+    // Helper function to check if a date is within range
+    // =============================================
+    const isDateInRange = (dateStr) => {
+      if (!dateStr) return false;
+      
+      // If no date filters, include everything
+      if (!fromDateObj && !toDateObj) return true;
+      
+      try {
+        const checkDate = new Date(dateStr);
+        if (isNaN(checkDate.getTime())) {
+          return false;
+        }
+        
+        if (fromDateObj && checkDate < fromDateObj) return false;
+        if (toDateObj && checkDate > toDateObj) return false;
+        
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    // =============================================
+    // Build paymentReports query with date filter
+    // =============================================
     const where = {
       tenant: {
         unit: {
@@ -1256,10 +1301,13 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       where.status = status;
     }
 
-    if (dateFrom || dateTo) {
+    // =============================================
+    // FIX: Filter paymentReports by date range in the query
+    // =============================================
+    if (fromDateObj || toDateObj) {
       where.paymentPeriod = {};
-      if (dateFrom) where.paymentPeriod.gte = new Date(dateFrom);
-      if (dateTo) where.paymentPeriod.lte = new Date(dateTo);
+      if (fromDateObj) where.paymentPeriod.gte = fromDateObj.toISOString();
+      if (toDateObj) where.paymentPeriod.lte = toDateObj.toISOString();
     }
 
     const total = await prisma.paymentReport.count({ where });
@@ -1305,6 +1353,9 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       take: parseInt(take)
     });
 
+    // =============================================
+    // Initialize summary variables
+    // =============================================
     let totalRentCollected = 0;
     let totalRentExpected = 0;
     let totalArrears = 0;
@@ -1314,31 +1365,28 @@ export const getPropertyRentPaymentReport = async (req, res) => {
     let unpaidCount = 0;
     let creditCount = 0;
 
-    // Helper function to safely get period key from a date
-    const getPeriodKey = (date) => {
-      if (!date) return null;
-      try {
-        const d = typeof date === 'string' ? new Date(date) : date;
-        if (isNaN(d.getTime())) return null;
-        return d.toISOString().slice(0, 7);
-      } catch (e) {
-        return null;
-      }
-    };
-
     // =============================================
-    // FIXED: Process tenants using invoice data as source of truth
+    // Process each tenant with date filtering
     // =============================================
     for (const tenant of tenants) {
       const tenantReports = tenant.paymentReports || [];
       const tenantInvoices = tenant.invoices || [];
       
-      // Calculate paid amount from reports (including CREDIT reports)
-      let tenantPaid = tenantReports.reduce((sum, report) => sum + report.amountPaid, 0);
+      // =============================================
+      // FIX: Filter by date range
+      // =============================================
+      const filteredReports = tenantReports.filter(report => {
+        return isDateInRange(report.paymentPeriod);
+      });
       
-      // =============================================
-      // FIXED: Calculate arrears based on INVOICE status
-      // =============================================
+      const filteredInvoices = tenantInvoices.filter(invoice => {
+        return isDateInRange(invoice.paymentPeriod);
+      });
+      
+      // Calculate paid amount from filtered reports
+      let tenantPaid = filteredReports.reduce((sum, report) => sum + report.amountPaid, 0);
+      
+      // Calculate arrears from filtered invoices
       let totalDue = 0;
       let totalArrearsForTenant = 0;
       let hasUnpaidInvoices = false;
@@ -1346,25 +1394,21 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       let hasFullyPaidInvoices = false;
       let hasOverdueInvoices = false;
       
-      // Process invoices - this is the source of truth
-      for (const invoice of tenantInvoices) {
+      // Process filtered invoices
+      for (const invoice of filteredInvoices) {
         if (invoice.status === 'PAID') {
           hasFullyPaidInvoices = true;
-          // Fully paid invoices contribute nothing to arrears
           continue;
         } else if (invoice.status === 'PARTIAL') {
           hasPartialInvoices = true;
           const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
-          // Only include if balance is > 0.01 (avoid floating point issues)
           if (balance > 0.01) {
             totalDue += invoice.totalDue;
             totalArrearsForTenant += balance;
           } else {
-            // Balance is effectively zero, treat as paid
             hasFullyPaidInvoices = true;
           }
           
-          // Check if overdue
           if (new Date(invoice.dueDate) < new Date()) {
             hasOverdueInvoices = true;
           }
@@ -1373,19 +1417,16 @@ export const getPropertyRentPaymentReport = async (req, res) => {
           totalDue += invoice.totalDue;
           totalArrearsForTenant += invoice.totalDue;
           
-          // Check if overdue
           if (invoice.status === 'OVERDUE' || new Date(invoice.dueDate) < new Date()) {
             hasOverdueInvoices = true;
           }
         }
       }
       
-      // If there are no invoices, use payment reports as fallback
-      if (tenantInvoices.length === 0) {
-        // Calculate total due from reports (excluding CREDIT)
-        for (const report of tenantReports) {
+      // If no invoices in date range, use payment reports
+      if (filteredInvoices.length === 0) {
+        for (const report of filteredReports) {
           if (report.status === 'CREDIT') {
-            // Credit reports reduce arrears
             totalArrearsForTenant -= report.amountPaid;
           } else {
             totalDue += report.totalDue || 0;
@@ -1394,9 +1435,9 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         }
       }
       
-      // If there are only CREDIT reports and no invoices, arrears should be negative
-      if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
-        const totalCredit = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0);
+      // Handle CREDIT only cases
+      if (filteredReports.every(r => r.status === 'CREDIT') && filteredInvoices.length === 0) {
+        const totalCredit = filteredReports.reduce((sum, r) => sum + r.amountPaid, 0);
         totalArrearsForTenant = -totalCredit;
         totalDue = 0;
       }
@@ -1405,57 +1446,55 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       totalArrearsForTenant = parseFloat(totalArrearsForTenant.toFixed(2));
       totalDue = parseFloat(totalDue.toFixed(2));
       
-      totalRentCollected += tenantPaid;
-      totalRentExpected += totalDue;
-      totalArrears += totalArrearsForTenant;
+      // Add to totals (ONLY if there's activity in the date range)
+      if (filteredReports.length > 0 || filteredInvoices.length > 0) {
+        totalRentCollected += tenantPaid;
+        totalRentExpected += totalDue;
+        totalArrears += totalArrearsForTenant;
+      }
       
-      // Determine tenant status based on invoice status
+      // Determine tenant status based on filtered invoices
       let tenantStatus = 'PAID';
-      const hasAnyInvoices = tenantInvoices.length > 0;
+      const hasAnyInvoices = filteredInvoices.length > 0;
       
       if (hasAnyInvoices) {
         if (hasUnpaidInvoices) {
           tenantStatus = 'UNPAID';
           unpaidCount++;
         } else if (hasPartialInvoices) {
-          // Only count as partial if there's actually a balance
           if (totalArrearsForTenant > 0.01) {
             tenantStatus = 'PARTIAL';
             partialPaidCount++;
           } else {
-            // All partial invoices are effectively paid
             tenantStatus = 'PAID';
             fullyPaidCount++;
           }
         } else if (hasFullyPaidInvoices) {
-          // All invoices are fully paid
           tenantStatus = 'PAID';
           fullyPaidCount++;
         } else {
-          // No outstanding invoices
           tenantStatus = 'PAID';
           fullyPaidCount++;
         }
       } else {
-        // No invoices, check payment reports
-        const hasUnpaidPaymentReports = tenantReports.some(report => 
+        // No invoices in date range, check payment reports
+        const hasUnpaidPaymentReports = filteredReports.some(report => 
           report.status === 'UNPAID' || report.status === 'PARTIAL'
         );
-        const hasCreditReports = tenantReports.some(report => report.status === 'CREDIT');
+        const hasCreditReports = filteredReports.some(report => report.status === 'CREDIT');
         
-        if (hasCreditReports && !hasUnpaidPaymentReports && tenantReports.length > 0) {
+        if (hasCreditReports && !hasUnpaidPaymentReports && filteredReports.length > 0) {
           tenantStatus = 'CREDIT';
           creditCount++;
         } else if (hasUnpaidPaymentReports) {
           tenantStatus = 'UNPAID';
           unpaidCount++;
-        } else if (tenantReports.length > 0) {
+        } else if (filteredReports.length > 0) {
           tenantStatus = 'PAID';
           fullyPaidCount++;
         }
       }
       
-      // Check for overdue
       if (hasOverdueInvoices) {
         totalOverdueCount++;
       }
@@ -1465,8 +1504,12 @@ export const getPropertyRentPaymentReport = async (req, res) => {
       ? (totalRentCollected / totalRentExpected) * 100 
       : totalRentCollected > 0 ? 100 : 0;
 
+    // =============================================
+    // FIX: Monthly trends - only include reports in date range
+    // =============================================
     const monthlyTrends = {};
     paymentReports.forEach(report => {
+      // Only include if in date range (already filtered by query)
       const monthKey = new Date(report.paymentPeriod).toLocaleDateString('en-US', { 
         year: 'numeric', 
         month: 'short' 
@@ -1482,7 +1525,6 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         };
       }
       
-      // For CREDIT reports, adjust the expected and arrears
       let expectedAmount = report.totalDue;
       let arrearsAmount = report.arrears;
       
@@ -1498,20 +1540,28 @@ export const getPropertyRentPaymentReport = async (req, res) => {
     });
 
     // =============================================
-    // FIXED: Calculate tenant outstanding using invoice data
+    // FIX: Tenant Outstanding - ONLY show tenants with balances
     // =============================================
     const tenantOutstanding = tenants.map(tenant => {
       const tenantReports = tenant.paymentReports || [];
       const tenantInvoices = tenant.invoices || [];
       
-      // Calculate total due and arrears from invoices
+      // Filter by date range
+      const filteredReports = tenantReports.filter(report => isDateInRange(report.paymentPeriod));
+      const filteredInvoices = tenantInvoices.filter(invoice => isDateInRange(invoice.paymentPeriod));
+      
+      // If no activity in date range, skip this tenant
+      if (filteredReports.length === 0 && filteredInvoices.length === 0) {
+        return null;
+      }
+      
       let totalDue = 0;
       let totalArrears = 0;
       let hasUnpaid = false;
       let hasPartial = false;
       let hasPaid = false;
       
-      for (const invoice of tenantInvoices) {
+      for (const invoice of filteredInvoices) {
         if (invoice.status === 'PAID') {
           hasPaid = true;
           continue;
@@ -1531,9 +1581,8 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         }
       }
       
-      // If no invoices, use reports
-      if (tenantInvoices.length === 0) {
-        for (const report of tenantReports) {
+      if (filteredInvoices.length === 0) {
+        for (const report of filteredReports) {
           if (report.status === 'CREDIT') {
             totalArrears -= report.amountPaid;
           } else {
@@ -1543,57 +1592,80 @@ export const getPropertyRentPaymentReport = async (req, res) => {
         }
       }
       
-      // If only CREDIT reports exist, arrears should be negative
-      if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
-        const totalCredit = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0);
+      if (filteredReports.every(r => r.status === 'CREDIT') && filteredInvoices.length === 0) {
+        const totalCredit = filteredReports.reduce((sum, r) => sum + r.amountPaid, 0);
         totalArrears = -totalCredit;
         totalDue = 0;
       }
       
-      // Calculate total paid
-      const totalPaid = tenantReports.reduce((sum, r) => sum + r.amountPaid, 0) +
-                        tenantInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
+      const totalPaid = filteredReports.reduce((sum, r) => sum + r.amountPaid, 0) +
+        filteredInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
       
       totalDue = parseFloat(totalDue.toFixed(2));
       totalArrears = parseFloat(totalArrears.toFixed(2));
+      const outstandingBalance = parseFloat((totalDue - totalPaid).toFixed(2));
+      
+      // =============================================
+      // FIX: ONLY include tenants with outstanding balance (PARTIAL/UNPAID)
+      // Skip tenants with zero balance (PAID)
+      // =============================================
+      if (Math.abs(outstandingBalance) < 0.01 && totalArrears === 0 && filteredInvoices.length === 0) {
+        // Skip tenants with zero balance
+        return null;
+      }
       
       let status = 'PAID';
       if (hasUnpaid) {
         status = 'UNPAID';
       } else if (hasPartial && totalArrears > 0.01) {
         status = 'PARTIAL';
-      } else if (tenantReports.every(r => r.status === 'CREDIT') && tenantInvoices.length === 0) {
+      } else if (filteredReports.every(r => r.status === 'CREDIT') && filteredInvoices.length === 0) {
         status = 'CREDIT';
       } else if (hasPaid || totalArrears <= 0.01) {
         status = 'PAID';
       }
       
-      // Only include tenants with outstanding balance or credit
-      if (totalArrears !== 0 || totalDue > 0 || tenantReports.length > 0) {
-        return {
-          tenantId: tenant.id,
-          tenantName: tenant.fullName,
-          unitNo: tenant.unit?.unitNo || 'N/A',
-          unitType: tenant.unit?.type || 'N/A',
-          expectedTotal: totalDue,
-          paidTotal: parseFloat(totalPaid.toFixed(2)),
-          outstandingBalance: parseFloat((totalDue - totalPaid).toFixed(2)),
-          arrears: totalArrears,
-          lastPaymentDate: tenantReports[0]?.paymentPeriod || null,
-          paymentStatus: status,
-          invoiceCount: tenantInvoices.length,
-          invoiceStatuses: tenantInvoices.map(inv => inv.status),
-          creditAmount: totalArrears < 0 ? Math.abs(totalArrears) : 0
-        };
+      // =============================================
+      // FIX: Only include if status is PARTIAL or UNPAID or has credit
+      // =============================================
+      if (status !== 'PARTIAL' && status !== 'UNPAID' && status !== 'CREDIT') {
+        return null;
       }
       
-      return null;
-    }).filter(Boolean);
+      const lastPayment = filteredReports
+        .filter(report => report.datePaid)
+        .sort((a, b) => new Date(b.datePaid) - new Date(a.datePaid))[0];
+      
+      return {
+        tenantId: tenant.id,
+        tenantName: tenant.fullName,
+        unitNo: tenant.unit?.unitNo || 'N/A',
+        unitType: tenant.unit?.type || 'N/A',
+        expectedTotal: totalDue,
+        paidTotal: parseFloat(totalPaid.toFixed(2)),
+        outstandingBalance: outstandingBalance,
+        arrears: totalArrears,
+        lastPaymentDate: lastPayment?.datePaid || 'No payments',
+        paymentStatus: status,
+        invoiceCount: filteredInvoices.length,
+        invoiceStatuses: filteredInvoices.map(inv => inv.status),
+        creditAmount: totalArrears < 0 ? Math.abs(totalArrears) : 0
+      };
+    }).filter(Boolean); // Remove null entries
 
     // Calculate total credit amount
     const totalCredit = tenantOutstanding
       .filter(t => t.creditAmount > 0)
       .reduce((sum, t) => sum + t.creditAmount, 0);
+
+    // =============================================
+    // FIX: Count total tenants with activity in date range
+    // =============================================
+    const activeTenants = tenants.filter(tenant => {
+      const hasReports = tenant.paymentReports.some(report => isDateInRange(report.paymentPeriod));
+      const hasInvoices = tenant.invoices.some(invoice => isDateInRange(invoice.paymentPeriod));
+      return hasReports || hasInvoices;
+    });
 
     res.json({
       success: true,
@@ -1604,7 +1676,7 @@ export const getPropertyRentPaymentReport = async (req, res) => {
           address: property.address
         },
         summary: {
-          totalTenants: tenants.length,
+          totalTenants: activeTenants.length, // Only tenants with activity in date range
           totalRentCollected: parseFloat(totalRentCollected.toFixed(2)),
           totalRentExpected: parseFloat(totalRentExpected.toFixed(2)),
           totalArrears: parseFloat(totalArrears.toFixed(2)),
@@ -1643,6 +1715,10 @@ export const getPropertyRentPaymentReport = async (req, res) => {
           limit: parseInt(take),
           total,
           totalPages: Math.ceil(total / take)
+        },
+        dateRange: {
+          from: dateFrom || null,
+          to: dateTo || null
         }
       }
     });
