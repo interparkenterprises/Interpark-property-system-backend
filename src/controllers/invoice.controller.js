@@ -701,10 +701,78 @@ export const updateInvoiceStatus = async (req, res) => {
       data: updateData
     });
 
+    // =============================================
+    // FIXED: Update linked payment reports when invoice status changes
+    // =============================================
+    if (updatedInvoice.paymentReportId) {
+      console.log(`Reconciling payment report for invoice ${updatedInvoice.invoiceNumber}`);
+      
+      // Get all invoices linked to this payment report
+      const reportInvoices = await prisma.invoice.findMany({
+        where: {
+          paymentReportId: updatedInvoice.paymentReportId
+        }
+      });
+      
+      // Check if all invoices are fully paid
+      const allFullyPaid = reportInvoices.every(inv => inv.status === 'PAID');
+      
+      // Calculate actual totals
+      const totalDue = reportInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
+      const totalPaid = reportInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
+      const actualArrears = Math.max(0, totalDue - totalPaid);
+      
+      // Determine correct status
+      let correctStatus = 'UNPAID';
+      if (allFullyPaid || actualArrears === 0) {
+        correctStatus = 'PAID';
+      } else if (actualArrears > 0 && totalPaid > 0) {
+        correctStatus = 'PARTIAL';
+      } else if (actualArrears > 0 && totalPaid === 0) {
+        correctStatus = 'UNPAID';
+      }
+      
+      // Get the payment report to check if it needs updating
+      const paymentReport = await prisma.paymentReport.findUnique({
+        where: { id: updatedInvoice.paymentReportId }
+      });
+      
+      if (paymentReport) {
+        // Update if status changed or arrears changed significantly
+        if (correctStatus !== paymentReport.status || 
+            Math.abs(paymentReport.arrears - actualArrears) > 0.01) {
+          
+          await prisma.paymentReport.update({
+            where: { id: updatedInvoice.paymentReportId },
+            data: {
+              status: correctStatus,
+              arrears: actualArrears,
+              amountPaid: totalPaid,
+              rent: reportInvoices.reduce((sum, inv) => sum + (inv.rent || 0), 0),
+              serviceCharge: reportInvoices.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
+              vat: reportInvoices.reduce((sum, inv) => sum + (inv.vat || 0), 0),
+              totalDue: totalDue,
+              updatedAt: new Date()
+            }
+          });
+          
+          console.log(`Reconciled payment report ${paymentReport.id}: ${paymentReport.status} -> ${correctStatus}`);
+        }
+      }
+    }
+
     res.json({
       success: true,
-      data: updatedInvoice,
-      message: 'Invoice updated successfully'
+      data: {
+        ...updatedInvoice,
+        reconciliation: updatedInvoice.paymentReportId ? {
+          paymentReportId: updatedInvoice.paymentReportId,
+          reconciled: true,
+          status: updatedInvoice.status
+        } : null
+      },
+      message: 'Invoice updated successfully' + 
+        (updatedInvoice.paymentReportId ? ' (Linked payment report reconciled)' : '')
     });
   } catch (error) {
     console.error('Error updating invoice:', error);

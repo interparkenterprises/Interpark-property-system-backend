@@ -2579,6 +2579,8 @@ export const createPaymentReport = async (req, res) => {
       // =============================================
       // FIXED: Process invoices with proper status updates
       // =============================================
+      const newlyPaidInvoiceIds = [];
+      
       for (const invoice of invoicesToProcess) {
         if (remainingPayment <= 0) break;
         
@@ -2598,8 +2600,9 @@ export const createPaymentReport = async (req, res) => {
         // FIXED: Determine new status based on balance
         // =============================================
         let newStatus = invoice.status;
-        if (newBalance <= 0.01) {
-          // Fully paid - even if it was previously partial
+        const wasFullyPaid = newBalance <= 0.01;
+        
+        if (wasFullyPaid) {
           newStatus = 'PAID';
         } else if (paymentToApply > 0 && invoice.status === 'UNPAID') {
           newStatus = 'PARTIAL';
@@ -2620,6 +2623,11 @@ export const createPaymentReport = async (req, res) => {
           }
         });
 
+        // Track newly paid invoices for reconciliation
+        if (wasFullyPaid && invoice.status !== 'PAID') {
+          newlyPaidInvoiceIds.push(invoice.id);
+        }
+
         updatedInvoices.push({
           id: updatedInvoice.id,
           invoiceNumber: updatedInvoice.invoiceNumber,
@@ -2633,10 +2641,79 @@ export const createPaymentReport = async (req, res) => {
           wasAutoPaid: false,
           paymentPolicy: updatedInvoice.paymentPolicy,
           selectionType: invoiceIds.length > 0 ? 'USER_SELECTED' : 'FIFO_ALLOCATION',
-          isFullyPaidNow: newStatus === 'PAID'
+          isFullyPaidNow: wasFullyPaid
         });
 
         remainingPayment -= paymentToApply;
+      }
+
+      // =============================================
+      // FIXED: Reconcile previous payment reports when invoices become fully paid
+      // =============================================
+      if (newlyPaidInvoiceIds.length > 0) {
+        console.log(`Reconciling payment reports for ${newlyPaidInvoiceIds.length} newly paid invoices`);
+        
+        // Find all payment reports linked to these invoices
+        const linkedReports = await tx.paymentReport.findMany({
+          where: {
+            invoices: {
+              some: {
+                id: { in: newlyPaidInvoiceIds }
+              }
+            }
+          },
+          include: {
+            invoices: true
+          }
+        });
+        
+        for (const linkedReport of linkedReports) {
+          // Get fresh invoice data for this report
+          const reportInvoices = await tx.invoice.findMany({
+            where: {
+              paymentReportId: linkedReport.id
+            }
+          });
+          
+          // Check if all invoices are fully paid
+          const allFullyPaid = reportInvoices.every(inv => inv.status === 'PAID');
+          
+          // Calculate actual totals
+          const totalDue = reportInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
+          const totalPaid = reportInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
+          const actualArrears = Math.max(0, totalDue - totalPaid);
+          
+          // Determine correct status
+          let correctStatus = linkedReport.status;
+          if (allFullyPaid || actualArrears === 0) {
+            correctStatus = 'PAID';
+          } else if (actualArrears > 0 && totalPaid > 0) {
+            correctStatus = 'PARTIAL';
+          } else if (actualArrears > 0 && totalPaid === 0) {
+            correctStatus = 'UNPAID';
+          }
+          
+          // Update if status changed or arrears changed
+          if (correctStatus !== linkedReport.status || 
+              Math.abs(linkedReport.arrears - actualArrears) > 0.01) {
+            
+            await tx.paymentReport.update({
+              where: { id: linkedReport.id },
+              data: {
+                status: correctStatus,
+                arrears: actualArrears,
+                amountPaid: totalPaid,
+                rent: reportInvoices.reduce((sum, inv) => sum + (inv.rent || 0), 0),
+                serviceCharge: reportInvoices.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
+                vat: reportInvoices.reduce((sum, inv) => sum + (inv.vat || 0), 0),
+                totalDue: totalDue,
+                updatedAt: new Date()
+              }
+            });
+            
+            console.log(`Reconciled payment report ${linkedReport.id}: ${linkedReport.status} -> ${correctStatus}`);
+          }
+        }
       }
 
       // Create income record
@@ -2729,7 +2806,8 @@ export const createPaymentReport = async (req, res) => {
         parsedAmountPaid,
         totalInvoiceBalance,
         totalAvailable,
-        paymentPeriodStr
+        paymentPeriodStr,
+        newlyPaidInvoiceIds
       };
     }, {
       maxWait: 20000,
@@ -2796,6 +2874,11 @@ export const createPaymentReport = async (req, res) => {
           paymentPolicy: inv.paymentPolicy,
           isFullyPaidNow: inv.isFullyPaidNow || inv.newStatus === 'PAID'
         })),
+        reconciliation: {
+          newlyPaidInvoiceCount: transactionResult.newlyPaidInvoiceIds?.length || 0,
+          newlyPaidInvoiceIds: transactionResult.newlyPaidInvoiceIds || [],
+          paymentReportsReconciled: transactionResult.report.id ? 1 : 0
+        },
         existingInvoicesUpdated: transactionResult.invoiceUpdateResult ? {
           count: transactionResult.invoiceUpdateResult.updatedInvoices.length,
           totalApplied: transactionResult.invoiceUpdateResult.totalApplied,
@@ -2832,7 +2915,9 @@ export const createPaymentReport = async (req, res) => {
         (transactionResult.creditUsed > 0 ? 
           ` (${transactionResult.creditUsed} credit applied)` : '') +
         (receiptResult ? ' (Receipt generated)' : '') +
-        (transactionResult.commission ? ` (Commission: ${transactionResult.commission.commissionAmount})` : '')
+        (transactionResult.commission ? ` (Commission: ${transactionResult.commission.commissionAmount})` : '') +
+        (transactionResult.newlyPaidInvoiceIds?.length > 0 ? 
+          ` (${transactionResult.newlyPaidInvoiceIds.length} invoices completed and payment reports reconciled)` : '')
     });
 
   } catch (error) {

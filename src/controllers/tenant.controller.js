@@ -851,462 +851,441 @@ function getOverdueCategory(days) {
 // @route   GET /api/tenants/property/:propertyId/next-payments
 // @access  Private
 export const getNextPaymentsByProperty = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const userRole = req.user.role;
-    const { propertyId } = req.params;
+    try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
+        const { propertyId } = req.params;
 
-    // Check access to property
-    let hasAccess = false;
+        // Check access to property
+        let hasAccess = false;
 
-    if (userRole === 'ADMIN') {
-      hasAccess = true;
-    } else if (userRole === 'MANAGER') {
-      const property = await prisma.property.findFirst({
-        where: { id: propertyId, managerId: userId }
-      });
-      hasAccess = !!property;
-    } else if (userRole === 'USER') {
-      hasAccess = await checkTenantPermission(userId, userRole, propertyId, 'view');
-    }
+        if (userRole === 'ADMIN') {
+            hasAccess = true;
+        } else if (userRole === 'MANAGER') {
+            const property = await prisma.property.findFirst({
+                where: { id: propertyId, managerId: userId }
+            });
+            hasAccess = !!property;
+        } else if (userRole === 'USER') {
+            hasAccess = await checkTenantPermission(userId, userRole, propertyId, 'view');
+        }
 
-    if (!hasAccess) {
-      return res.status(403).json({ 
-        message: 'Access denied to this property',
-        requiredPermission: 'VIEW_TENANTS'
-      });
-    }
+        if (!hasAccess) {
+            return res.status(403).json({
+                message: 'Access denied to this property',
+                requiredPermission: 'VIEW_TENANTS'
+            });
+        }
 
-    // Fetch ALL tenants for the property with their related data
-    const tenants = await prisma.tenant.findMany({
-      where: {
-        unit: {
-          propertyId: propertyId
-        }
-      },
-      include: {
-        unit: {
-          include: {
-            property: true
-          }
-        },
-        paymentReports: {
-          orderBy: { datePaid: 'desc' }
-        },
-        serviceCharge: true,
-        invoices: {
-          orderBy: { dueDate: 'asc' }
-        },
-        billInvoices: {
-          where: {
-            status: { in: ['UNPAID', 'PARTIAL'] }
-          },
-          orderBy: { dueDate: 'asc' }
-        }
-      },
-      orderBy: { fullName: 'asc' }
-    });
-
-    // Calculate next payment for EACH tenant
-    const tenantsWithNextPayment = [];
-    const now = new Date();
-    
-    // Create a Nairobi timezone date for accurate day calculations
-    const nairobiNow = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-    const nairobiTodayStart = new Date(nairobiNow);
-    nairobiTodayStart.setHours(0, 0, 0, 0);
-
-    for (const tenant of tenants) {
-      // Calculate rent info with escalation
-      const rentInfo = calculateEscalatedRent(tenant);
-      const monthlyRent = rentInfo.currentRent;
-      
-      // Calculate total payment breakdown
-      const paymentBreakdown = calculateTotalPayment(tenant, monthlyRent, tenant.paymentPolicy);
-      
-      // =============================================
-      // USE getPaymentSummary AS THE SOURCE OF TRUTH
-      // =============================================
-      const paymentSummary = getPaymentSummary(tenant);
-      
-      // =============================================
-      // EXTRACT DATA FROM PAYMENT SUMMARY
-      // =============================================
-      
-      // Get the total due per period (one payment period amount)
-      const totalDuePerPeriod = paymentSummary.totalDuePerPeriod || paymentBreakdown.total.paymentByPolicy || 0;
-      const totalDueWithoutWithholding = paymentSummary.totalDueWithoutWithholding || 0;
-      const totalWithheld = paymentSummary.totalWithheld || 0;
-      
-      // Get outstanding balance (total expected - total paid)
-      const outstandingBalance = paymentSummary.paymentHistory?.outstandingBalance || 0;
-      const totalPaid = paymentSummary.paymentHistory?.totalPaid || 0;
-      const totalExpected = paymentSummary.paymentHistory?.expectedTotal || 0;
-      const paymentsBehind = paymentSummary.nextPayment?.paymentsBehind || 0;
-      const expectedPaymentsCount = paymentSummary.paymentHistory?.expectedPaymentsCount || 0;
-      
-      // Get the payment period amount breakdown
-      const periodRentAmount = paymentBreakdown.rent.paymentByPolicy || 0;
-      const periodServiceCharge = paymentBreakdown.serviceCharge.paymentByPolicy || 0;
-      const periodVatOnRent = paymentBreakdown.rent.vatAmount || 0;
-      const periodVatOnServiceCharge = paymentBreakdown.serviceCharge.vatAmount || 0;
-      
-      // =============================================
-      // GET NEXT DUE DATE FROM PAYMENT SUMMARY (SOURCE OF TRUTH)
-      // =============================================
-      const nextDueDate = paymentSummary.nextPayment?.dueDate;
-      const isOverdue = paymentSummary.nextPayment?.isOverdue || false;
-      const isInGracePeriod = paymentSummary.nextPayment?.isInGracePeriod || false;
-      const gracePeriodEnd = paymentSummary.nextPayment?.gracePeriodEnd || null;
-      
-      // Get the actual status from payment summary
-      const status = paymentSummary.status || 'UNPAID';
-      
-      // =============================================
-      // CALCULATE OVERDUE INFORMATION FROM PAYMENT SUMMARY
-      // =============================================
-      
-      // Determine the actual overdue since date based on the payment summary
-      let overdueSinceDate = null;
-      let daysOverdue = 0;
-      let isOverdueByBalance = outstandingBalance > 0;
-      let futureDueDate = null;
-      let dueDateFormatted = null;
-      let daysUntilDue = 0;
-      let isOverdueInNairobi = false;
-      let daysUntilGraceEnd = null;
-      
-      // If we have a next due date, calculate the future due date
-      if (nextDueDate) {
-        const policyMonths = getPolicyMonths(tenant.paymentPolicy);
-        const nextDue = new Date(nextDueDate);
-        
-        // If the due date is in the past, advance it to the next period
-        let futureDue = new Date(nextDue);
-        while (futureDue <= now) {
-          futureDue.setMonth(futureDue.getMonth() + policyMonths);
-        }
-        futureDue.setHours(23, 59, 59, 999);
-        futureDueDate = futureDue;
-        
-        // Format the due date
-        try {
-          const dueDateInNairobi = new Date(futureDue.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-          dueDateFormatted = dueDateInNairobi.toLocaleDateString('en-US', {
-            timeZone: 'Africa/Nairobi',
-            month: 'long',
-            day: 'numeric',
-            year: 'numeric'
-          });
-          
-          const dueDateStart = new Date(dueDateInNairobi);
-          dueDateStart.setHours(0, 0, 0, 0);
-          const diffTime = dueDateStart - nairobiTodayStart;
-          daysUntilDue = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          isOverdueInNairobi = nairobiTodayStart > dueDateStart;
-        } catch (dateError) {
-          console.error('Error processing date for tenant:', tenant.id, dateError);
-          dueDateFormatted = futureDue.toLocaleDateString();
-        }
-        
-        // =============================================
-        // CALCULATE OVERDUE SINCE DATE
-        // =============================================
-        // For truly overdue tenants, calculate when the overdue period started
-        if (isOverdue || (isOverdueByBalance && isOverdueInNairobi) || status === 'OVERDUE') {
-          // The overdue started from the first missed payment
-          // Get this from the payment summary or calculate it
-          
-          // Check if payment summary has the information we need
-          const missedPayments = paymentSummary.paymentHistory?.missedPayments || [];
-          const invoiceStatus = paymentSummary.invoiceStatus || {};
-          
-          // If there are unpaid invoices, use the earliest unpaid invoice due date
-          if (tenant.invoices && tenant.invoices.length > 0) {
-            const unpaidInvoices = tenant.invoices.filter(inv => 
-              inv.status === 'UNPAID' || inv.status === 'OVERDUE' || 
-              (inv.status === 'PARTIAL' && inv.balance > 0.01)
-            );
-            
-            if (unpaidInvoices.length > 0) {
-              // Sort by due date (ascending) to get the earliest
-              const sortedUnpaid = unpaidInvoices.sort((a, b) => 
-                new Date(a.dueDate) - new Date(b.dueDate)
-              );
-              overdueSinceDate = new Date(sortedUnpaid[0].dueDate);
-            }
-          }
-          
-          // If no invoices, use the payment summary's next payment due date minus one period
-          if (!overdueSinceDate) {
-            const overdueSince = new Date(nextDue);
-            // Go back one period from the next due date
-            overdueSince.setMonth(overdueSince.getMonth() - policyMonths);
-            overdueSinceDate = overdueSince;
-          }
-          
-          // Set the overdue since date to end of day
-          if (overdueSinceDate) {
-            overdueSinceDate.setHours(23, 59, 59, 999);
-            
-            // Calculate days overdue (should be negative for past dates)
-            const overdueStart = new Date(overdueSinceDate);
-            overdueStart.setHours(0, 0, 0, 0);
-            const diffTime = overdueStart - nairobiTodayStart;
-            daysOverdue = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          }
-        }
-        
-        // Calculate grace period end and days until grace end
-        if (gracePeriodEnd) {
-          try {
-            const graceEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-            const graceEndStart = new Date(graceEndInNairobi);
-            graceEndStart.setHours(0, 0, 0, 0);
-            
-            // Only calculate if in grace period
-            if (isInGracePeriod) {
-              const graceDiffTime = graceEndStart - nairobiTodayStart;
-              daysUntilGraceEnd = Math.ceil(graceDiffTime / (1000 * 60 * 60 * 24));
-            }
-          } catch (graceError) {
-            console.error('Error calculating grace period for tenant:', tenant.id, graceError);
-          }
-        }
-      } else {
-        // No next due date - calculate from rent start
-        const rentStartDate = new Date(tenant.rentStart);
-        const policyMonths = getPolicyMonths(tenant.paymentPolicy);
-        let futureDue = new Date(rentStartDate);
-        
-        // Find the next payment period in the future
-        while (futureDue <= now) {
-          futureDue.setMonth(futureDue.getMonth() + policyMonths);
-        }
-        futureDue.setHours(23, 59, 59, 999);
-        futureDueDate = futureDue;
-        
-        dueDateFormatted = futureDue.toLocaleDateString('en-US', {
-          month: 'long',
-          day: 'numeric',
-          year: 'numeric'
+        // Fetch ALL tenants for the property with their related data
+        const tenants = await prisma.tenant.findMany({
+            where: {
+                unit: {
+                    propertyId: propertyId
+                }
+            },
+            include: {
+                unit: {
+                    include: {
+                        property: true
+                    }
+                },
+                paymentReports: {
+                    orderBy: { datePaid: 'desc' }
+                },
+                serviceCharge: true,
+                invoices: {
+                    orderBy: { dueDate: 'asc' }
+                },
+                billInvoices: {
+                    where: {
+                        status: { in: ['UNPAID', 'PARTIAL'] }
+                    },
+                    orderBy: { dueDate: 'asc' }
+                }
+            },
+            orderBy: { fullName: 'asc' }
         });
-      }
-      
-      // =============================================
-      // CALCULATE THE AMOUNT DUE (INCLUDING ARREARS)
-      // =============================================
-      
-      // Calculate how many periods are behind
-      let periodsBehind = 0;
-      if (totalDuePerPeriod > 0) {
-        periodsBehind = Math.floor(outstandingBalance / totalDuePerPeriod);
-        // If there's a partial period, round up
-        if (outstandingBalance % totalDuePerPeriod > 0.01) {
-          periodsBehind += 1;
+
+        // Calculate next payment for EACH tenant
+        const tenantsWithNextPayment = [];
+        const now = new Date();
+
+        // Create a Nairobi timezone date for accurate day calculations
+        const nairobiNow = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+        const nairobiTodayStart = new Date(nairobiNow);
+        nairobiTodayStart.setHours(0, 0, 0, 0);
+
+        for (const tenant of tenants) {
+            // Calculate rent info with escalation
+            const rentInfo = calculateEscalatedRent(tenant);
+            const monthlyRent = rentInfo.currentRent;
+
+            // Calculate total payment breakdown
+            const paymentBreakdown = calculateTotalPayment(tenant, monthlyRent, tenant.paymentPolicy);
+
+            // USE getPaymentSummary AS THE SOURCE OF TRUTH
+            const paymentSummary = getPaymentSummary(tenant);
+
+            // EXTRACT DATA FROM PAYMENT SUMMARY
+            const totalDuePerPeriod = paymentSummary.totalDuePerPeriod || paymentBreakdown.total.paymentByPolicy || 0;
+            const totalDueWithoutWithholding = paymentSummary.totalDueWithoutWithholding || 0;
+            const totalWithheld = paymentSummary.totalWithheld || 0;
+
+            // Get outstanding balance (total expected - total paid)
+            const outstandingBalance = paymentSummary.paymentHistory?.outstandingBalance || 0;
+            const totalPaid = paymentSummary.paymentHistory?.totalPaid || 0;
+            const totalExpected = paymentSummary.paymentHistory?.expectedTotal || 0;
+            const paymentsBehind = paymentSummary.nextPayment?.paymentsBehind || 0;
+            const expectedPaymentsCount = paymentSummary.paymentHistory?.expectedPaymentsCount || 0;
+
+            // Get the payment period amount breakdown
+            const periodRentAmount = paymentBreakdown.rent.paymentByPolicy || 0;
+            const periodServiceCharge = paymentBreakdown.serviceCharge.paymentByPolicy || 0;
+            const periodVatOnRent = paymentBreakdown.rent.vatAmount || 0;
+            const periodVatOnServiceCharge = paymentBreakdown.serviceCharge.vatAmount || 0;
+
+            // GET NEXT DUE DATE FROM PAYMENT SUMMARY
+            const nextDueDate = paymentSummary.nextPayment?.dueDate;
+            const isOverdue = paymentSummary.nextPayment?.isOverdue || false;
+            const isInGracePeriod = paymentSummary.nextPayment?.isInGracePeriod || false;
+            const gracePeriodEnd = paymentSummary.nextPayment?.gracePeriodEnd || null;
+
+            // Get the actual status from payment summary
+            const status = paymentSummary.status || 'UNPAID';
+
+            // =============================================
+            // FIXED: Determine if tenant is truly overdue
+            // Only mark as overdue if there's a PARTIAL or UNPAID invoice
+            // with a due date that has passed
+            // =============================================
+            const hasOutstandingBalance = outstandingBalance > 0.01;
+
+            let isTrulyOverdue = false;
+            let overdueSinceDate = null;
+            let daysOverdue = 0;
+
+            // Check if there are any unpaid/partial invoices with balance > 0
+            if (hasOutstandingBalance) {
+                const hasUnpaidInvoices = tenant.invoices && tenant.invoices.some(inv => {
+                    const balance = inv.balance || (inv.totalDue - inv.amountPaid);
+                    const isUnpaid = inv.status === 'UNPAID' || inv.status === 'OVERDUE';
+                    const isPartialWithBalance = inv.status === 'PARTIAL' && balance > 0.01;
+                    return (isUnpaid || isPartialWithBalance);
+                });
+
+                if (hasUnpaidInvoices) {
+                    // Get all invoices with balance > 0
+                    const invoicesWithBalance = tenant.invoices.filter(inv => {
+                        const balance = inv.balance || (inv.totalDue - inv.amountPaid);
+                        const isUnpaid = inv.status === 'UNPAID' || inv.status === 'OVERDUE';
+                        const isPartialWithBalance = inv.status === 'PARTIAL' && balance > 0.01;
+                        return (isUnpaid || isPartialWithBalance) && balance > 0.01;
+                    });
+
+                    if (invoicesWithBalance.length > 0) {
+                        // Sort by due date (ascending)
+                        const sortedInvoices = invoicesWithBalance.sort((a, b) =>
+                            new Date(a.dueDate) - new Date(b.dueDate)
+                        );
+
+                        // =============================================
+                        // FIXED: Only mark as overdue if the due date has passed
+                        // =============================================
+                        const earliestInvoice = sortedInvoices[0];
+                        const dueDate = new Date(earliestInvoice.dueDate);
+                        const today = new Date();
+                        today.setHours(0, 0, 0, 0);
+                        dueDate.setHours(0, 0, 0, 0);
+
+                        // Check if the due date is in the past (including grace period)
+                        if (dueDate < today) {
+                            // Check if grace period has passed
+                            let gracePeriodEndDate = new Date(dueDate);
+                            // Add 5 days for grace period
+                            gracePeriodEndDate.setDate(gracePeriodEndDate.getDate() + 5);
+                            gracePeriodEndDate.setHours(23, 59, 59, 999);
+
+                            if (today > gracePeriodEndDate) {
+                                isTrulyOverdue = true;
+                                overdueSinceDate = new Date(dueDate);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Calculate days overdue
+            if (overdueSinceDate) {
+                overdueSinceDate.setHours(23, 59, 59, 999);
+                const overdueStart = new Date(overdueSinceDate);
+                overdueStart.setHours(0, 0, 0, 0);
+                const diffTime = overdueStart - nairobiTodayStart;
+                daysOverdue = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            }
+
+            // Calculate future due date
+            let futureDueDate = null;
+            let dueDateFormatted = null;
+            let daysUntilDue = 0;
+            let isOverdueInNairobi = false;
+            let daysUntilGraceEnd = null;
+
+            if (nextDueDate) {
+                const policyMonths = getPolicyMonths(tenant.paymentPolicy);
+                const nextDue = new Date(nextDueDate);
+
+                // If the due date is in the past, advance it to the next period
+                let futureDue = new Date(nextDue);
+                while (futureDue <= now) {
+                    futureDue.setMonth(futureDue.getMonth() + policyMonths);
+                }
+                futureDue.setHours(23, 59, 59, 999);
+                futureDueDate = futureDue;
+
+                // Format the due date
+                try {
+                    const dueDateInNairobi = new Date(futureDue.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+                    dueDateFormatted = dueDateInNairobi.toLocaleDateString('en-US', {
+                        timeZone: 'Africa/Nairobi',
+                        month: 'long',
+                        day: 'numeric',
+                        year: 'numeric'
+                    });
+
+                    const dueDateStart = new Date(dueDateInNairobi);
+                    dueDateStart.setHours(0, 0, 0, 0);
+                    const diffTime = dueDateStart - nairobiTodayStart;
+                    daysUntilDue = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                    isOverdueInNairobi = nairobiTodayStart > dueDateStart;
+                } catch (dateError) {
+                    console.error('Error processing date for tenant:', tenant.id, dateError);
+                    dueDateFormatted = futureDue.toLocaleDateString();
+                }
+
+                // Calculate grace period end and days until grace end
+                if (gracePeriodEnd && hasOutstandingBalance) {
+                    try {
+                        const graceEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+                        const graceEndStart = new Date(graceEndInNairobi);
+                        graceEndStart.setHours(0, 0, 0, 0);
+
+                        if (isInGracePeriod) {
+                            const graceDiffTime = graceEndStart - nairobiTodayStart;
+                            daysUntilGraceEnd = Math.ceil(graceDiffTime / (1000 * 60 * 60 * 24));
+                        }
+                    } catch (graceError) {
+                        console.error('Error calculating grace period for tenant:', tenant.id, graceError);
+                    }
+                }
+            } else {
+                // No next due date - calculate from rent start
+                const rentStartDate = new Date(tenant.rentStart);
+                const policyMonths = getPolicyMonths(tenant.paymentPolicy);
+                let futureDue = new Date(rentStartDate);
+
+                while (futureDue <= now) {
+                    futureDue.setMonth(futureDue.getMonth() + policyMonths);
+                }
+                futureDue.setHours(23, 59, 59, 999);
+                futureDueDate = futureDue;
+
+                dueDateFormatted = futureDue.toLocaleDateString('en-US', {
+                    month: 'long',
+                    day: 'numeric',
+                    year: 'numeric'
+                });
+            }
+
+            // CALCULATE THE AMOUNT DUE
+            let totalAmountDue = totalDuePerPeriod;
+
+            if (outstandingBalance > 0) {
+                totalAmountDue = totalDuePerPeriod + outstandingBalance;
+            } else if (outstandingBalance < 0) {
+                const creditAmount = Math.abs(outstandingBalance);
+                if (creditAmount >= totalDuePerPeriod) {
+                    totalAmountDue = 0;
+                } else {
+                    totalAmountDue = totalDuePerPeriod - creditAmount;
+                }
+            }
+
+            // Calculate the breakdown of the amount due
+            let amountBreakdown = {
+                rent: periodRentAmount,
+                serviceCharge: periodServiceCharge,
+                vatOnRent: periodVatOnRent,
+                vatOnServiceCharge: periodVatOnServiceCharge,
+                total: totalAmountDue
+            };
+
+            if (outstandingBalance !== 0 && totalDuePerPeriod > 0) {
+                const ratio = (totalAmountDue / totalDuePerPeriod);
+                amountBreakdown = {
+                    rent: periodRentAmount * ratio,
+                    serviceCharge: periodServiceCharge * ratio,
+                    vatOnRent: periodVatOnRent * ratio,
+                    vatOnServiceCharge: periodVatOnServiceCharge * ratio,
+                    total: totalAmountDue
+                };
+            }
+
+            // Format overdue since date if it exists
+            let overdueSinceFormatted = null;
+            if (overdueSinceDate) {
+                try {
+                    const overdueSinceInNairobi = new Date(overdueSinceDate.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+                    overdueSinceFormatted = overdueSinceInNairobi.toLocaleDateString('en-US', {
+                        timeZone: 'Africa/Nairobi',
+                        month: 'long',
+                        day: 'numeric',
+                        year: 'numeric'
+                    });
+                } catch (dateError) {
+                    overdueSinceFormatted = overdueSinceDate.toLocaleDateString();
+                }
+            }
+
+            // Format grace period end if it exists
+            let gracePeriodEndFormatted = null;
+            if (gracePeriodEnd && hasOutstandingBalance) {
+                try {
+                    const graceEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+                    gracePeriodEndFormatted = graceEndInNairobi.toLocaleDateString('en-US', {
+                        timeZone: 'Africa/Nairobi',
+                        month: 'long',
+                        day: 'numeric',
+                        year: 'numeric'
+                    });
+                } catch (dateError) {
+                    gracePeriodEndFormatted = gracePeriodEnd.toLocaleDateString();
+                }
+            }
+
+            // Determine the final status display
+            let statusDisplay = status;
+
+            if (outstandingBalance > 0 && isTrulyOverdue) {
+                statusDisplay = 'OVERDUE';
+            } else if (isInGracePeriod && hasOutstandingBalance) {
+                statusDisplay = 'IN_GRACE_PERIOD';
+            } else if (outstandingBalance > 0 && !isTrulyOverdue) {
+                statusDisplay = 'PARTIALLY_PAID';
+            } else if (outstandingBalance === 0 && totalPaid > 0) {
+                statusDisplay = 'PAID';
+            }
+
+            // BUILD THE PAYMENT OBJECT
+            tenantsWithNextPayment.push({
+                id: tenant.id,
+                name: tenant.fullName,
+                contact: {
+                    email: tenant.email || null,
+                    phone: tenant.contact || null,
+                    kra: tenant.KRAPin || null
+                },
+                unit: {
+                    number: tenant.unit?.unitNo || 'N/A',
+                    type: tenant.unit?.type || tenant.unit?.unitType || 'Unit',
+                    size: tenant.unit?.sizeSqFt || 0,
+                    floor: tenant.unit?.floor || 'N/A'
+                },
+                payment: {
+                    dueDate: dueDateFormatted || 'Not set',
+                    dueDateRaw: futureDueDate || null,
+                    daysUntilDue: daysUntilDue,
+                    // FIXED: Only mark as overdue if the due date has passed
+                    isOverdue: isTrulyOverdue,
+                    isInGracePeriod: isInGracePeriod && hasOutstandingBalance,
+                    daysUntilGraceEnd: hasOutstandingBalance ? daysUntilGraceEnd : null,
+                    gracePeriodEnd: hasOutstandingBalance ? gracePeriodEndFormatted : null,
+                    amount: {
+                        rent: amountBreakdown.rent || periodRentAmount,
+                        serviceCharge: amountBreakdown.serviceCharge || periodServiceCharge,
+                        vatOnRent: amountBreakdown.vatOnRent || periodVatOnRent,
+                        vatOnServiceCharge: amountBreakdown.vatOnServiceCharge || periodVatOnServiceCharge,
+                        total: totalAmountDue
+                    },
+                    status: statusDisplay,
+                    policy: tenant.paymentPolicy || 'MONTHLY',
+                    paymentsBehind: paymentsBehind > 0 ? paymentsBehind : (outstandingBalance > 0 ? Math.ceil(outstandingBalance / totalDuePerPeriod) : 0),
+                    totalPaid: totalPaid,
+                    totalExpected: totalExpected,
+                    expectedPeriods: expectedPaymentsCount,
+                    totalDuePerPeriod: totalDuePerPeriod,
+                    totalDueWithoutWithholding: totalDueWithoutWithholding,
+                    totalWithheld: totalWithheld,
+                    outstandingBalance: outstandingBalance,
+                    regularPeriodAmount: totalDuePerPeriod,
+                    // FIXED: Only set overdue tracking if truly overdue (due date has passed)
+                    overdueSince: isTrulyOverdue ? overdueSinceFormatted : null,
+                    overdueSinceRaw: isTrulyOverdue && overdueSinceDate ? overdueSinceDate.toISOString() : null,
+                    daysOverdue: isTrulyOverdue ? daysOverdue : 0
+                },
+                rent: {
+                    current: monthlyRent || 0,
+                    escalation: tenant.escalationRate ? {
+                        rate: tenant.escalationRate,
+                        frequency: tenant.escalationFrequency,
+                        nextDate: rentInfo?.nextEscalationDate || null
+                    } : null
+                },
+                history: paymentSummary?.paymentHistory?.lastPaymentDate ? {
+                    lastPayment: paymentSummary.paymentHistory.lastPaymentDateFormatted,
+                    paymentsMade: paymentSummary.paymentHistory.paymentsMade
+                } : null,
+                invoiceStatus: paymentSummary.invoiceStatus || null
+            });
         }
-      }
-      
-      // Calculate the total amount due
-      let totalAmountDue = totalDuePerPeriod;
-      
-      if (outstandingBalance > 0) {
-        // Tenant has arrears - show current period + arrears
-        totalAmountDue = totalDuePerPeriod + outstandingBalance;
-      } else if (outstandingBalance < 0) {
-        // Tenant has overpaid - apply credit to current period
-        const creditAmount = Math.abs(outstandingBalance);
-        if (creditAmount >= totalDuePerPeriod) {
-          totalAmountDue = 0;
-        } else {
-          totalAmountDue = totalDuePerPeriod - creditAmount;
-        }
-      } else {
-        // No outstanding balance - regular period amount
-        totalAmountDue = totalDuePerPeriod;
-      }
-      
-      // Calculate the breakdown of the amount due
-      let amountBreakdown = {
-        rent: periodRentAmount,
-        serviceCharge: periodServiceCharge,
-        vatOnRent: periodVatOnRent,
-        vatOnServiceCharge: periodVatOnServiceCharge,
-        total: totalAmountDue
-      };
-      
-      // If there's an outstanding balance, distribute it proportionally
-      if (outstandingBalance !== 0 && totalDuePerPeriod > 0) {
-        const ratio = (totalAmountDue / totalDuePerPeriod);
-        amountBreakdown = {
-          rent: periodRentAmount * ratio,
-          serviceCharge: periodServiceCharge * ratio,
-          vatOnRent: periodVatOnRent * ratio,
-          vatOnServiceCharge: periodVatOnServiceCharge * ratio,
-          total: totalAmountDue
+
+        // Sort: Overdue first, then by days until due (most urgent first)
+        tenantsWithNextPayment.sort((a, b) => {
+            if (a.payment.isOverdue && !b.payment.isOverdue) return -1;
+            if (!a.payment.isOverdue && b.payment.isOverdue) return 1;
+            return a.payment.daysUntilDue - b.payment.daysUntilDue;
+        });
+
+        // Calculate summary statistics
+        const summary = {
+            total: tenantsWithNextPayment.length,
+            overdue: tenantsWithNextPayment.filter(t => t.payment.isOverdue).length,
+            inGracePeriod: tenantsWithNextPayment.filter(t => t.payment.isInGracePeriod).length,
+            dueToday: tenantsWithNextPayment.filter(t => t.payment.daysUntilDue === 0).length,
+            upcoming: tenantsWithNextPayment.filter(t => !t.payment.isOverdue && t.payment.daysUntilDue > 0).length,
+            amounts: {
+                outstanding: tenantsWithNextPayment.reduce((sum, t) =>
+                    sum + (t.payment.isOverdue ? t.payment.amount.total : 0), 0),
+                upcoming: tenantsWithNextPayment.reduce((sum, t) =>
+                    sum + (!t.payment.isOverdue ? t.payment.amount.total : 0), 0)
+            },
+            byPolicy: {
+                MONTHLY: tenantsWithNextPayment.filter(t => t.payment.policy === 'MONTHLY').length,
+                QUARTERLY: tenantsWithNextPayment.filter(t => t.payment.policy === 'QUARTERLY').length,
+                ANNUAL: tenantsWithNextPayment.filter(t => t.payment.policy === 'ANNUAL').length
+            }
         };
-      }
-      
-      // Format overdue since date if it exists
-      let overdueSinceFormatted = null;
-      if (overdueSinceDate) {
-        try {
-          const overdueSinceInNairobi = new Date(overdueSinceDate.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-          overdueSinceFormatted = overdueSinceInNairobi.toLocaleDateString('en-US', {
-            timeZone: 'Africa/Nairobi',
-            month: 'long',
-            day: 'numeric',
-            year: 'numeric'
-          });
-        } catch (dateError) {
-          overdueSinceFormatted = overdueSinceDate.toLocaleDateString();
+
+        // Get property name safely
+        let propertyName = 'Unknown';
+        if (tenants.length > 0 && tenants[0]?.unit?.property?.name) {
+            propertyName = tenants[0].unit.property.name;
         }
-      }
-      
-      // Format grace period end if it exists
-      let gracePeriodEndFormatted = null;
-      if (gracePeriodEnd) {
-        try {
-          const graceEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-          gracePeriodEndFormatted = graceEndInNairobi.toLocaleDateString('en-US', {
-            timeZone: 'Africa/Nairobi',
-            month: 'long',
-            day: 'numeric',
-            year: 'numeric'
-          });
-        } catch (dateError) {
-          gracePeriodEndFormatted = gracePeriodEnd.toLocaleDateString();
-        }
-      }
-      
-      // Determine the final status display
-      let statusDisplay = status;
-      
-      // Override if we have clear indicators
-      if (outstandingBalance > 0 && isOverdue) {
-        statusDisplay = 'OVERDUE';
-      } else if (isInGracePeriod) {
-        statusDisplay = 'IN_GRACE_PERIOD';
-      } else if (outstandingBalance > 0 && !isOverdue) {
-        statusDisplay = 'PARTIALLY_PAID';
-      } else if (outstandingBalance === 0 && totalPaid > 0) {
-        statusDisplay = 'PAID';
-      }
-      
-      // =============================================
-      // BUILD THE PAYMENT OBJECT
-      // =============================================
-      tenantsWithNextPayment.push({
-        id: tenant.id,
-        name: tenant.fullName,
-        contact: {
-          email: tenant.email || null,
-          phone: tenant.contact || null,
-          kra: tenant.KRAPin || null
-        },
-        unit: {
-          number: tenant.unit?.unitNo || 'N/A',
-          type: tenant.unit?.type || tenant.unit?.unitType || 'Unit',
-          size: tenant.unit?.sizeSqFt || 0,
-          floor: tenant.unit?.floor || 'N/A'
-        },
-        payment: {
-          dueDate: dueDateFormatted || 'Not set',
-          dueDateRaw: futureDueDate || null,
-          daysUntilDue: daysUntilDue,
-          isOverdue: isOverdue || (outstandingBalance > 0 && isOverdueInNairobi),
-          isInGracePeriod: isInGracePeriod,
-          daysUntilGraceEnd: daysUntilGraceEnd,
-          gracePeriodEnd: gracePeriodEndFormatted,
-          amount: {
-            rent: amountBreakdown.rent || periodRentAmount,
-            serviceCharge: amountBreakdown.serviceCharge || periodServiceCharge,
-            vatOnRent: amountBreakdown.vatOnRent || periodVatOnRent,
-            vatOnServiceCharge: amountBreakdown.vatOnServiceCharge || periodVatOnServiceCharge,
-            total: totalAmountDue
-          },
-          status: statusDisplay,
-          policy: tenant.paymentPolicy || 'MONTHLY',
-          paymentsBehind: paymentsBehind > 0 ? paymentsBehind : (outstandingBalance > 0 ? Math.ceil(outstandingBalance / totalDuePerPeriod) : 0),
-          totalPaid: totalPaid,
-          totalExpected: totalExpected,
-          expectedPeriods: expectedPaymentsCount,
-          totalDuePerPeriod: totalDuePerPeriod,
-          totalDueWithoutWithholding: totalDueWithoutWithholding,
-          totalWithheld: totalWithheld,
-          outstandingBalance: outstandingBalance,
-          regularPeriodAmount: totalDuePerPeriod,
-          // Overdue tracking fields (only set if actually overdue)
-          overdueSince: (isOverdue || (outstandingBalance > 0 && isOverdueInNairobi)) ? overdueSinceFormatted : null,
-          overdueSinceRaw: (isOverdue || (outstandingBalance > 0 && isOverdueInNairobi)) && overdueSinceDate ? overdueSinceDate.toISOString() : null,
-          daysOverdue: (isOverdue || (outstandingBalance > 0 && isOverdueInNairobi)) ? daysOverdue : 0
-        },
-        rent: {
-          current: monthlyRent || 0,
-          escalation: tenant.escalationRate ? {
-            rate: tenant.escalationRate,
-            frequency: tenant.escalationFrequency,
-            nextDate: rentInfo?.nextEscalationDate || null
-          } : null
-        },
-        history: paymentSummary?.paymentHistory?.lastPaymentDate ? {
-          lastPayment: paymentSummary.paymentHistory.lastPaymentDateFormatted,
-          paymentsMade: paymentSummary.paymentHistory.paymentsMade
-        } : null,
-        // Include invoice status for debugging
-        invoiceStatus: paymentSummary.invoiceStatus || null
-      });
+
+        res.json({
+            success: true,
+            property: {
+                id: propertyId,
+                name: propertyName
+            },
+            summary,
+            payments: tenantsWithNextPayment
+        });
+
+    } catch (error) {
+        console.error('Get next payments error:', error);
+        res.status(400).json({ message: error.message });
     }
-
-    // Sort: Overdue first, then by days until due (most urgent first)
-    tenantsWithNextPayment.sort((a, b) => {
-      // Overdue first
-      if (a.payment.isOverdue && !b.payment.isOverdue) return -1;
-      if (!a.payment.isOverdue && b.payment.isOverdue) return 1;
-      // Then by days until due (ascending)
-      return a.payment.daysUntilDue - b.payment.daysUntilDue;
-    });
-
-    // Calculate summary statistics
-    const summary = {
-      total: tenantsWithNextPayment.length,
-      overdue: tenantsWithNextPayment.filter(t => t.payment.isOverdue).length,
-      inGracePeriod: tenantsWithNextPayment.filter(t => t.payment.isInGracePeriod).length,
-      dueToday: tenantsWithNextPayment.filter(t => t.payment.daysUntilDue === 0).length,
-      upcoming: tenantsWithNextPayment.filter(t => !t.payment.isOverdue && t.payment.daysUntilDue > 0).length,
-      amounts: {
-        outstanding: tenantsWithNextPayment.reduce((sum, t) => 
-          sum + (t.payment.isOverdue ? t.payment.amount.total : 0), 0),
-        upcoming: tenantsWithNextPayment.reduce((sum, t) => 
-          sum + (!t.payment.isOverdue ? t.payment.amount.total : 0), 0)
-      },
-      byPolicy: {
-        MONTHLY: tenantsWithNextPayment.filter(t => t.payment.policy === 'MONTHLY').length,
-        QUARTERLY: tenantsWithNextPayment.filter(t => t.payment.policy === 'QUARTERLY').length,
-        ANNUAL: tenantsWithNextPayment.filter(t => t.payment.policy === 'ANNUAL').length
-      }
-    };
-
-    // Get property name safely
-    let propertyName = 'Unknown';
-    if (tenants.length > 0 && tenants[0]?.unit?.property?.name) {
-      propertyName = tenants[0].unit.property.name;
-    }
-
-    res.json({
-      success: true,
-      property: {
-        id: propertyId,
-        name: propertyName
-      },
-      summary,
-      payments: tenantsWithNextPayment
-    });
-    
-  } catch (error) {
-    console.error('Get next payments error:', error);
-    res.status(400).json({ message: error.message });
-  }
 };
 
 // @desc    Create tenant
