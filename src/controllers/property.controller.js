@@ -142,6 +142,330 @@ export const getProperty = async (req, res) => {
   }
 };
 
+// @desc    Get property collection statement with financial summary
+// @route   GET /api/properties/:id/collection-statement
+// @access  Private
+export const getPropertyCollectionStatement = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const propertyId = req.params.id;
+    const { startDate, endDate } = req.query;
+
+    // Check property access
+    const hasAccess = await permissionService.checkPropertyAccess(userId, propertyId, 'canView');
+    
+    if (!hasAccess) {
+      return res.status(403).json({ message: 'Access denied to this property' });
+    }
+
+    // Parse dates with defaults
+    const start = startDate ? new Date(startDate) : new Date(new Date().setMonth(new Date().getMonth() - 3));
+    const end = endDate ? new Date(endDate) : new Date();
+    
+    // Ensure dates are valid
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ 
+        message: 'Invalid date format. Please use ISO format (YYYY-MM-DD)' 
+      });
+    }
+
+    // Get property with all related data
+    const property = await prisma.property.findUnique({
+      where: { id: propertyId },
+      include: {
+        landlord: true,
+        manager: {
+          select: { id: true, name: true, email: true, role: true }
+        },
+        units: {
+          include: {
+            tenant: {
+              include: {
+                serviceCharge: true,
+                invoices: {
+                  where: {
+                    issueDate: {
+                      gte: start,
+                      lte: end
+                    }
+                  }
+                },
+                bills: {
+                  where: {
+                    issuedAt: {
+                      gte: start,
+                      lte: end
+                    }
+                  }
+                },
+                paymentReports: {
+                  where: {
+                    datePaid: {
+                      gte: start,
+                      lte: end
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        incomes: {
+          where: {
+            createdAt: {
+              gte: start,
+              lte: end
+            }
+          }
+        },
+        commissions: {
+          where: {
+            createdAt: {
+              gte: start,
+              lte: end
+            }
+          }
+        },
+        serviceProviders: true,
+        leads: {
+          where: {
+            createdAt: {
+              gte: start,
+              lte: end
+            }
+          }
+        }
+      }
+    });
+
+    if (!property) {
+      return res.status(404).json({ message: 'Property not found' });
+    }
+
+    // Calculate financial summaries
+    let totalDeposits = 0;
+    let totalRentCollected = 0;
+    let totalServiceCharge = 0;
+    let totalVATCollected = 0;
+    let totalBillsAmount = 0;
+    let totalOtherIncomes = 0;
+    let totalCommissions = 0;
+    let totalOutstanding = 0;
+    let totalUnits = property.units.length;
+    let occupiedUnits = 0;
+    let vacantUnits = 0;
+
+    // Process each unit and its tenant
+    const unitSummaries = property.units.map(unit => {
+      const tenant = unit.tenant;
+      let unitDeposit = 0;
+      let unitRentCollected = 0;
+      let unitServiceCharge = 0;
+      let unitVATCollected = 0;
+      let unitBillsAmount = 0;
+      let unitOutstanding = 0;
+      let isOccupied = false;
+
+      if (tenant) {
+        isOccupied = true;
+        occupiedUnits++;
+        unitDeposit = tenant.deposit || 0;
+        totalDeposits += unitDeposit;
+
+        // Calculate tenant financials
+        if (tenant.paymentReports && tenant.paymentReports.length > 0) {
+          tenant.paymentReports.forEach(report => {
+            unitRentCollected += report.rent || 0;
+            unitServiceCharge += report.serviceCharge || 0;
+            unitVATCollected += report.vat || 0;
+          });
+          totalRentCollected += unitRentCollected;
+          totalServiceCharge += unitServiceCharge;
+          totalVATCollected += unitVATCollected;
+        }
+
+        // Calculate bills
+        if (tenant.bills && tenant.bills.length > 0) {
+          tenant.bills.forEach(bill => {
+            const billTotal = bill.grandTotal || bill.totalAmount || 0;
+            const billPaid = bill.amountPaid || 0;
+            unitBillsAmount += billTotal;
+            unitOutstanding += (billTotal - billPaid);
+          });
+          totalBillsAmount += unitBillsAmount;
+          totalOutstanding += unitOutstanding;
+        }
+
+        // Calculate invoices outstanding
+        if (tenant.invoices && tenant.invoices.length > 0) {
+          tenant.invoices.forEach(invoice => {
+            unitOutstanding += (invoice.balance || 0);
+          });
+        }
+      }
+
+      return {
+        unitId: unit.id,
+        unitNo: unit.unitNo || 'N/A',
+        unitType: unit.unitType,
+        bedrooms: unit.bedrooms,
+        rentAmount: unit.rentAmount,
+        status: unit.status,
+        isOccupied,
+        tenant: tenant ? {
+          id: tenant.id,
+          fullName: tenant.fullName,
+          email: tenant.email,
+          contact: tenant.contact,
+          KRAPin: tenant.KRAPin,
+          paymentPolicy: tenant.paymentPolicy,
+          deposit: tenant.deposit,
+          serviceCharge: tenant.serviceCharge,
+          rent: tenant.rent,
+          vatRate: tenant.vatRate,
+          vatType: tenant.vatType,
+          withholdingTaxRate: tenant.withholdingTaxRate,
+          isWithholdingTaxExempt: tenant.isWithholdingTaxExempt
+        } : null,
+        financialSummary: {
+          deposit: unitDeposit,
+          rentCollected: unitRentCollected,
+          serviceCharge: unitServiceCharge,
+          vatCollected: unitVATCollected,
+          billsAmount: unitBillsAmount,
+          outstanding: unitOutstanding
+        }
+      };
+    });
+
+    vacantUnits = totalUnits - occupiedUnits;
+
+    // Calculate income summary
+    const incomeSummary = property.incomes.reduce((acc, income) => {
+      if (income.frequency === 'MONTHLY') {
+        acc.monthly += income.amount;
+      } else if (income.frequency === 'QUARTERLY') {
+        acc.quarterly += income.amount;
+      } else if (income.frequency === 'ANNUAL') {
+        acc.annual += income.amount;
+      }
+      totalOtherIncomes += income.amount;
+      return acc;
+    }, { monthly: 0, quarterly: 0, annual: 0 });
+
+    // Calculate commission summary
+    const commissionSummary = property.commissions.reduce((acc, commission) => {
+      if (commission.status === 'PENDING') {
+        acc.pending += commission.commissionAmount;
+      } else if (commission.status === 'PAID') {
+        acc.paid += commission.commissionAmount;
+      }
+      totalCommissions += commission.commissionAmount;
+      return acc;
+    }, { pending: 0, paid: 0 });
+        // ========== NEW: Add manager name to each commission ==========
+    const commissionsWithManager = property.commissions.map(commission => ({
+      ...commission,
+      managerName: property.manager?.name || 'Unknown Manager'
+    }));
+
+    // Prepare service provider summary
+    const serviceProviderSummary = property.serviceProviders.map(provider => ({
+      id: provider.id,
+      name: provider.name,
+      contact: provider.contact,
+      serviceContract: provider.serviceContract,
+      chargeAmount: provider.chargeAmount,
+      chargeFrequency: provider.chargeFrequency,
+      contractPeriod: provider.contractPeriod
+    }));
+
+    // Prepare lead summary
+    const leadSummary = {
+      total: property.leads.length,
+      leads: property.leads.map(lead => ({
+        id: lead.id,
+        name: lead.name,
+        phone: lead.phone,
+        email: lead.email,
+        companyName: lead.companyName,
+        natureOfLead: lead.natureOfLead,
+        createdAt: lead.createdAt
+      }))
+    };
+
+    // Calculate totals
+    const totalRentPotential = property.units.reduce((sum, unit) => sum + unit.rentAmount, 0);
+    const occupancyRate = totalUnits > 0 ? (occupiedUnits / totalUnits) * 100 : 0;
+
+    // Prepare final response
+    const response = {
+      property: {
+        id: property.id,
+        name: property.name,
+        address: property.address,
+        lrNumber: property.lrNumber,
+        form: property.form,
+        usage: property.usage,
+        commissionFee: property.commissionFee,
+        image: property.image,
+        bankDetails: {
+          accountName: property.accountName,
+          accountNo: property.accountNo,
+          bank: property.bank,
+          branch: property.branch,
+          branchCode: property.branchCode
+        },
+        landlord: property.landlord,
+        manager: property.manager
+      },
+      dateRange: {
+        startDate: start,
+        endDate: end
+      },
+      summary: {
+        totalUnits,
+        occupiedUnits,
+        vacantUnits,
+        occupancyRate: Math.round(occupancyRate * 100) / 100,
+        totalRentPotential,
+        totalDeposits,
+        totalRentCollected,
+        totalServiceCharge,
+        totalVATCollected,
+        totalBillsAmount,
+        totalOtherIncomes,
+        totalCommissions,
+        totalOutstanding,
+        totalRevenue: totalRentCollected + totalServiceCharge + totalOtherIncomes + totalBillsAmount,
+        netRevenue: (totalRentCollected + totalServiceCharge + totalOtherIncomes + totalBillsAmount) - totalCommissions
+      },
+      unitSummaries,
+      incomeSummary,
+      commissionSummary,
+      serviceProviders: serviceProviderSummary,
+      leadSummary,
+      // Include raw data for reference
+      rawData: {
+        incomes: property.incomes,
+        commissions: commissionsWithManager
+      }
+    };
+
+    res.json({
+      success: true,
+      data: response
+    });
+
+  } catch (error) {
+    console.error('Collection statement error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Error generating collection statement'
+    });
+  }
+};
+
 // @desc    Create property
 // @route   POST /api/properties
 // @access  Private

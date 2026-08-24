@@ -9,7 +9,8 @@ import {
   updatePropertyImage,
   updatePropertyCommission,
   getPropertyImage,
-  upload
+  upload,
+  getPropertyCollectionStatement
 } from '../controllers/property.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
@@ -58,6 +59,16 @@ router.get('/:id/image', getPropertyImage);
 // ======================================================
 
 router.patch('/:id/commission', authorize('ADMIN'), updatePropertyCommission);
+
+// ======================================================
+// PROPERTY COLLECTION STATEMENT
+// ======================================================
+
+router.get('/:id/collection-statement', 
+  authorize('ADMIN', 'MANAGER', 'USER'), 
+  requirePropertyAccess('canView'), 
+  getPropertyCollectionStatement
+);
 
 // ======================================================
 // RELATED MODEL ROUTES (with property-based access)
