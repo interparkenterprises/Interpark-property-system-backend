@@ -1782,28 +1782,49 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
       });
     }
 
-    const where = {
-      tenant: {
-        unit: {
-          propertyId: propertyId
+    // =============================================
+    // Parse date filters
+    // =============================================
+    let fromDateObj = null;
+    let toDateObj = null;
+    
+    if (dateFrom) {
+      fromDateObj = new Date(dateFrom);
+      fromDateObj.setHours(0, 0, 0, 0);
+    }
+    
+    if (dateTo) {
+      toDateObj = new Date(dateTo);
+      toDateObj.setHours(23, 59, 59, 999);
+    }
+
+    // =============================================
+    // Helper function to check if a date is within range
+    // =============================================
+    const isDateInRange = (dateStr) => {
+      if (!dateStr) return false;
+      
+      // If no date filters, include everything
+      if (!fromDateObj && !toDateObj) return true;
+      
+      try {
+        const checkDate = new Date(dateStr);
+        if (isNaN(checkDate.getTime())) {
+          return false;
         }
+        
+        if (fromDateObj && checkDate < fromDateObj) return false;
+        if (toDateObj && checkDate > toDateObj) return false;
+        
+        return true;
+      } catch (e) {
+        return false;
       }
     };
 
-    if (billType && ['WATER', 'ELECTRICITY'].includes(billType.toUpperCase())) {
-      where.billType = billType.toUpperCase();
-    }
-
-    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'OVERDUE', 'CANCELLED'].includes(status)) {
-      where.status = status;
-    }
-
-    if (dateFrom || dateTo) {
-      where.issueDate = {};
-      if (dateFrom) where.issueDate.gte = new Date(dateFrom);
-      if (dateTo) where.issueDate.lte = new Date(dateTo);
-    }
-
+    // =============================================
+    // Get all tenants with their bill invoices
+    // =============================================
     const tenants = await prisma.tenant.findMany({
       where: {
         unit: {
@@ -1823,18 +1844,40 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
         billInvoices: {
           where: {
             ...(billType ? { billType: billType.toUpperCase() } : {}),
-            ...(status ? { status } : {}),
-            ...(dateFrom || dateTo ? {
-              issueDate: {
-                ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
-                ...(dateTo ? { lte: new Date(dateTo) } : {})
-              }
-            } : {})
+            ...(status ? { status } : {})
           },
           orderBy: { issueDate: 'desc' }
         }
       }
     });
+
+    // =============================================
+    // Build billInvoices query with date filter
+    // =============================================
+    const where = {
+      tenant: {
+        unit: {
+          propertyId: propertyId
+        }
+      }
+    };
+
+    if (billType && ['WATER', 'ELECTRICITY'].includes(billType.toUpperCase())) {
+      where.billType = billType.toUpperCase();
+    }
+
+    if (status && ['PAID', 'PARTIAL', 'UNPAID', 'OVERDUE', 'CANCELLED'].includes(status)) {
+      where.status = status;
+    }
+
+    // =============================================
+    // FIX: Filter billInvoices by payment period (not issueDate)
+    // =============================================
+    if (fromDateObj || toDateObj) {
+      where.issueDate = {};
+      if (fromDateObj) where.issueDate.gte = fromDateObj;
+      if (toDateObj) where.issueDate.lte = toDateObj;
+    }
 
     const total = await prisma.billInvoice.count({ where });
 
@@ -1863,6 +1906,9 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
       take: parseInt(take)
     });
 
+    // =============================================
+    // Initialize summary variables
+    // =============================================
     let totalWaterBills = 0;
     let totalWaterCollected = 0;
     let totalWaterArrears = 0;
@@ -1877,8 +1923,16 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
     let unpaidBillsCount = 0;
     let overdueBillsCount = 0;
 
+    // =============================================
+    // Process each tenant with date filtering
+    // =============================================
     for (const tenant of tenants) {
-      for (const invoice of tenant.billInvoices) {
+      // Filter bill invoices by date range
+      const filteredBillInvoices = tenant.billInvoices.filter(invoice => {
+        return isDateInRange(invoice.issueDate);
+      });
+
+      for (const invoice of filteredBillInvoices) {
         const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
         const amountPaid = invoice.amountPaid || 0;
         const balance = invoice.balance || (grandTotal - amountPaid);
@@ -1908,8 +1962,14 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
     const electricityCollectionRate = totalElectricityBills > 0 ? (totalElectricityCollected / totalElectricityBills) * 100 : 0;
     const overallCollectionRate = totalBillsExpected > 0 ? (totalBillsCollected / totalBillsExpected) * 100 : 0;
 
+    // =============================================
+    // Monthly trends - only include bills in date range
+    // =============================================
     const monthlyTrends = {};
     billInvoices.forEach(invoice => {
+      // Only include if in date range
+      if (!isDateInRange(invoice.issueDate)) return;
+      
       const monthKey = new Date(invoice.issueDate).toLocaleDateString('en-US', { 
         year: 'numeric', 
         month: 'short' 
@@ -1944,11 +2004,24 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
       monthlyTrends[monthKey].total.arrears += balance;
     });
 
+    // =============================================
+    // FIX: Tenant Bill Summary - ONLY include tenants with outstanding balances
+    // =============================================
     const tenantBillSummary = tenants.map(tenant => {
+      // Filter bill invoices by date range
+      const filteredBillInvoices = tenant.billInvoices.filter(invoice => {
+        return isDateInRange(invoice.issueDate);
+      });
+
+      // If no bills in date range, skip this tenant
+      if (filteredBillInvoices.length === 0) {
+        return null;
+      }
+
       let waterTotal = 0, waterPaid = 0, waterBalance = 0;
       let electricityTotal = 0, electricityPaid = 0, electricityBalance = 0;
       
-      tenant.billInvoices.forEach(invoice => {
+      filteredBillInvoices.forEach(invoice => {
         const grandTotal = invoice.grandTotal || invoice.totalAmount || 0;
         const amountPaid = invoice.amountPaid || 0;
         const balance = invoice.balance || (grandTotal - amountPaid);
@@ -1963,6 +2036,13 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
           electricityBalance += balance;
         }
       });
+      
+      const totalOutstanding = waterBalance + electricityBalance;
+      
+      // Only include tenants with outstanding balances
+      if (totalOutstanding === 0) {
+        return null;
+      }
       
       return {
         tenantId: tenant.id,
@@ -1981,17 +2061,47 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
           outstanding: electricityBalance,
           status: electricityBalance === 0 ? 'PAID' : electricityPaid > 0 ? 'PARTIAL' : 'UNPAID'
         },
-        totalOutstanding: waterBalance + electricityBalance
+        totalOutstanding: totalOutstanding
       };
-    }).filter(t => t.totalOutstanding > 0);
+    }).filter(Boolean); // Remove null entries
 
+    // =============================================
+    // FIX: Delinquent bills - only include bills in date range
+    // =============================================
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
     
-    const delinquentBills = billInvoices.filter(invoice => 
-      invoice.status === 'OVERDUE' || 
-      (invoice.status === 'UNPAID' && new Date(invoice.dueDate) < thirtyDaysAgo)
-    );
+    const delinquentBills = billInvoices.filter(invoice => {
+      // Must be in date range
+      if (!isDateInRange(invoice.issueDate)) return false;
+      
+      return invoice.status === 'OVERDUE' || 
+        (invoice.status === 'UNPAID' && new Date(invoice.dueDate) < thirtyDaysAgo);
+    });
+
+    // =============================================
+    // Count total tenants with activity in date range
+    // =============================================
+    const activeTenants = tenants.filter(tenant => {
+      return tenant.billInvoices.some(invoice => isDateInRange(invoice.issueDate));
+    });
+
+    // =============================================
+    // Calculate total credit amount
+    // =============================================
+    let totalCredit = 0;
+    for (const tenant of tenants) {
+      const filteredBillInvoices = tenant.billInvoices.filter(invoice => {
+        return isDateInRange(invoice.issueDate);
+      });
+      
+      for (const invoice of filteredBillInvoices) {
+        const balance = invoice.balance || ((invoice.grandTotal || invoice.totalAmount) - (invoice.amountPaid || 0));
+        if (balance < 0) {
+          totalCredit += Math.abs(balance);
+        }
+      }
+    }
 
     res.json({
       success: true,
@@ -2002,8 +2112,9 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
           address: property.address
         },
         summary: {
-          totalTenants: tenants.length,
-          totalBillInvoices: billInvoices.length,
+          totalTenants: activeTenants.length, // Only tenants with activity in date range
+          totalBillInvoices: billInvoices.filter(inv => isDateInRange(inv.issueDate)).length,
+          totalCredit: parseFloat(totalCredit.toFixed(2)),
           water: {
             totalBilled: totalWaterBills,
             totalCollected: totalWaterCollected,
@@ -2074,6 +2185,10 @@ export const getPropertyBillsPaymentReport = async (req, res) => {
           limit: parseInt(take),
           total,
           totalPages: Math.ceil(total / take)
+        },
+        dateRange: {
+          from: dateFrom || null,
+          to: dateTo || null
         }
       }
     });
