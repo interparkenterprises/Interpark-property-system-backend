@@ -3,31 +3,90 @@
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![Language](https://img.shields.io/badge/language-JavaScript-yellow.svg)
 ![License](https://img.shields.io/badge/license-ISC-green.svg)
+![Node](https://img.shields.io/badge/node-16+-brightgreen.svg)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12+-blue.svg)
+
+A comprehensive **Node.js/Express backend** for managing residential and commercial properties. Handles tenant management, invoice generation, automated payment reminders, commission tracking, and role-based access control with 90+ granular permissions.
+
+---
 
 ## 📋 Table of Contents
 
-- [System Overview](#system-overview)
-- [What It Accomplishes](#what-it-accomplishes)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Setup & Installation](#setup--installation)
-- [Running the System](#running-the-system)
-- [API Documentation](#api-documentation)
-- [Working Features](#working-features)
-- [Testing Status](#testing-status)
-- [Troubleshooting](#troubleshooting)
+- [⚡ Quick Start (5 min)](#⚡-quick-start-5-min)
+- [System Overview](#🏢-system-overview)
+- [What It Accomplishes](#✅-what-it-accomplishes)
+- [Tech Stack](#🛠️-tech-stack)
+- [Database Schema](#🗄️-database-schema)
+- [Project Structure](#📁-project-structure)
+- [Setup & Installation](#🚀-setup--installation)
+- [Running the System](#▶️-running-the-system)
+- [Environment Variables Guide](#🔐-environment-variables-guide)
+- [API Documentation](#📚-api-documentation)
+- [Common Development Tasks](#🛠️-common-development-tasks)
+- [Working Features](#✅-working-features)
+- [Testing Status](#🧪-testing-status)
+- [Logging & Debugging](#🔍-logging--debugging)
+- [Git Workflow](#🔗-git-workflow)
+- [Troubleshooting](#🔧-troubleshooting)
+- [Performance Considerations](#⚡-performance-considerations)
+- [Known Issues & Technical Debt](#⚠️-known-issues--technical-debt)
+- [Additional Resources](#📖-additional-resources)
+- [Roadmap](#🎯-roadmap)
+
+---
+
+## ⚡ Quick Start (5 min)
+
+Get the backend running in 5 minutes:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/interparkenterprises/Interpark-property-system-backend.git
+cd Interpark-property-system-backend
+
+# 2. Install dependencies
+npm install
+
+# 3. Create .env file (copy from .env.example)
+cp .env.example .env
+# Update DATABASE_URL, JWT_SECRET, EMAIL credentials in .env
+
+# 4. Set up PostgreSQL
+createdb interpark_db
+psql -U postgres -d interpark_db -c "SELECT version();"
+
+# 5. Run migrations
+npx prisma migrate dev --name init
+
+# 6. Start development server + scheduler
+npm run dev:all
+
+# 7. Test the API
+curl http://localhost:5000/api/health
+# Expected: {"message":"Property Management API is running!"}
+```
+
+**Server running on:** `http://localhost:5000`  
+**API Base URL:** `http://localhost:5000/api`
 
 ---
 
 ## 🏢 System Overview
 
-**Interpark Property Management System** is a comprehensive backend solution designed for property managers to efficiently manage landlord properties, tenants, payments, and operations. It provides real-time tracking of rent payments, automated reminders, document generation, and role-based access control for multi-user environments.
+**Interpark Property Management System** is a comprehensive backend solution designed for property managers to efficiently manage landlord properties, tenants, payments, and operations.
 
 **Target Users:**
 - Property Managers (manage multiple properties)
 - Landlords (property owners)
 - Administrative Staff
 - Finance/Accounting Teams
+
+**Key Characteristics:**
+- ✅ **Production-Ready**: Used in live deployments
+- ✅ **Scalable**: Handles multiple properties, tenants, and invoices
+- ✅ **Automated**: Scheduled reminders, invoice generation, commission calculations
+- ✅ **Secure**: JWT authentication, password hashing (bcrypt), RBAC with 90+ permissions
+- ✅ **Professional**: PDF invoices with letterhead, audit logging
 
 ---
 
@@ -113,6 +172,12 @@
     - Track lead source and nature
     - Convert leads to tenants via offer letters
 
+12. **Other Income Tracking**
+    - Record additional income (consultancy, property sales, leasing fees)
+    - Categorize income types
+    - Generate invoices with VAT
+    - Track payment status
+
 ---
 
 ## 🛠️ Tech Stack
@@ -126,9 +191,9 @@
 | **Authentication** | JWT (jsonwebtoken) | 9.0.2 |
 | **Password Hashing** | bcryptjs | 3.0.2 |
 | **Task Scheduler** | node-cron | 4.2.1 |
-| **Email Service** | Nodemailer / Resend | 8.0.5 / 6.12.4 |
+| **Email Service** | Nodemailer / Resend | 9.0.5 / 6.12.4 |
 | **PDF Generation** | PDFKit | 0.17.2 |
-| **Server-side Rendering** | Puppeteer | 24.33.0 |
+| **Server-side Rendering** | Puppeteer | 25.8.0 |
 | **File Uploads** | Multer | 2.0.2 |
 | **Logging** | Morgan | 1.10.1 |
 | **CORS** | cors | 2.8.5 |
@@ -137,6 +202,68 @@
 | **Process Manager** | PM2 (production) | - |
 | **Concurrent Tasks** | concurrently | 9.2.1 |
 | **Dev Tool** | Nodemon | 3.1.14 |
+
+---
+
+## 🗄️ Database Schema
+
+### High-Level Architecture
+
+```
+User (Authentication)
+├── CustomRole (RBAC)
+├── Property (Owned/Managed)
+│   ├── Unit
+│   │   └── Tenant
+│   │       ├── Invoice
+│   │       ├── PaymentReport
+│   │       ├── Bill
+│   │       └── ServiceCharge
+│   ├── Lead
+│   ├── OfferLetter
+│   ├── ManagerCommission
+│   ├── DailyReport
+│   └── ActivationRequest
+├── Employee (Payroll)
+│   └── SalaryPayment
+├── OtherIncome (Additional Revenue)
+└── ToDo (Task Management)
+```
+
+### Key Models (25+)
+
+| Model | Purpose |
+|-------|---------|
+| **User** | System users with roles (ADMIN, MANAGER, USER) |
+| **Property** | Buildings/complexes managed by the system |
+| **Unit** | Individual apartments/offices within properties |
+| **Tenant** | Occupants of units with lease agreements |
+| **Invoice** | Rent invoices for tenants |
+| **PaymentReport** | Records of payments received |
+| **Bill** | Utility bills (water, electricity, gas) |
+| **ManagerCommission** | Commission calculations for managers |
+| **Employee** | Staff members and their salary info |
+| **OtherIncome** | Non-rent income (consultancy, sales, etc.) |
+| **CustomRole** | User-defined roles with permissions |
+| **Permission** | Granular access controls (90+ codes) |
+| **RBACAuditLog** | Audit trail for RBAC actions |
+| **DailyReport** | Operational reports (security, cleaning) |
+| **ActivationRequest** | Event/activation license requests |
+| **Lead** | Property inquiry leads |
+| **OfferLetter** | Lease offer documents |
+| **DemandLetter** | Payment demand notices |
+
+### Key Relationships
+
+```
+User → CustomRole → Permission
+User → Property → Unit → Tenant → Invoice → PaymentReport
+User → Employee → SalaryPayment
+Property → ManagerCommission (tracks manager earnings)
+Tenant → ServiceCharge (additional charges)
+Tenant → Bill → BillInvoice
+Landlord → Property → OfferLetter → Lead
+```
 
 ---
 
@@ -149,33 +276,34 @@ Interpark-property-system-backend/
 ├── 📄 ecosystem.config.cjs         # PM2 config for running server + scheduler
 ├── 📄 package.json                 # Dependencies and npm scripts
 ├── 📄 .env.example                 # Environment variables template
+├── 📄 .gitignore                   # Git ignore rules
 │
 ├── 📦 prisma/
 │   ├── schema.prisma               # Database schema (25+ models)
-│   └── migrations/                 # Database migrations
+│   └── migrations/                 # Database migrations (version control)
 │
 ├── 📦 src/
 │   │
 │   ├── 📄 app.js                   # Express app setup, middleware, routes mounting
 │   │
 │   ├── 📂 controllers/             # Request handlers (one per domain)
-│   │   ├── auth.controller.js
-│   │   ├── property.controller.js
-│   │   ├── unit.controller.js
-│   │   ├── tenant.controller.js
-│   │   ├── invoice.controller.js
-│   │   ├── bill.controller.js
-│   │   ├── paymentReport.controller.js
-│   │   ├── commissionController.js
-│   │   ├── demandLetter.controller.js
-│   │   ├── offerLetter.controller.js
-│   │   ├── dailyReport.controller.js
+│   │   ├── auth.controller.js      # Authentication (register, login, reset)
+│   │   ├── property.controller.js  # Property CRUD
+│   │   ├── unit.controller.js      # Unit management
+│   │   ├── tenant.controller.js    # Tenant CRUD
+│   │   ├── invoice.controller.js   # Invoice generation & retrieval
+│   │   ├── bill.controller.js      # Utility bill management
+│   │   ├── paymentReport.controller.js  # Payment recording
+│   │   ├── commissionController.js # Commission calculations
+│   │   ├── demandLetter.controller.js   # Demand letter generation
+│   │   ├── offerLetter.controller.js    # Offer letter generation
+│   │   ├── dailyReport.controller.js    # Daily operational reports
 │   │   ├── rbac.controller.js      # Role & permission management
-│   │   ├── employee.controller.js
-│   │   ├── lead.controller.js
-│   │   ├── activation.controller.js
-│   │   ├── todo.controller.js
-│   │   └── [14 more controllers]
+│   │   ├── employee.controller.js  # Employee management
+│   │   ├── lead.controller.js      # Lead tracking
+│   │   ├── activation.controller.js # Activation requests
+│   │   ├── todo.controller.js      # Task management
+│   │   └── [more controllers...]
 │   │
 │   ├── 📂 services/                # Business logic & calculations
 │   │   ├── permissionService.js    # RBAC permission checking (cached)
@@ -183,7 +311,7 @@ Interpark-property-system-backend/
 │   │   ├── paymentScheduling.js    # Payment scheduling logic
 │   │   ├── rentCalculation.js      # Rent escalation & VAT calculations
 │   │   ├── commissionService.js    # Commission calculations
-│   │   └── cacheService.js         # In-memory caching
+│   │   └── cacheService.js         # In-memory caching strategy
 │   │
 │   ├── 📂 routes/                  # API endpoint routing
 │   │   ├── auth.routes.js
@@ -194,7 +322,7 @@ Interpark-property-system-backend/
 │   │   ├── rbac.routes.js
 │   │   ├── commission.routes.js
 │   │   ├── employee.routes.js
-│   │   └── [9 more route files]
+│   │   └── [more route files...]
 │   │
 │   ├── 📂 middleware/              # Request processing
 │   │   ├── auth.middleware.js      # JWT verification
@@ -236,6 +364,7 @@ Interpark-property-system-backend/
 | **jobs/** | Scheduled background tasks (reminders, reports) |
 | **lib/** | Database connections, singleton patterns |
 | **utils/** | Reusable helper functions across the app |
+| **prisma/** | Database schema and migrations (version controlled) |
 
 ---
 
@@ -261,49 +390,16 @@ cd Interpark-property-system-backend
 npm install
 ```
 
-This installs all packages listed in `package.json` including:
-- Express.js, Prisma, JWT, bcryptjs, nodemailer, PDFKit, and more
+This installs all packages listed in `package.json`.
 
 ### Step 3: Configure Environment Variables
 
 Create a `.env` file in the root directory. Copy from `.env.example` and update:
 
 ```bash
-# Database Configuration
-DATABASE_URL="postgresql://username:password@localhost:5432/interpark_db"
-
-# Server Configuration
-PORT=5000
-NODE_ENV=development
-
-# Authentication
-JWT_SECRET="your-super-secret-jwt-key-change-this"
-JWT_EXPIRE=7d
-
-# Email Service (Gmail)
-EMAIL_USER="your-email@gmail.com"
-EMAIL_PASS="your-app-password"  # Use Google App Passwords, not regular password
-EMAIL_FROM="noreply@interparkenterprises.co.ke"
-
-# Resend Email Service (Alternative)
-RESEND_API_KEY="your-resend-api-key"
-
-# Frontend URL (for email links)
-FRONTEND_URL="http://localhost:3000"
-
-# File Storage
-UPLOAD_DIR="./uploads"
-MAX_FILE_SIZE=10485760  # 10MB in bytes
-
-# Optional: Third-party services
-STRIPE_KEY="your-stripe-key"
+cp .env.example .env
+# Then edit .env with your configuration
 ```
-
-**Important Security Notes:**
-- Change `JWT_SECRET` to a strong random string
-- Use [Google App Passwords](https://myaccount.google.com/apppasswords) for Gmail
-- Never commit `.env` to version control
-- Use strong database passwords in production
 
 ### Step 4: Set Up PostgreSQL Database
 
@@ -323,14 +419,9 @@ Update `DATABASE_URL` in `.env` with correct credentials.
 # Create tables and schema
 npx prisma migrate dev --name init
 
-# View database in Prisma Studio (optional)
+# View database in Prisma Studio (optional, great for exploration)
 npx prisma studio
 ```
-
-This creates:
-- 25+ database tables (User, Property, Tenant, Invoice, etc.)
-- Relationships and indexes
-- Enum types for statuses
 
 ### Step 6: Seed Initial Data (Optional)
 
@@ -338,6 +429,64 @@ This creates:
 # Create test data if seed script exists
 npm run seed
 ```
+
+---
+
+## 🔐 Environment Variables Guide
+
+### Essential Variables
+
+```bash
+# Database Connection
+DATABASE_URL="postgresql://username:password@localhost:5432/interpark_db"
+
+# Server Configuration
+PORT=5000
+NODE_ENV=development
+
+# JWT Authentication
+JWT_SECRET="your-super-secret-jwt-key-change-this"
+JWT_EXPIRE=7d
+```
+
+### Email Configuration (Choose One)
+
+**Option A: Gmail (with App Passwords)**
+```bash
+EMAIL_USER="your-email@gmail.com"
+EMAIL_PASS="your-app-password"  # Use Google App Passwords, NOT regular password
+EMAIL_FROM="noreply@interparkenterprises.co.ke"
+```
+
+**Option B: Resend Email Service**
+```bash
+RESEND_API_KEY="your-resend-api-key"
+```
+
+### Additional Configuration
+
+```bash
+# Frontend URL (for email links)
+FRONTEND_URL="http://localhost:3000"
+
+# File Storage
+UPLOAD_DIR="./uploads"
+MAX_FILE_SIZE=10485760  # 10MB in bytes
+
+# Optional: Third-party services
+STRIPE_KEY="your-stripe-key"
+
+# Timezone (for scheduled tasks)
+TZ="Africa/Nairobi"
+```
+
+### Security Best Practices
+
+- ⚠️ **Change `JWT_SECRET`** to a strong random string in production
+- ⚠️ **Use [Google App Passwords](https://myaccount.google.com/apppasswords)** for Gmail (not regular password)
+- ⚠️ **Never commit `.env`** to version control (already in .gitignore)
+- ⚠️ **Use strong database passwords** in production
+- ⚠️ **Rotate secrets regularly** in production environments
 
 ---
 
@@ -396,10 +545,10 @@ pm2 start ecosystem.config.cjs
 # View running processes
 pm2 list
 
-# View logs
+# View logs in real-time
 pm2 logs
 
-# Monitor in real-time
+# Monitor CPU/memory usage
 pm2 monit
 
 # Stop all processes
@@ -420,7 +569,7 @@ http://localhost:5000/api
 ```
 
 ### Authentication
-All endpoints (except `/api/auth/login`) require JWT token in header:
+All endpoints (except `/api/auth/login` and `/api/auth/register`) require JWT token in header:
 ```
 Authorization: Bearer {jwt_token}
 ```
@@ -491,7 +640,150 @@ Authorization: Bearer {jwt_token}
 - `POST /employees/:id/salary` - Record salary payment
 - `GET /employees/:id/history` - Payment history
 
-**For complete API specification**, see API documentation or use Swagger/Postman collection (if available).
+**For complete API specification**, check the routes in `src/routes/` or use Postman/Swagger if available.
+
+---
+
+## 🛠️ Common Development Tasks
+
+### Adding a New API Endpoint
+
+1. **Create Controller** (`src/controllers/feature.controller.js`):
+```javascript
+export const createFeature = async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    const feature = await prisma.feature.create({
+      data: { name, description }
+    });
+    res.status(201).json(feature);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+```
+
+2. **Create Routes** (`src/routes/feature.routes.js`):
+```javascript
+import express from 'express';
+import { createFeature, getFeatures } from '../controllers/feature.controller.js';
+import { protect } from '../middleware/auth.middleware.js';
+
+const router = express.Router();
+
+router.post('/', protect, createFeature);
+router.get('/', protect, getFeatures);
+
+export default router;
+```
+
+3. **Mount Routes** in `src/app.js`:
+```javascript
+import featureRoutes from './routes/feature.routes.js';
+app.use('/api/features', featureRoutes);
+```
+
+### Adding a New Database Model
+
+1. **Update Schema** in `prisma/schema.prisma`:
+```prisma
+model Feature {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([name])
+}
+```
+
+2. **Create Migration**:
+```bash
+npx prisma migrate dev --name add_feature_model
+```
+
+3. **Use in Code**:
+```javascript
+const feature = await prisma.feature.create({
+  data: { name: "Test", description: "Test feature" }
+});
+```
+
+### Adding a New Permission
+
+1. **Add to Database** (via seed or migration):
+```javascript
+await prisma.permission.create({
+  data: {
+    code: "FEATURE_READ",
+    name: "Read Features",
+    category: "FEATURE",
+    scope: "GLOBAL"
+  }
+});
+```
+
+2. **Use in Middleware**:
+```javascript
+import { checkPermission } from '../services/permissionService.js';
+
+router.get('/features', protect, async (req, res) => {
+  const hasPermission = await checkPermission(req.user.id, 'FEATURE_READ');
+  if (!hasPermission) return res.status(403).json({ error: 'Forbidden' });
+  // Handle request
+});
+```
+
+### Creating a New Scheduled Task
+
+1. **Create Job File** (`src/jobs/myJob.js`):
+```javascript
+import cron from 'node-cron';
+import { prisma } from '../lib/prisma.js';
+
+export const startMyJob = () => {
+  // Run every day at 9 AM Kenya time
+  cron.schedule('0 9 * * *', async () => {
+    try {
+      console.log('Running my job...');
+      // Do work here
+    } catch (error) {
+      console.error('Job failed:', error);
+    }
+  });
+};
+```
+
+2. **Register in Scheduler** (`src/jobs/reminderJob.js`):
+```javascript
+import { startMyJob } from './myJob.js';
+
+startMyJob();
+```
+
+### Generating PDF Documents
+
+```javascript
+import PDFDocument from 'pdfkit';
+import fs from 'fs';
+
+export const generateInvoicePDF = async (invoiceData, filename) => {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument();
+    const stream = fs.createWriteStream(filename);
+    
+    doc.pipe(stream);
+    doc.fontSize(20).text('INVOICE', 100, 100);
+    doc.fontSize(12).text(`Invoice #: ${invoiceData.number}`);
+    // Add more content...
+    doc.end();
+    
+    stream.on('finish', () => resolve(filename));
+    stream.on('error', reject);
+  });
+};
+```
 
 ---
 
@@ -541,18 +833,18 @@ Authorization: Bearer {jwt_token}
 - [x] Cron job for payment reminders
 - [x] Daily checks at 9 AM & 12 PM (Kenya timezone)
 - [x] Weekly summary on Monday 10 AM
-- [x] Email notifications with urgency levels (URGENT, WARNING, REMINDER, UPCOMING)
+- [x] Email notifications with urgency levels
 - [x] Separate scheduler process (can run independently)
 - [x] Graceful shutdown handling
 
 ### ✅ Commission Management
 - [x] Manager commission calculation
 - [x] Commission invoice generation
-- [x] Commission status tracking (pending/paid/processing)
+- [x] Commission status tracking
 - [x] Commission reports with VAT
 
 ### ✅ Reporting
-- [x] Daily operational reports (security, cleaning, maintenance)
+- [x] Daily operational reports
 - [x] Payment reports with summaries
 - [x] Audit logs for all system actions
 - [x] Report filtering and pagination
@@ -560,8 +852,8 @@ Authorization: Bearer {jwt_token}
 ### ✅ Employee Management
 - [x] Employee creation and management
 - [x] Salary payment recording
-- [x] Payment frequency support (daily, weekly, bi-weekly, monthly)
-- [x] Automatic status updates based on payment history
+- [x] Payment frequency support
+- [x] Automatic status updates
 - [x] Payment period validation
 
 ### ⚠️ Partial/In-Development
@@ -639,6 +931,130 @@ curl -X POST http://localhost:5000/api/properties \
 
 ---
 
+## 🔍 Logging & Debugging
+
+### Enable Debug Logging
+
+```bash
+# Run with debug output
+DEBUG=* npm run dev
+
+# Or for specific module
+DEBUG=express:* npm run dev
+```
+
+### View Logs
+
+**Development:**
+```bash
+# Console output (with Morgan logging)
+npm run dev 2>&1 | tail -100
+```
+
+**Production (PM2):**
+```bash
+# View all logs
+pm2 logs
+
+# View specific app logs
+pm2 logs property-management-backend
+
+# View last 100 lines
+pm2 logs property-management-backend --lines 100
+
+# Follow logs in real-time
+pm2 logs --follow
+```
+
+### Database Query Logging
+
+Enable Prisma query logs:
+```bash
+# In .env
+DATABASE_LOG=["query", "info", "warn", "error"]
+```
+
+### Common Log Locations
+
+| What | Location |
+|------|----------|
+| Express/API logs | Console / PM2 logs |
+| Scheduler logs | Console / `src/jobs/reminderJob.js` output |
+| Database errors | Console with DATABASE_LOG enabled |
+| Generated PDFs | `uploads/invoices/`, `uploads/receipts/`, etc. |
+
+---
+
+## 🔗 Git Workflow
+
+### Branch Naming Convention
+
+```
+feature/description       # New features
+bugfix/description        # Bug fixes
+hotfix/description        # Production hotfixes
+refactor/description      # Code refactoring
+docs/description          # Documentation updates
+```
+
+### Example Workflow
+
+1. **Create Feature Branch:**
+```bash
+git checkout -b feature/add-invoice-export
+```
+
+2. **Make Changes & Commit:**
+```bash
+git add .
+git commit -m "feat: add invoice PDF export functionality
+
+- Implement PDF generation using PDFKit
+- Add invoice download endpoint
+- Include company letterhead
+- Closes #123"
+```
+
+**Commit Message Format:**
+- `feat:` - New feature
+- `fix:` - Bug fix
+- `docs:` - Documentation
+- `refactor:` - Code refactoring
+- `test:` - Test changes
+- `chore:` - Build/dependency changes
+
+3. **Push & Create Pull Request:**
+```bash
+git push origin feature/add-invoice-export
+# Create PR on GitHub
+```
+
+4. **Pull Request Checklist:**
+- [ ] Tests written/updated
+- [ ] README updated if needed
+- [ ] No console.log statements left
+- [ ] Code follows project conventions
+- [ ] Breaking changes documented
+
+5. **After Approval, Merge:**
+```bash
+git checkout main
+git pull origin main
+git merge feature/add-invoice-export
+git push origin main
+```
+
+### Code Style Guidelines
+
+- Use **camelCase** for variables/functions
+- Use **PascalCase** for classes/models
+- Add **comments for complex logic**
+- Handle **errors gracefully**
+- **Test before committing**
+- Keep **functions small and focused**
+
+---
+
 ## 🔧 Troubleshooting
 
 ### Common Issues & Solutions
@@ -657,6 +1073,9 @@ sudo systemctl start postgresql
 
 # Verify DATABASE_URL in .env is correct
 echo $DATABASE_URL
+
+# Test connection
+psql -U postgres -d interpark_db -c "SELECT version();"
 ```
 
 #### 2. **JWT Token Invalid/Expired**
@@ -758,6 +1177,114 @@ ls -la src/letterHeads/letterhead.png
 # System will still work with text header as fallback
 ```
 
+#### 9. **Prisma Client Generation Issues**
+```
+Error: Cannot find module '@prisma/client'
+```
+**Solution:**
+```bash
+# Regenerate Prisma client
+npx prisma generate
+
+# Or reinstall
+npm install @prisma/client
+```
+
+---
+
+## ⚡ Performance Considerations
+
+### Permission Caching Strategy
+
+The system uses **node-cache** for permission caching to avoid repeated database lookups:
+
+```javascript
+// Permissions are cached with 5-minute TTL
+const hasPermission = await checkPermission(userId, 'PERMISSION_CODE');
+// Subsequent calls within 5 minutes use cache
+```
+
+**Cache Invalidation:** Automatically expires after 5 minutes or manually clear with:
+```javascript
+cacheService.clear();
+```
+
+### Invoice Generation Performance
+
+**Batch Generation Tips:**
+- Use pagination when querying invoices: `skip`, `take` parameters
+- Generate PDFs asynchronously (don't block requests)
+- Consider queue system for large batch operations
+
+### Database Query Optimization
+
+**Best Practices:**
+```javascript
+// ✅ Good: Select only needed fields
+const invoice = await prisma.invoice.findUnique({
+  where: { id },
+  select: { id: true, number: true, amount: true }
+});
+
+// ❌ Avoid: Loading unnecessary relations
+const invoice = await prisma.invoice.findUnique({
+  where: { id },
+  include: { tenant: true, paymentReport: true, /* ... */ }
+});
+```
+
+### Connection Pooling
+
+PostgreSQL connection pooling is handled by Prisma:
+```prisma
+// prisma/schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+Connection pool settings are managed automatically.
+
+---
+
+## ⚠️ Known Issues & Technical Debt
+
+### Outstanding Issues
+
+1. **Batch Demand Letter Generation**
+   - Single generation works ✅
+   - Batch/bulk generation needs optimization
+   - Consider async queue system
+
+2. **Offer Letter PDF Refinement**
+   - Current implementation works but styling could be improved
+   - No template engine currently in use
+
+3. **Test Coverage**
+   - No unit tests yet
+   - Manual testing is currently primary method
+   - Need Jest/Mocha setup
+
+4. **API Rate Limiting**
+   - Currently no rate limiting
+   - Should add for production security
+
+5. **Error Handling**
+   - Some endpoints lack detailed error messages
+   - Consider structured error response format
+
+### Technical Debt
+
+- [ ] Add TypeScript for better type safety
+- [ ] Implement comprehensive error handling middleware
+- [ ] Add API documentation (Swagger/OpenAPI)
+- [ ] Setup automated testing (Jest)
+- [ ] Add input validation schemas (Zod/Yup)
+- [ ] Implement request/response logging
+- [ ] Add database connection pooling configuration
+- [ ] Setup CI/CD pipeline
+
 ---
 
 ## 📖 Additional Resources
@@ -782,7 +1309,22 @@ npm run lint
 
 # Build production bundle
 npm run build
+
+# View dependency tree
+npm list
+
+# Check for outdated packages
+npm outdated
 ```
+
+### Documentation & Links
+
+- [Express.js Docs](https://expressjs.com/)
+- [Prisma ORM Docs](https://www.prisma.io/docs/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
+- [JWT.io](https://jwt.io/)
+- [Node Cron Docs](https://github.com/kelektiv/node-cron)
+- [PDFKit Documentation](http://pdfkit.org/)
 
 ### File Locations to Know
 
@@ -819,7 +1361,7 @@ npm run build
 1. Create a new branch: `git checkout -b feature/description`
 2. Make your changes
 3. Test thoroughly
-4. Commit with clear messages: `git commit -m "Add feature description"`
+4. Commit with clear messages
 5. Push to branch: `git push origin feature/description`
 6. Create Pull Request with description
 
@@ -843,7 +1385,7 @@ ISC License - See LICENSE file for details
 ## 🆘 Support & Questions
 
 For issues or questions:
-1. Check [Troubleshooting](#troubleshooting) section
+1. Check [Troubleshooting](#🔧-troubleshooting) section
 2. Review existing GitHub issues
 3. Create new issue with detailed description
 4. Contact development team
@@ -857,20 +1399,31 @@ For issues or questions:
 - [ ] Automated API tests
 - [ ] Advanced analytics endpoints
 - [ ] WhatsApp notification integration
+- [ ] API documentation (Swagger)
 
 ### v1.2.0
 - [ ] Mobile app backend enhancements
 - [ ] Multi-currency support
 - [ ] Bank statement reconciliation
+- [ ] Webhook integration for payment events
 
 ### v2.0.0
 - [ ] Microservices architecture
 - [ ] GraphQL API alternative
 - [ ] Real-time WebSocket updates
 - [ ] AI-powered payment forecasting
+- [ ] Advanced analytics dashboard
 
 ---
 
-**Last Updated:** July 20, 2026  
+**Last Updated:** August 25, 2026  
 **Maintained By:** Interpark Enterprises Limited  
 **Repository:** https://github.com/interparkenterprises/Interpark-property-system-backend
+
+---
+
+## 📞 Contact & Support
+
+**Development Team:** [Contact information here]  
+**Email:** dev@interparkenterprises.co.ke  
+**Issues & Bugs:** Use GitHub Issues tracker  
