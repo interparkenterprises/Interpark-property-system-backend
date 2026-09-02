@@ -12,6 +12,8 @@ import {
   getPropertyArrears,
   getOutstandingInvoices,
   downloadPaymentReceipt,
+  regeneratePaymentReceipt,
+   bulkRegenerateReceipts,
   deletePaymentReport
 } from '../controllers/paymentReport.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
@@ -73,5 +75,10 @@ router.route('/:id')
 
 // GET /api/payments/:id/receipt - Download payment receipt PDF
 router.get('/:id/receipt', authorize('ADMIN', 'MANAGER', 'USER'), downloadPaymentReceipt);
+
+// POST /api/payments/:id/regenerate-receipt - Regenerate a single receipt
+router.post('/:id/regenerate-receipt', authorize('ADMIN', 'MANAGER', 'USER'), regeneratePaymentReceipt);
+// POST /api/payments/bulk/regenerate-receipts - Bulk regenerate receipts (ADMIN only)
+router.post('/bulk/regenerate-receipts', authorize('ADMIN'), bulkRegenerateReceipts);
 
 export default router;

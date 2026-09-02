@@ -3741,6 +3741,364 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     });
   }
 };
+// @desc    Regenerate receipt for a payment report
+// @route   POST /api/payments/:id/regenerate-receipt
+// @access  Private (ADMIN, MANAGER, or users with EDIT_PAYMENT_RECORDS permission)
+export const regeneratePaymentReceipt = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+    const { force = false } = req.query;
+
+    // Get the payment report with all related data
+    const paymentReport = await prisma.paymentReport.findUnique({
+      where: { id },
+      include: {
+        tenant: {
+          include: {
+            unit: {
+              include: {
+                property: true
+              }
+            },
+            serviceCharge: true
+          }
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalDue: true,
+            amountPaid: true,
+            balance: true,
+            status: true,
+            paymentPeriod: true,
+            paymentPolicy: true,
+            rent: true,
+            serviceCharge: true,
+            vat: true,
+            issueDate: true,
+            dueDate: true
+          }
+        },
+        billInvoices: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            billType: true,
+            totalAmount: true,
+            amountPaid: true,
+            status: true,
+            issueDate: true,
+            dueDate: true,
+            grandTotal: true,
+            balance: true
+          }
+        }
+      }
+    });
+
+    if (!paymentReport) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment report not found'
+      });
+    }
+
+    // Check if receipt already exists and force flag is not set
+    if (paymentReport.receiptUrl && !force) {
+      return res.status(400).json({
+        success: false,
+        message: 'Receipt already exists for this payment report. Use force=true to regenerate.',
+        receiptUrl: paymentReport.receiptUrl
+      });
+    }
+
+    const propertyId = paymentReport.tenant?.unit?.propertyId;
+
+    // Permission checks
+    if (userRole !== 'ADMIN') {
+      const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
+      if (!canManage) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to regenerate receipts for this property'
+        });
+      }
+      
+      const hasEditPermission = await permissionService.hasPermission(
+        userId,
+        'EDIT_PAYMENT_RECORDS',
+        propertyId
+      );
+      
+      if (!hasEditPermission && userRole !== 'MANAGER') {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to regenerate receipts'
+        });
+      }
+    }
+
+    // Extract overpayment and credit info from notes
+    let overpaymentAmount = 0;
+    let creditUsed = 0;
+    
+    if (paymentReport.notes) {
+      const overpaymentMatch = paymentReport.notes.match(/Overpayment: Ksh ([\d.]+)/);
+      if (overpaymentMatch) {
+        overpaymentAmount = parseFloat(overpaymentMatch[1]);
+      }
+      const creditMatch = paymentReport.notes.match(/Applied Ksh ([\d.]+) from credit balance/);
+      if (creditMatch) {
+        creditUsed = parseFloat(creditMatch[1]);
+      }
+    }
+
+    // Combine invoices for receipt generation
+    const allInvoices = [...paymentReport.invoices, ...paymentReport.billInvoices];
+
+    // Generate the receipt
+    const receiptResult = await generateAndUploadReceipt(
+      paymentReport,
+      paymentReport.tenant,
+      allInvoices,
+      overpaymentAmount,
+      creditUsed
+    );
+
+    if (receiptResult.error) {
+      // Log the error but don't fail the request if receipt generation fails
+      console.error('Receipt generation error:', receiptResult.error);
+      
+      // Update the payment report with a failed status note
+      await prisma.paymentReport.update({
+        where: { id: paymentReport.id },
+        data: {
+          notes: paymentReport.notes 
+            ? `${paymentReport.notes} | Receipt generation failed: ${receiptResult.error}`
+            : `Receipt generation failed: ${receiptResult.error}`
+        }
+      });
+
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to generate receipt',
+        error: receiptResult.error
+      });
+    }
+
+    // Update the payment report with the new receipt URL
+    const updatedReport = await prisma.paymentReport.update({
+      where: { id: paymentReport.id },
+      data: {
+        receiptUrl: receiptResult.receiptUrl,
+        updatedAt: new Date()
+      },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            fullName: true,
+            contact: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        paymentReport: {
+          id: updatedReport.id,
+          receiptUrl: updatedReport.receiptUrl,
+          receiptNumber: receiptResult.receiptNumber,
+          regeneratedAt: new Date()
+        },
+        receipt: {
+          receiptNumber: receiptResult.receiptNumber,
+          receiptUrl: receiptResult.receiptUrl,
+          generatedAt: new Date()
+        },
+        message: paymentReport.receiptUrl 
+          ? 'Receipt regenerated successfully' 
+          : 'Receipt generated successfully'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error regenerating receipt:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to regenerate receipt'
+    });
+  }
+};
+
+// @desc    Bulk regenerate receipts for payment reports
+// @route   POST /api/payments/bulk/regenerate-receipts
+// @access  Private (ADMIN only)
+export const bulkRegenerateReceipts = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+    const { paymentReportIds = [], propertyId, dateFrom, dateTo, limit = 50 } = req.body;
+
+    // Only admins can perform bulk operations
+    if (userRole !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only admins can perform bulk receipt regeneration'
+      });
+    }
+
+    // Build query to find payment reports without receipts
+    const where = {
+      receiptUrl: null
+    };
+
+    if (paymentReportIds.length > 0) {
+      where.id = { in: paymentReportIds };
+    }
+
+    if (propertyId) {
+      where.tenant = {
+        unit: {
+          propertyId
+        }
+      };
+    }
+
+    if (dateFrom || dateTo) {
+      where.createdAt = {};
+      if (dateFrom) where.createdAt.gte = new Date(dateFrom);
+      if (dateTo) where.createdAt.lte = new Date(dateTo);
+    }
+
+    // Find all payment reports without receipts
+    const paymentReports = await prisma.paymentReport.findMany({
+      where,
+      include: {
+        tenant: {
+          include: {
+            unit: {
+              include: {
+                property: true
+              }
+            },
+            serviceCharge: true
+          }
+        },
+        invoices: true,
+        billInvoices: true
+      },
+      take: Math.min(limit, 100), // Limit to prevent memory issues
+      orderBy: { createdAt: 'asc' }
+    });
+
+    if (paymentReports.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No payment reports found that need receipt generation',
+        data: {
+          processed: 0,
+          successful: 0,
+          failed: 0,
+          results: []
+        }
+      });
+    }
+
+    const results = [];
+    let successful = 0;
+    let failed = 0;
+
+    for (const paymentReport of paymentReports) {
+      try {
+        // Extract overpayment and credit info from notes
+        let overpaymentAmount = 0;
+        let creditUsed = 0;
+        
+        if (paymentReport.notes) {
+          const overpaymentMatch = paymentReport.notes.match(/Overpayment: Ksh ([\d.]+)/);
+          if (overpaymentMatch) {
+            overpaymentAmount = parseFloat(overpaymentMatch[1]);
+          }
+          const creditMatch = paymentReport.notes.match(/Applied Ksh ([\d.]+) from credit balance/);
+          if (creditMatch) {
+            creditUsed = parseFloat(creditMatch[1]);
+          }
+        }
+
+        const allInvoices = [...paymentReport.invoices, ...paymentReport.billInvoices];
+
+        const receiptResult = await generateAndUploadReceipt(
+          paymentReport,
+          paymentReport.tenant,
+          allInvoices,
+          overpaymentAmount,
+          creditUsed
+        );
+
+        if (receiptResult.error) {
+          failed++;
+          results.push({
+            paymentReportId: paymentReport.id,
+            success: false,
+            error: receiptResult.error
+          });
+          continue;
+        }
+
+        // Update the payment report
+        await prisma.paymentReport.update({
+          where: { id: paymentReport.id },
+          data: {
+            receiptUrl: receiptResult.receiptUrl,
+            updatedAt: new Date()
+          }
+        });
+
+        successful++;
+        results.push({
+          paymentReportId: paymentReport.id,
+          success: true,
+          receiptNumber: receiptResult.receiptNumber,
+          receiptUrl: receiptResult.receiptUrl
+        });
+
+      } catch (error) {
+        failed++;
+        results.push({
+          paymentReportId: paymentReport.id,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        processed: paymentReports.length,
+        successful,
+        failed,
+        results,
+        totalRemaining: paymentReports.length - successful - failed
+      },
+      message: `Processed ${paymentReports.length} payment reports. ${successful} successful, ${failed} failed.`
+    });
+
+  } catch (error) {
+    console.error('Error in bulk receipt regeneration:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to bulk regenerate receipts'
+    });
+  }
+};
 
 // @desc    Download payment receipt PDF
 // @route   GET /api/payments/:id/receipt
