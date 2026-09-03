@@ -3411,7 +3411,8 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       amountPaid, 
       paymentPeriod, 
       notes,
-      regenerateReceipt = false // New flag to control receipt regeneration
+      regenerateReceipt = false,
+      force = false // Add force parameter
     } = req.body;
 
     const existingReport = await prisma.paymentReport.findUnique({
@@ -3441,7 +3442,7 @@ export const updatePaymentReportWithIncome = async (req, res) => {
 
     const propertyId = existingReport.tenant?.unit?.propertyId;
 
-    // Permission checks (keep your existing permission logic)
+    // Permission checks
     if (userRole !== 'ADMIN') {
       const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
       if (!canManage) {
@@ -3595,7 +3596,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
 
       // Update linked invoices if they exist
       if (existingReport.invoices && existingReport.invoices.length > 0) {
-        // Update the payment period on all linked invoices
         for (const invoice of existingReport.invoices) {
           const rentBalance = arrears > 0 ? arrears : 0;
           
@@ -3623,7 +3623,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           await tx.billInvoice.update({
             where: { id: billInvoice.id },
             data: {
-              // Update bill invoice payment period if applicable
               issueDate: periodDate || billInvoice.issueDate,
               updatedAt: new Date()
             }
@@ -3696,41 +3695,64 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           creditUsed
         );
 
-        // Update the payment report with new receipt URL
-        if (receiptResult.receiptUrl) {
+        // Only update if receipt was generated successfully
+        if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
           await prisma.paymentReport.update({
             where: { id: result.updatedReport.id },
             data: { 
-              receiptUrl: receiptResult.receiptUrl 
+              receiptUrl: receiptResult.receiptUrl,
+              updatedAt: new Date()
             }
           });
+          console.log(`Receipt regenerated successfully: ${receiptResult.receiptNumber}`);
+        } else if (receiptResult && receiptResult.error) {
+          // Log the error but DON'T add it to notes
+          console.error('Receipt generation error:', receiptResult.error);
+          // Do NOT update notes with the error
         }
-
-        console.log(`Receipt regenerated successfully: ${receiptResult.receiptNumber}`);
       } catch (receiptError) {
+        // Log the error but DON'T add it to notes
         console.error('Failed to regenerate receipt:', receiptError);
         // Don't fail the whole update if receipt regeneration fails
+        // Do NOT update notes with the error
       }
+    }
+
+    // Prepare the response
+    const responseData = {
+      paymentReport: {
+        ...result.updatedReport,
+        receiptUrl: receiptResult?.receiptUrl || result.updatedReport.receiptUrl,
+        receiptNumber: receiptResult?.receiptNumber || null
+      },
+      income: result.updatedIncome
+    };
+
+    // Only add receipt info if it was generated
+    if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
+      responseData.receipt = {
+        receiptNumber: receiptResult.receiptNumber,
+        receiptUrl: receiptResult.receiptUrl,
+        regenerated: true,
+        generatedAt: new Date()
+      };
+    }
+
+    // Determine the appropriate message
+    let message = 'Payment report updated successfully';
+    if (paymentPeriod) {
+      message = 'Payment report updated with new payment period';
+      if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
+        message += ' and receipt regenerated';
+      }
+    } else if (regenerateReceipt && receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
+      message = 'Payment report updated and receipt regenerated successfully';
     }
 
     res.json({
       success: true,
-      data: {
-        paymentReport: {
-          ...result.updatedReport,
-          receiptUrl: receiptResult?.receiptUrl || result.updatedReport.receiptUrl,
-          receiptNumber: receiptResult?.receiptNumber || null
-        },
-        income: result.updatedIncome,
-        receipt: receiptResult ? {
-          receiptNumber: receiptResult.receiptNumber,
-          receiptUrl: receiptResult.receiptUrl,
-          regenerated: true
-        } : null,
-        message: paymentPeriod 
-          ? 'Payment report updated with new payment period and receipt regenerated' 
-          : 'Payment report updated successfully'
-      }
+      data: responseData,
+      message: message
     });
 
   } catch (error) {
@@ -3948,7 +3970,7 @@ export const bulkRegenerateReceipts = async (req, res) => {
       dateFrom, 
       dateTo, 
       limit = 50,
-      force = false // NEW: Add force parameter
+      force = false
     } = req.body;
 
     // Only admins can perform bulk operations
@@ -3962,7 +3984,6 @@ export const bulkRegenerateReceipts = async (req, res) => {
     // Build query to find payment reports
     const where = {};
     
-    // NEW: If force is true, include all reports, otherwise only those without receipts
     if (!force) {
       where.receiptUrl = null;
     }
@@ -3985,7 +4006,7 @@ export const bulkRegenerateReceipts = async (req, res) => {
       if (dateTo) where.createdAt.lte = new Date(dateTo);
     }
 
-    // Find all payment reports (including those with existing receipts if force=true)
+    // Find all payment reports
     const paymentReports = await prisma.paymentReport.findMany({
       where,
       include: {
@@ -4002,7 +4023,7 @@ export const bulkRegenerateReceipts = async (req, res) => {
         invoices: true,
         billInvoices: true
       },
-      take: Math.min(limit, 100), // Limit to prevent memory issues
+      take: Math.min(limit, 100),
       orderBy: { createdAt: 'asc' }
     });
 
@@ -4024,13 +4045,9 @@ export const bulkRegenerateReceipts = async (req, res) => {
     const results = [];
     let successful = 0;
     let failed = 0;
-    let skipped = 0;
 
     for (const paymentReport of paymentReports) {
       try {
-        // If force is true, we regenerate regardless of existing receipt
-        // If force is false, we skip if receipt already exists (already handled by query)
-        
         // Extract overpayment and credit info from notes
         let overpaymentAmount = 0;
         let creditUsed = 0;
@@ -4057,6 +4074,10 @@ export const bulkRegenerateReceipts = async (req, res) => {
         );
 
         if (receiptResult.error) {
+          // Log the error but DON'T add it to notes
+          console.error(`Receipt generation error for ${paymentReport.id}:`, receiptResult.error);
+          
+          // Don't update notes with error, just increment failed count
           failed++;
           results.push({
             paymentReportId: paymentReport.id,
@@ -4073,6 +4094,7 @@ export const bulkRegenerateReceipts = async (req, res) => {
           data: {
             receiptUrl: receiptResult.receiptUrl,
             updatedAt: new Date()
+            // IMPORTANT: Do NOT update notes here
           }
         });
 
@@ -4082,10 +4104,13 @@ export const bulkRegenerateReceipts = async (req, res) => {
           success: true,
           receiptNumber: receiptResult.receiptNumber,
           receiptUrl: receiptResult.receiptUrl,
-          wasRegenerated: !!paymentReport.receiptUrl // Indicates if this was a regeneration
+          wasRegenerated: !!paymentReport.receiptUrl
         });
 
       } catch (error) {
+        // Log the error but DON'T add it to notes
+        console.error(`Error processing ${paymentReport.id}:`, error);
+        
         failed++;
         results.push({
           paymentReportId: paymentReport.id,
@@ -4102,7 +4127,6 @@ export const bulkRegenerateReceipts = async (req, res) => {
         processed: paymentReports.length,
         successful,
         failed,
-        skipped,
         force: force,
         results,
         totalRemaining: paymentReports.length - successful - failed
