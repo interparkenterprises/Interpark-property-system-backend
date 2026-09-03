@@ -3942,7 +3942,14 @@ export const bulkRegenerateReceipts = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
-    const { paymentReportIds = [], propertyId, dateFrom, dateTo, limit = 50 } = req.body;
+    const { 
+      paymentReportIds = [], 
+      propertyId, 
+      dateFrom, 
+      dateTo, 
+      limit = 50,
+      force = false // NEW: Add force parameter
+    } = req.body;
 
     // Only admins can perform bulk operations
     if (userRole !== 'ADMIN') {
@@ -3952,10 +3959,13 @@ export const bulkRegenerateReceipts = async (req, res) => {
       });
     }
 
-    // Build query to find payment reports without receipts
-    const where = {
-      receiptUrl: null
-    };
+    // Build query to find payment reports
+    const where = {};
+    
+    // NEW: If force is true, include all reports, otherwise only those without receipts
+    if (!force) {
+      where.receiptUrl = null;
+    }
 
     if (paymentReportIds.length > 0) {
       where.id = { in: paymentReportIds };
@@ -3975,7 +3985,7 @@ export const bulkRegenerateReceipts = async (req, res) => {
       if (dateTo) where.createdAt.lte = new Date(dateTo);
     }
 
-    // Find all payment reports without receipts
+    // Find all payment reports (including those with existing receipts if force=true)
     const paymentReports = await prisma.paymentReport.findMany({
       where,
       include: {
@@ -3999,7 +4009,9 @@ export const bulkRegenerateReceipts = async (req, res) => {
     if (paymentReports.length === 0) {
       return res.json({
         success: true,
-        message: 'No payment reports found that need receipt generation',
+        message: force 
+          ? 'No payment reports found matching the criteria' 
+          : 'No payment reports found that need receipt generation',
         data: {
           processed: 0,
           successful: 0,
@@ -4012,9 +4024,13 @@ export const bulkRegenerateReceipts = async (req, res) => {
     const results = [];
     let successful = 0;
     let failed = 0;
+    let skipped = 0;
 
     for (const paymentReport of paymentReports) {
       try {
+        // If force is true, we regenerate regardless of existing receipt
+        // If force is false, we skip if receipt already exists (already handled by query)
+        
         // Extract overpayment and credit info from notes
         let overpaymentAmount = 0;
         let creditUsed = 0;
@@ -4045,12 +4061,13 @@ export const bulkRegenerateReceipts = async (req, res) => {
           results.push({
             paymentReportId: paymentReport.id,
             success: false,
-            error: receiptResult.error
+            error: receiptResult.error,
+            hadExistingReceipt: !!paymentReport.receiptUrl
           });
           continue;
         }
 
-        // Update the payment report
+        // Update the payment report with the new receipt URL
         await prisma.paymentReport.update({
           where: { id: paymentReport.id },
           data: {
@@ -4064,7 +4081,8 @@ export const bulkRegenerateReceipts = async (req, res) => {
           paymentReportId: paymentReport.id,
           success: true,
           receiptNumber: receiptResult.receiptNumber,
-          receiptUrl: receiptResult.receiptUrl
+          receiptUrl: receiptResult.receiptUrl,
+          wasRegenerated: !!paymentReport.receiptUrl // Indicates if this was a regeneration
         });
 
       } catch (error) {
@@ -4072,7 +4090,8 @@ export const bulkRegenerateReceipts = async (req, res) => {
         results.push({
           paymentReportId: paymentReport.id,
           success: false,
-          error: error.message
+          error: error.message,
+          hadExistingReceipt: !!paymentReport.receiptUrl
         });
       }
     }
@@ -4083,10 +4102,14 @@ export const bulkRegenerateReceipts = async (req, res) => {
         processed: paymentReports.length,
         successful,
         failed,
+        skipped,
+        force: force,
         results,
         totalRemaining: paymentReports.length - successful - failed
       },
-      message: `Processed ${paymentReports.length} payment reports. ${successful} successful, ${failed} failed.`
+      message: force
+        ? `Processed ${paymentReports.length} payment reports. ${successful} regenerated, ${failed} failed.`
+        : `Processed ${paymentReports.length} payment reports. ${successful} successful, ${failed} failed.`
     });
 
   } catch (error) {
