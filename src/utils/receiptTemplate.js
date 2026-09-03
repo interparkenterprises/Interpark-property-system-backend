@@ -9,6 +9,52 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 /**
+ * Clean notes by removing error messages and returning a generic message if needed
+ */
+const cleanNotes = (notes) => {
+  if (!notes) return null;
+  
+  // Check if notes contain error messages
+  const errorPatterns = [
+    'Receipt generation failed',
+    'Failed to generate PDF',
+    'Could not find Chrome',
+    'page.waitForTimeout',
+    'Could not find Chromium',
+    'Failed to launch browser',
+    'TimeoutError',
+    'Protocol error'
+  ];
+  
+  const hasError = errorPatterns.some(pattern => notes.includes(pattern));
+  
+  if (hasError) {
+    // Return a generic success message instead of the error
+    return 'Payment processed successfully. Thank you for your payment.';
+  }
+  
+  // Clean up any remaining error patterns (just in case)
+  let cleanNotes = notes;
+  errorPatterns.forEach(pattern => {
+    const regex = new RegExp(`\\|? ?${pattern}[^|]*`, 'g');
+    cleanNotes = cleanNotes.replace(regex, '');
+  });
+  
+  // Clean up extra pipes and spaces
+  cleanNotes = cleanNotes.replace(/\|\s*\|/g, '|');
+  cleanNotes = cleanNotes.replace(/^\s*\|\s*/, '');
+  cleanNotes = cleanNotes.replace(/\|\s*$/, '');
+  cleanNotes = cleanNotes.trim();
+  
+  // If after cleaning the notes are empty, return a generic message
+  if (!cleanNotes || cleanNotes === '' || cleanNotes === '|') {
+    return 'Payment processed successfully. Thank you for your payment.';
+  }
+  
+  return cleanNotes;
+};
+
+/**
  * Generate PDF receipt with letterhead and proper footer
  * @param {Object} data - Receipt data
  * @returns {Buffer} PDF buffer
@@ -145,6 +191,9 @@ export async function generateReceiptPDF(data) {
         monthlyEquivalent
       } = data;
 
+      // Clean the notes before using them
+      const cleanNotesText = cleanNotes(notes);
+
       // ===========================================
       // RECEIPT TITLE
       // ===========================================
@@ -276,7 +325,6 @@ export async function generateReceiptPDF(data) {
 
         const tableTop = doc.y;
         const tableWidth = doc.page.width - 100;
-        // MODIFIED: Updated column widths for better clarity
         const colWidths = [tableWidth * 0.25, tableWidth * 0.25, tableWidth * 0.25, tableWidth * 0.25];
         
         // Table Header
@@ -286,7 +334,6 @@ export async function generateReceiptPDF(data) {
         doc.rect(50, tableTop, tableWidth, 20).fill('#005478');
         
         let xPos = 50;
-        // MODIFIED: Clearer headers that explain the amounts
         const headers = ['Monthly Amount', 'Amount Paid', 'Remaining Balance', 'Status'];
         
         doc.fontSize(8)
@@ -315,7 +362,6 @@ export async function generateReceiptPDF(data) {
           
           xPos = 50;
           
-          // MODIFIED: Show the monthly amount (not the full invoice amount)
           const monthlyAmount = inv.monthlyAmount || inv.previousBalance;
           doc.fontSize(9)
              .fillColor('#1e293b')
@@ -323,15 +369,12 @@ export async function generateReceiptPDF(data) {
              .text(formatCurrency(monthlyAmount), xPos + 3, rowY + 4, { width: colWidths[0] - 6 });
           xPos += colWidths[0];
           
-          // Amount Paid (what was paid for this period)
           doc.text(formatCurrency(inv.paymentApplied || inv.amountPaid || 0), xPos + 3, rowY + 4, { width: colWidths[1] - 6 });
           xPos += colWidths[1];
           
-          // Remaining Balance
           doc.text(formatCurrency(inv.newBalance), xPos + 3, rowY + 4, { width: colWidths[2] - 6 });
           xPos += colWidths[2];
           
-          // Status
           doc.fillColor(statusColor).font('Helvetica-Bold');
           doc.text(inv.newStatus, xPos + 3, rowY + 4, { width: colWidths[3] - 6 });
           
@@ -408,10 +451,10 @@ export async function generateReceiptPDF(data) {
       doc.y = Math.max(doc.y, summaryY + (creditUsed > 0 ? 75 : 50));
 
       // ===========================================
-      // NOTES SECTION (if provided)
+      // NOTES SECTION (with cleaned notes)
       // ===========================================
       
-      if (notes) {
+      if (cleanNotesText) {
         doc.moveDown(0.5);
         
         doc.fontSize(10)
@@ -424,7 +467,7 @@ export async function generateReceiptPDF(data) {
         doc.fontSize(9)
            .fillColor('#475569')
            .font('Helvetica')
-           .text(notes, 50, doc.y, { width: doc.page.width - 100 });
+           .text(cleanNotesText, 50, doc.y, { width: doc.page.width - 100 });
         
         doc.moveDown(0.5);
       }
@@ -475,7 +518,7 @@ export async function generateReceiptPDF(data) {
 }
 
 /**
- * HTML template for email/backup purposes - MODIFIED with correct headers
+ * HTML template for email/backup purposes - MODIFIED with clean notes
  */
 export const generateReceiptHTML = (data) => {
   const {
@@ -499,6 +542,9 @@ export const generateReceiptHTML = (data) => {
     monthlyEquivalent
   } = data;
 
+  // Clean the notes before using them
+  const cleanNotesText = cleanNotes(notes);
+
   const formatCurrency = (amount) => {
     return `Ksh ${parseFloat(amount).toLocaleString('en-US', {
       minimumFractionDigits: 2,
@@ -507,6 +553,7 @@ export const generateReceiptHTML = (data) => {
   };
 
   const formatDate = (date) => {
+    if (!date) return 'N/A';
     return new Date(date).toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'long',
@@ -611,7 +658,7 @@ export const generateReceiptHTML = (data) => {
     Total Amount Received: ${formatCurrency(totalAllocated || amountPaid)}
   </div>
 
-  ${notes ? `<div class="section"><div class="section-title">Notes</div><p>${notes}</p></div>` : ''}
+  ${cleanNotesText ? `<div class="section"><div class="section-title">Notes</div><p>${cleanNotesText}</p></div>` : ''}
 
   <div class="footer">
     <h3>Thank you for your payment!</h3>
