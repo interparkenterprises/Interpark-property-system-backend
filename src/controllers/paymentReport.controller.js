@@ -3869,16 +3869,14 @@ export const regeneratePaymentReceipt = async (req, res) => {
     );
 
     if (receiptResult.error) {
-      // Log the error but don't fail the request if receipt generation fails
+      // Log the error but don't add it to notes
       console.error('Receipt generation error:', receiptResult.error);
       
-      // Update the payment report with a failed status note
+      // Only update the updatedAt timestamp, preserve existing notes without adding error
       await prisma.paymentReport.update({
         where: { id: paymentReport.id },
         data: {
-          notes: paymentReport.notes 
-            ? `${paymentReport.notes} | Receipt generation failed: ${receiptResult.error}`
-            : `Receipt generation failed: ${receiptResult.error}`
+          updatedAt: new Date()
         }
       });
 
