@@ -2170,7 +2170,7 @@ export const updateTenant = async (req, res) => {
   }
 };
 
-// @desc    Delete tenant
+// @desc    Delete tenant (with optimized batch operations)
 // @route   DELETE /api/tenants/:id
 // @access  Private (ADMIN, MANAGER, and USER with DELETE_TENANT permission)
 export const deleteTenant = async (req, res) => {
@@ -2199,36 +2199,116 @@ export const deleteTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    // Store the unit's original rent amount before tenant deletion
-    const originalUnitRent = tenant.unit.rentAmount;
+    // Store the unit's current rent amount (which is the tenant's rent)
+    // This will be preserved when the tenant leaves
+    const unitRentAmount = tenant.unit.rentAmount;
 
-    // Delete service charge if exists
-    if (tenant.serviceCharge) {
-      await prisma.serviceCharge.delete({
-        where: { tenantId: tenant.id }
-      });
-    }
+    // Use parallel promises for better performance
+    const updatePromises = [];
 
-    // Update unit status to vacant and restore original rent amount
-    await prisma.unit.update({
-      where: { id: tenant.unitId },
-      data: { 
-        status: 'VACANT',
-        rentAmount: originalUnitRent
+    // Update invoices
+    updatePromises.push(
+      prisma.invoice.updateMany({
+        where: { tenantId: tenant.id },
+        data: { 
+          status: 'CANCELLED',
+          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
+        }
+      })
+    );
+
+    // Update bill invoices
+    updatePromises.push(
+      prisma.billInvoice.updateMany({
+        where: { tenantId: tenant.id },
+        data: { 
+          status: 'CANCELLED',
+          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
+        }
+      })
+    );
+
+    // Update bills
+    updatePromises.push(
+      prisma.bill.updateMany({
+        where: { tenantId: tenant.id },
+        data: { 
+          status: 'CANCELLED',
+          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
+        }
+      })
+    );
+
+    // Update payment reports
+    updatePromises.push(
+      prisma.paymentReport.updateMany({
+        where: { tenantId: tenant.id },
+        data: {
+          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
+        }
+      })
+    );
+
+    // Update demand letters
+    updatePromises.push(
+      prisma.demandLetter.updateMany({
+        where: { tenantId: tenant.id },
+        data: { 
+          status: 'ESCALATED',
+          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
+        }
+      })
+    );
+
+    // Run all updates in parallel (outside transaction)
+    await Promise.all(updatePromises);
+
+    // Now do the critical operations in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // Delete service charge
+      if (tenant.serviceCharge) {
+        await tx.serviceCharge.delete({
+          where: { tenantId: tenant.id }
+        });
       }
+
+      // Update unit - KEEP THE RENT AMOUNT (don't reset to 0)
+      // The rent amount stays as the tenant was paying, since the next tenant
+      // will likely pay the same amount
+      await tx.unit.update({
+        where: { id: tenant.unitId },
+        data: { 
+          status: 'VACANT'
+          // rentAmount: unitRentAmount - KEEP THE SAME VALUE
+        }
+      });
+
+      // Delete tenant
+      await tx.tenant.delete({
+        where: { id: req.params.id }
+      });
+
+      return {
+        tenantId: tenant.id,
+        tenantName: tenant.fullName,
+        unitId: tenant.unitId,
+        preservedRentAmount: unitRentAmount,
+        message: `Unit rent amount of ${unitRentAmount} preserved for the next tenant.`
+      };
+    }, {
+      timeout: 10000
     });
 
-    await prisma.tenant.delete({
-      where: { id: req.params.id }
+    res.json({ 
+      message: 'Tenant deleted successfully. All related records have been archived.',
+      details: result
     });
-
-    res.json({ message: 'Tenant deleted successfully' });
+    
   } catch (error) {
     console.error('Delete tenant error:', error);
     res.status(400).json({ message: error.message });
   }
 };
-
 // @desc    Update tenant service charge
 // @route   PATCH /api/tenants/:id/service-charge
 // @access  Private (ADMIN, MANAGER, and USER with EDIT_TENANT permission)
