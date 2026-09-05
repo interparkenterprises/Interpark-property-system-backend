@@ -105,7 +105,7 @@ const checkUserWriteAccess = async (userId, userRole, tenantId = null, operation
   return false;
 };
 
-// @desc    Get all tenants
+// @desc    Get all tenants (active tenants only - excludes LEFT tenants)
 // @route   GET /api/tenants
 // @access  Private
 export const getTenants = async (req, res) => {
@@ -113,10 +113,21 @@ export const getTenants = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
+    // Optional: Add query param to include left tenants
+    const { includeLeft } = req.query;
+    const showLeftTenants = includeLeft === 'true';
+
     let tenants;
+
+    // Base where clause to exclude LEFT tenants by default
+    let baseWhere = {};
+    if (!showLeftTenants) {
+      baseWhere.status = 'ACTIVE';
+    }
 
     if (userRole === 'ADMIN') {
       tenants = await prisma.tenant.findMany({
+        where: baseWhere,
         include: {
           unit: {
             include: {
@@ -132,6 +143,7 @@ export const getTenants = async (req, res) => {
     } else if (userRole === 'MANAGER') {
       tenants = await prisma.tenant.findMany({
         where: {
+          ...baseWhere,
           unit: {
             property: {
               managerId: userId
@@ -173,6 +185,7 @@ export const getTenants = async (req, res) => {
       
       tenants = await prisma.tenant.findMany({
         where: {
+          ...baseWhere,
           unit: {
             property: {
               id: { in: propertiesWithPermission }
@@ -236,7 +249,34 @@ export const getTenants = async (req, res) => {
       };
     });
 
-    res.json(enhancedTenants);
+    // Add metadata about the query
+    const response = {
+      tenants: enhancedTenants,
+      metadata: {
+        totalCount: enhancedTenants.length,
+        showLeftTenants: showLeftTenants,
+        filter: showLeftTenants ? 'all tenants' : 'active tenants only'
+      }
+    };
+
+    // If showLeftTenants is true, also include a count of left tenants
+    if (showLeftTenants) {
+      const leftTenantsCount = await prisma.tenant.count({
+        where: {
+          status: 'LEFT',
+          ...(userRole !== 'ADMIN' ? {
+            unit: {
+              property: {
+                ...(userRole === 'MANAGER' ? { managerId: userId } : {})
+              }
+            }
+          } : {})
+        }
+      });
+      response.metadata.leftTenantsCount = leftTenantsCount;
+    }
+
+    res.json(response);
   } catch (error) {
     console.error('Get tenants error:', error);
     res.status(400).json({ message: error.message });
@@ -276,7 +316,12 @@ export const getTenant = async (req, res) => {
         },
         paymentReports: { orderBy: { datePaid: 'desc' } },
         serviceCharge: true,
-        incomes: true
+        incomes: true,
+        invoices: { orderBy: { createdAt: 'desc' } },
+        billInvoices: { orderBy: { createdAt: 'desc' } },
+        bills: { orderBy: { createdAt: 'desc' } },
+        demandLetters: { orderBy: { createdAt: 'desc' } },
+        attachments: { orderBy: { uploadedAt: 'desc' } }
       }
     });
 
@@ -292,7 +337,8 @@ export const getTenant = async (req, res) => {
     // Calculate payment summary with due dates
     const paymentSummary = getPaymentSummary(fullTenant);
 
-    res.json({
+    // Add status information
+    const response = {
       ...fullTenant,
       rentInfo: {
         ...rentInfo,
@@ -300,8 +346,20 @@ export const getTenant = async (req, res) => {
         paymentBreakdown: paymentBreakdown
       },
       rentSchedule,
-      paymentSummary
-    });
+      paymentSummary,
+      statusInfo: {
+        currentStatus: fullTenant.status,
+        isActive: fullTenant.status === 'ACTIVE',
+        leftDate: fullTenant.status === 'LEFT' ? fullTenant.updatedAt : null
+      }
+    };
+
+    // If tenant has left, show a warning
+    if (fullTenant.status === 'LEFT') {
+      response.warning = 'This tenant has left the property. All records are preserved for historical purposes.';
+    }
+
+    res.json(response);
   } catch (error) {
     console.error('Get tenant error:', error);
     res.status(400).json({ message: error.message });
@@ -2170,7 +2228,7 @@ export const updateTenant = async (req, res) => {
   }
 };
 
-// @desc    Delete tenant (with optimized batch operations)
+// @desc    Delete tenant (Soft Delete - marks as LEFT, preserves all history)
 // @route   DELETE /api/tenants/:id
 // @access  Private (ADMIN, MANAGER, and USER with DELETE_TENANT permission)
 export const deleteTenant = async (req, res) => {
@@ -2187,11 +2245,19 @@ export const deleteTenant = async (req, res) => {
       });
     }
 
+    // Fetch tenant with all related data
     const tenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: { 
         unit: true,
-        serviceCharge: true
+        serviceCharge: true,
+        paymentReports: true,
+        invoices: true,
+        billInvoices: true,
+        bills: true,
+        demandLetters: true,
+        attachments: true,
+        incomes: true
       }
     });
 
@@ -2199,114 +2265,153 @@ export const deleteTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    // Store the unit's current rent amount (which is the tenant's rent)
-    // This will be preserved when the tenant leaves
-    const unitRentAmount = tenant.unit.rentAmount;
-
-    // Use parallel promises for better performance
-    const updatePromises = [];
-
-    // Update invoices
-    updatePromises.push(
-      prisma.invoice.updateMany({
-        where: { tenantId: tenant.id },
-        data: { 
-          status: 'CANCELLED',
-          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
+    // Check if tenant is already inactive
+    if (tenant.status === 'LEFT') {
+      return res.status(400).json({ 
+        message: 'Tenant has already been marked as left.',
+        tenant: {
+          id: tenant.id,
+          name: tenant.fullName,
+          leftDate: tenant.updatedAt
         }
-      })
-    );
+      });
+    }
 
-    // Update bill invoices
-    updatePromises.push(
-      prisma.billInvoice.updateMany({
-        where: { tenantId: tenant.id },
-        data: { 
-          status: 'CANCELLED',
-          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
-        }
-      })
-    );
+    // Store tenant info for response
+    const tenantInfo = {
+      id: tenant.id,
+      name: tenant.fullName,
+      email: tenant.email,
+      unitId: tenant.unitId,
+      rentAmount: tenant.rent
+    };
 
-    // Update bills
-    updatePromises.push(
-      prisma.bill.updateMany({
-        where: { tenantId: tenant.id },
-        data: { 
-          status: 'CANCELLED',
-          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
-        }
-      })
-    );
-
-    // Update payment reports
-    updatePromises.push(
-      prisma.paymentReport.updateMany({
-        where: { tenantId: tenant.id },
-        data: {
-          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
-        }
-      })
-    );
-
-    // Update demand letters
-    updatePromises.push(
-      prisma.demandLetter.updateMany({
-        where: { tenantId: tenant.id },
-        data: { 
-          status: 'ESCALATED',
-          notes: `Tenant left on ${new Date().toISOString().split('T')[0]}`
-        }
-      })
-    );
-
-    // Run all updates in parallel (outside transaction)
-    await Promise.all(updatePromises);
-
-    // Now do the critical operations in a transaction
+    // Use transaction for data consistency
     const result = await prisma.$transaction(async (tx) => {
-      // Delete service charge
+      // 1. SOFT DELETE: Mark tenant as LEFT (NOT actually deleting)
+      const updatedTenant = await tx.tenant.update({
+        where: { id: tenant.id },
+        data: {
+          status: 'LEFT'
+        }
+      });
+
+      // 2. Delete service charge if exists
       if (tenant.serviceCharge) {
         await tx.serviceCharge.delete({
           where: { tenantId: tenant.id }
         });
       }
 
-      // Update unit - KEEP THE RENT AMOUNT (don't reset to 0)
-      // The rent amount stays as the tenant was paying, since the next tenant
-      // will likely pay the same amount
+      // 3. Update unit to VACANT (keep the rent amount for next tenant)
       await tx.unit.update({
         where: { id: tenant.unitId },
         data: { 
           status: 'VACANT'
-          // rentAmount: unitRentAmount - KEEP THE SAME VALUE
+          // rentAmount: tenant.rent // KEEP the rent amount
         }
       });
 
-      // Delete tenant
-      await tx.tenant.delete({
-        where: { id: req.params.id }
-      });
+      // 4. Update any outstanding invoices to show tenant left
+      if (tenant.invoices && tenant.invoices.length > 0) {
+        await tx.invoice.updateMany({
+          where: { 
+            tenantId: tenant.id,
+            status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+          },
+          data: {
+            status: 'OVERDUE',
+            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+          }
+        });
+      }
+
+      // 5. Update bill invoices
+      if (tenant.billInvoices && tenant.billInvoices.length > 0) {
+        await tx.billInvoice.updateMany({
+          where: { 
+            tenantId: tenant.id,
+            status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+          },
+          data: {
+            status: 'OVERDUE',
+            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+          }
+        });
+      }
+
+      // 6. Update bills
+      if (tenant.bills && tenant.bills.length > 0) {
+        await tx.bill.updateMany({
+          where: { 
+            tenantId: tenant.id,
+            status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+          },
+          data: {
+            status: 'OVERDUE',
+            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+          }
+        });
+      }
+
+      // 7. Update payment reports with notes
+      if (tenant.paymentReports && tenant.paymentReports.length > 0) {
+        await tx.paymentReport.updateMany({
+          where: { tenantId: tenant.id },
+          data: {
+            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+          }
+        });
+      }
+
+      // 8. Update demand letters
+      if (tenant.demandLetters && tenant.demandLetters.length > 0) {
+        await tx.demandLetter.updateMany({
+          where: { tenantId: tenant.id },
+          data: { 
+            status: 'ESCALATED',
+            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+          }
+        });
+      }
 
       return {
-        tenantId: tenant.id,
-        tenantName: tenant.fullName,
-        unitId: tenant.unitId,
-        preservedRentAmount: unitRentAmount,
-        message: `Unit rent amount of ${unitRentAmount} preserved for the next tenant.`
+        tenant: updatedTenant,
+        preservedRecords: {
+          paymentReports: tenant.paymentReports?.length || 0,
+          invoices: tenant.invoices?.length || 0,
+          billInvoices: tenant.billInvoices?.length || 0,
+          bills: tenant.bills?.length || 0,
+          demandLetters: tenant.demandLetters?.length || 0,
+          attachments: tenant.attachments?.length || 0,
+          incomes: tenant.incomes?.length || 0
+        }
       };
     }, {
-      timeout: 10000
+      timeout: 15000
     });
 
     res.json({ 
-      message: 'Tenant deleted successfully. All related records have been archived.',
-      details: result
+      success: true,
+      message: `Tenant '${tenantInfo.name}' marked as left property successfully. All historical records preserved.`,
+      data: {
+        tenantId: tenantInfo.id,
+        tenantName: tenantInfo.name,
+        unitId: tenantInfo.unitId,
+        status: 'LEFT',
+        leftDate: new Date().toISOString(),
+        preservedRentAmount: tenantInfo.rentAmount,
+        preservedRecords: result.preservedRecords,
+        note: 'All payment history, invoices, bills, and other records have been preserved.'
+      }
     });
     
   } catch (error) {
     console.error('Delete tenant error:', error);
-    res.status(400).json({ message: error.message });
+    res.status(400).json({ 
+      message: error.message,
+      error: error.message 
+    });
   }
 };
 // @desc    Update tenant service charge
@@ -2950,5 +3055,230 @@ export const downloadAttachment = async (req, res) => {
       message: 'Failed to download attachment',
       error: error.message
     });
+  }
+};
+
+// @desc    Restore a tenant (reactivate)
+// @route   PATCH /api/tenants/:id/restore
+// @access  Private (ADMIN only)
+export const restoreTenant = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Only admins can restore tenants
+    if (userRole !== 'ADMIN') {
+      return res.status(403).json({ 
+        message: 'Access denied. Only admins can restore tenants.'
+      });
+    }
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: req.params.id }
+    });
+
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
+    }
+
+    if (tenant.status === 'ACTIVE') {
+      return res.status(400).json({ message: 'Tenant is already active.' });
+    }
+
+    const restoredTenant = await prisma.tenant.update({
+      where: { id: req.params.id },
+      data: { status: 'ACTIVE' }
+    });
+
+    // Also update the unit status if needed
+    await prisma.unit.update({
+      where: { id: tenant.unitId },
+      data: { status: 'OCCUPIED' }
+    });
+
+    res.json({
+      message: 'Tenant restored successfully',
+      tenant: restoredTenant
+    });
+  } catch (error) {
+    console.error('Restore tenant error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Get all tenants who have left (departed tenants)
+// @route   GET /api/tenants/left
+// @access  Private (ADMIN, MANAGER)
+export const getLeftTenants = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Only admins and managers can view departed tenants
+    if (userRole === 'USER') {
+      return res.status(403).json({ 
+        message: 'Access denied. Users cannot view departed tenants.'
+      });
+    }
+
+    let tenants;
+
+    if (userRole === 'ADMIN') {
+      tenants = await prisma.tenant.findMany({
+        where: {
+          status: 'LEFT'
+        },
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          },
+          paymentReports: {
+            orderBy: { datePaid: 'desc' },
+            take: 5
+          },
+          invoices: {
+            where: {
+              status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+            }
+          },
+          serviceCharge: true,
+          incomes: true
+        },
+        orderBy: { updatedAt: 'desc' }
+      });
+    } else if (userRole === 'MANAGER') {
+      tenants = await prisma.tenant.findMany({
+        where: {
+          status: 'LEFT',
+          unit: {
+            property: {
+              managerId: userId
+            }
+          }
+        },
+        include: {
+          unit: {
+            include: {
+              property: true
+            }
+          },
+          paymentReports: {
+            orderBy: { datePaid: 'desc' },
+            take: 5
+          },
+          invoices: {
+            where: {
+              status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+            }
+          },
+          serviceCharge: true,
+          incomes: true
+        },
+        orderBy: { updatedAt: 'desc' }
+      });
+    }
+
+    // Calculate summary statistics for departed tenants
+    const summary = {
+      totalDeparted: tenants.length,
+      withOutstandingBalance: tenants.filter(t => {
+        const totalInvoices = t.invoices?.reduce((sum, inv) => sum + (inv.totalDue - inv.amountPaid), 0) || 0;
+        return totalInvoices > 0;
+      }).length,
+      totalOutstanding: tenants.reduce((sum, t) => {
+        const totalInvoices = t.invoices?.reduce((s, inv) => s + (inv.totalDue - inv.amountPaid), 0) || 0;
+        return sum + totalInvoices;
+      }, 0)
+    };
+
+    res.json({
+      success: true,
+      summary,
+      tenants: tenants
+    });
+  } catch (error) {
+    console.error('Get left tenants error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Get tenant statistics by status
+// @route   GET /api/tenants/stats
+// @access  Private
+export const getTenantStats = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let whereClause = {};
+
+    if (userRole === 'MANAGER') {
+      whereClause = {
+        unit: {
+          property: {
+            managerId: userId
+          }
+        }
+      };
+    } else if (userRole === 'USER') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      if (accessiblePropertyIds.length === 0) {
+        return res.json({
+          active: 0,
+          left: 0,
+          total: 0
+        });
+      }
+      
+      const propertiesWithPermission = [];
+      for (const propertyId of accessiblePropertyIds) {
+        const hasViewPermission = await checkTenantPermission(userId, userRole, propertyId, 'view');
+        if (hasViewPermission) {
+          propertiesWithPermission.push(propertyId);
+        }
+      }
+      
+      if (propertiesWithPermission.length === 0) {
+        return res.json({
+          active: 0,
+          left: 0,
+          total: 0
+        });
+      }
+      
+      whereClause = {
+        unit: {
+          property: {
+            id: { in: propertiesWithPermission }
+          }
+        }
+      };
+    }
+
+    const [activeCount, leftCount] = await Promise.all([
+      prisma.tenant.count({
+        where: {
+          ...whereClause,
+          status: 'ACTIVE'
+        }
+      }),
+      prisma.tenant.count({
+        where: {
+          ...whereClause,
+          status: 'LEFT'
+        }
+      })
+    ]);
+
+    res.json({
+      active: activeCount,
+      left: leftCount,
+      total: activeCount + leftCount
+    });
+  } catch (error) {
+    console.error('Get tenant stats error:', error);
+    res.status(400).json({ message: error.message });
   }
 };

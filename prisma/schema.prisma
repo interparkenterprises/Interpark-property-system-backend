@@ -409,11 +409,17 @@ model Tenant {
   vatRate             Float?               @default(0)
   vatType             VATType              @default(NOT_APPLICABLE)
   email               String?              @unique
+  
+  // ========== NEW FIELD ==========
+  status              TenantStatus         @default(ACTIVE) // ACTIVE or LEFT
+  // ==============================
+  
   // ========== WITHHOLDING TAX FIELDS ==========
-  withholdingTaxRate     Float?   @default(0)  // Percentage (e.g., 5 for 5%)
-  withholdingVatRate     Float?   @default(0)  // Percentage (e.g., 2 for 2%)
-  isWithholdingTaxExempt Boolean  @default(false) // Exempt from withholding tax
+  withholdingTaxRate     Float?   @default(0)
+  withholdingVatRate     Float?   @default(0)
+  isWithholdingTaxExempt Boolean  @default(false)
   // ============================================
+  
   bills               Bill[]
   billInvoices        BillInvoice[]
   demandLetters       DemandLetter[]
@@ -1099,6 +1105,10 @@ enum UnitType {
 enum UnitStatus {
   VACANT
   OCCUPIED
+}
+enum TenantStatus {
+  ACTIVE
+  LEFT
 }
 
 enum RentType {
