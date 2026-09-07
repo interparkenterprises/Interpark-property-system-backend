@@ -366,7 +366,7 @@ export const getTenant = async (req, res) => {
   }
 };
 
-// @desc    Get tenants by property ID
+// @desc    Get tenants by property ID (active tenants only by default)
 // @route   GET /api/tenants/property/:propertyId
 // @access  Private
 export const getTenantsByProperty = async (req, res) => {
@@ -374,6 +374,7 @@ export const getTenantsByProperty = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
     const { propertyId } = req.params;
+    const { includeLeft } = req.query; // Add query param to include left tenants
 
     // Check if user has access to this property
     let hasAccess = false;
@@ -397,13 +398,21 @@ export const getTenantsByProperty = async (req, res) => {
       });
     }
 
+    // Build where clause - only active tenants by default
+    const whereClause = {
+      unit: {
+        propertyId: propertyId
+      }
+    };
+    
+    // Only filter by status if includeLeft is not explicitly true
+    if (includeLeft !== 'true') {
+      whereClause.status = 'ACTIVE';
+    }
+
     // Fetch tenants for this property
     const tenants = await prisma.tenant.findMany({
-      where: {
-        unit: {
-          propertyId: propertyId
-        }
-      },
+      where: whereClause,
       include: {
         unit: {
           include: {
@@ -464,7 +473,30 @@ export const getTenantsByProperty = async (req, res) => {
       };
     });
 
-    res.json(enhancedTenants);
+    // Add metadata about the query
+    const response = {
+      tenants: enhancedTenants,
+      metadata: {
+        totalCount: enhancedTenants.length,
+        showLeftTenants: includeLeft === 'true',
+        filter: includeLeft === 'true' ? 'all tenants' : 'active tenants only'
+      }
+    };
+
+    // If includeLeft is true, also include a count of left tenants for this property
+    if (includeLeft === 'true') {
+      const leftTenantsCount = await prisma.tenant.count({
+        where: {
+          status: 'LEFT',
+          unit: {
+            propertyId: propertyId
+          }
+        }
+      });
+      response.metadata.leftTenantsCount = leftTenantsCount;
+    }
+
+    res.json(response);
   } catch (error) {
     console.error('Get tenants by property error:', error);
     res.status(400).json({ message: error.message });
@@ -935,12 +967,16 @@ export const getNextPaymentsByProperty = async (req, res) => {
             });
         }
 
-        // Fetch ALL tenants for the property with their related data
+        // =============================================
+        // FIXED: Fetch ONLY ACTIVE tenants for the property
+        // Exclude tenants with status 'LEFT'
+        // =============================================
         const tenants = await prisma.tenant.findMany({
             where: {
                 unit: {
                     propertyId: propertyId
-                }
+                },
+                status: 'ACTIVE' // Only get active tenants
             },
             include: {
                 unit: {
