@@ -1,22 +1,16 @@
 import prisma from "../lib/prisma.js";
-import PDFDocument from 'pdfkit';
+import { buildBillInvoiceHtml, buildBillInvoiceFooterTemplate } from '../services/pdf/billInvoicePdf.js';
+import { generatePDF } from '../utils/pdfGenerator.js';
 import { uploadToStorage } from '../utils/storage.js';
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import sizeOf from 'image-size';
 import permissionService from "../services/permissionService.js";
-
-// Create __dirname equivalent for ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // ======================================================
 // PERMISSION HELPER FUNCTIONS
 // ======================================================
 
-// Helper function to check if user has access to a property with specific permission
 const checkPropertyAccess = async (userId, userRole, propertyId, requiredPermission = 'canView') => {
   if (userRole === 'ADMIN') {
     return true;
@@ -36,7 +30,6 @@ const checkPropertyAccess = async (userId, userRole, propertyId, requiredPermiss
   return false;
 };
 
-// Helper function to check bill invoice permission for a property
 const checkBillInvoicePermission = async (userId, userRole, propertyId, operation) => {
   if (userRole === 'ADMIN') {
     return true;
@@ -50,20 +43,17 @@ const checkBillInvoicePermission = async (userId, userRole, propertyId, operatio
   }
   
   if (userRole === 'USER') {
-    // Use the centralized permission service
     return await permissionService.checkPermission(userId, 'billInvoice', operation, propertyId);
   }
   
   return false;
 };
 
-// Helper function to check if user has write access to a specific bill invoice
 const checkBillInvoiceWriteAccess = async (userId, userRole, billInvoiceId, operation = 'edit') => {
   if (userRole === 'ADMIN') {
     return true;
   }
   
-  // Get property ID from bill invoice
   const billInvoice = await prisma.billInvoice.findUnique({
     where: { id: billInvoiceId },
     include: {
@@ -98,7 +88,6 @@ const checkBillInvoiceWriteAccess = async (userId, userRole, billInvoiceId, oper
   return false;
 };
 
-// Helper function to get accessible property IDs for filtering
 const getAccessiblePropertyIds = async (userId, userRole) => {
   if (userRole === 'ADMIN') {
     const allProperties = await prisma.property.findMany({ select: { id: true } });
@@ -133,7 +122,6 @@ export const generateBillInvoice = async (req, res) => {
     const userRole = req.user.role;
     const { billId, dueDate, notes } = req.body;
 
-    // Validate required fields
     if (!billId || !dueDate) {
       return res.status(400).json({ 
         success: false, 
@@ -141,7 +129,6 @@ export const generateBillInvoice = async (req, res) => {
       });
     }
 
-    // Fetch bill with tenant and property details
     const bill = await prisma.bill.findUnique({
       where: { id: billId },
       include: {
@@ -166,7 +153,6 @@ export const generateBillInvoice = async (req, res) => {
 
     const propertyId = bill.tenant?.unit?.propertyId;
     
-    // Check CREATE_BILL_INVOICE permission
     const hasCreatePermission = await checkBillInvoicePermission(userId, userRole, propertyId, 'create');
     
     if (!hasCreatePermission) {
@@ -178,7 +164,6 @@ export const generateBillInvoice = async (req, res) => {
       });
     }
 
-    // Calculate current remaining balance
     const remainingBalance = bill.grandTotal - bill.amountPaid;
     
     if (remainingBalance <= 0) {
@@ -188,13 +173,9 @@ export const generateBillInvoice = async (req, res) => {
       });
     }
 
-    // Generate unique invoice number
     const invoiceNumber = await generateBillInvoiceNumber();
-
-    // Generate bill reference number
     const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
 
-    // Determine status based on remaining balance
     let status = 'UNPAID';
     const now = new Date();
     const due = new Date(dueDate);
@@ -241,13 +222,17 @@ export const generateBillInvoice = async (req, res) => {
       }
     });
 
-    // Generate PDF
-    const pdfBuffer = await generateBillInvoicePDF(billInvoice, bill.description);
-    
-    // Upload PDF to storage
+    // Generate PDF -- uses `billInvoice`, the record just created above,
+    // which already has the tenant/unit/property/bill include it needs.
+    const pdfBuffer = await generatePDF(buildBillInvoiceHtml(billInvoice), {
+      displayHeaderFooter: true,
+      headerTemplate: '<div></div>',
+      footerTemplate: buildBillInvoiceFooterTemplate(),
+      margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+    });
+
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
 
-    // Update invoice with PDF URL
     const updatedInvoice = await prisma.billInvoice.update({
       where: { id: billInvoice.id },
       data: { pdfUrl }
@@ -279,12 +264,9 @@ export const getAllBillInvoices = async (req, res) => {
     if (tenantId) whereClause.tenantId = tenantId;
     if (billType) whereClause.billType = billType;
 
-    // Apply role-based filtering
     if (userRole === 'ADMIN') {
-      // Admin sees all bill invoices
-      // No additional where clause needed
+      // no additional filter
     } else if (userRole === 'MANAGER') {
-      // Manager sees bill invoices for their properties
       whereClause = {
         ...whereClause,
         tenant: {
@@ -296,7 +278,6 @@ export const getAllBillInvoices = async (req, res) => {
         }
       };
     } else if (userRole === 'USER') {
-      // USER sees bill invoices for accessible properties with VIEW_BILL_INVOICES permission
       const accessiblePropertyIds = await getAccessiblePropertyIds(userId, userRole);
       
       if (accessiblePropertyIds.length === 0) {
@@ -312,7 +293,6 @@ export const getAllBillInvoices = async (req, res) => {
         });
       }
       
-      // Filter properties where user has VIEW_BILL_INVOICES permission
       const propertiesWithPermission = [];
       for (const propertyId of accessiblePropertyIds) {
         const hasViewPermission = await checkBillInvoicePermission(userId, userRole, propertyId, 'view');
@@ -410,7 +390,6 @@ export const getBillInvoicesByTenant = async (req, res) => {
     const { page = 1, limit = 10, status, billType } = req.query;
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
-    // Get tenant to check property access
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
       include: {
@@ -431,7 +410,6 @@ export const getBillInvoicesByTenant = async (req, res) => {
     
     const propertyId = tenant.unit?.propertyId;
     
-    // Check VIEW_BILL_INVOICES permission
     const hasViewPermission = await checkBillInvoicePermission(userId, userRole, propertyId, 'view');
     
     if (!hasViewPermission) {
@@ -524,7 +502,6 @@ export const getBillInvoiceById = async (req, res) => {
 
     const propertyId = billInvoice.tenant?.unit?.propertyId;
     
-    // Check VIEW_BILL_INVOICES permission
     const hasViewPermission = await checkBillInvoicePermission(userId, userRole, propertyId, 'view');
     
     if (!hasViewPermission) {
@@ -560,7 +537,6 @@ export const updateBillInvoicePayment = async (req, res) => {
       });
     }
 
-    // Check EDIT_BILL_INVOICE_PAYMENT permission
     const hasEditPermission = await checkBillInvoiceWriteAccess(userId, userRole, id, 'edit');
     
     if (!hasEditPermission) {
@@ -593,13 +569,11 @@ export const updateBillInvoicePayment = async (req, res) => {
       newStatus = 'PARTIAL';
     }
 
-    // Check if overdue
     const now = new Date();
     if (now > billInvoice.dueDate && newStatus !== 'PAID') {
       newStatus = 'OVERDUE';
     }
 
-    // Prevent over-payment
     const totalPaid = Math.min(newAmountPaid, billInvoice.grandTotal);
     const finalBalance = Math.max(0, billInvoice.grandTotal - totalPaid);
 
@@ -625,7 +599,6 @@ export const updateBillInvoicePayment = async (req, res) => {
       }
     });
 
-    // Also update the original bill
     await prisma.bill.update({
       where: { id: billInvoice.billId },
       data: {
@@ -656,7 +629,6 @@ export const recordBillInvoicePayment = async (req, res) => {
     const { id } = req.params;
     const { amountPaid, paymentDate, notes } = req.body;
 
-    // Validate input
     if (!amountPaid || amountPaid <= 0) {
       return res.status(400).json({
         success: false,
@@ -671,7 +643,6 @@ export const recordBillInvoicePayment = async (req, res) => {
       });
     }
 
-    // Check EDIT_BILL_INVOICE_PAYMENT permission
     const hasEditPermission = await checkBillInvoiceWriteAccess(userId, userRole, id, 'edit');
     
     if (!hasEditPermission) {
@@ -691,7 +662,6 @@ export const recordBillInvoicePayment = async (req, res) => {
       });
     }
 
-    // Fetch invoice with bill details
     const billInvoice = await prisma.billInvoice.findUnique({
       where: { id },
       include: { 
@@ -715,13 +685,11 @@ export const recordBillInvoicePayment = async (req, res) => {
       });
     }
 
-    // Calculate new cumulative payment & balance for THIS invoice
     const newAmountPaid = billInvoice.amountPaid + amountPaid;
     const invoiceGrandTotal = Number(billInvoice.grandTotal);
     const finalAmountPaid = Math.min(newAmountPaid, invoiceGrandTotal);
     const newBalance = Math.max(0, invoiceGrandTotal - finalAmountPaid);
 
-    // Determine new status for THIS invoice
     let newInvoiceStatus = billInvoice.status;
     if (finalAmountPaid >= invoiceGrandTotal) {
       newInvoiceStatus = 'PAID';
@@ -734,9 +702,7 @@ export const recordBillInvoicePayment = async (req, res) => {
       newInvoiceStatus = 'OVERDUE';
     }
 
-    // Start transaction: update invoice + update bill
     const [updatedInvoice, updatedBill] = await prisma.$transaction(async (tx) => {
-      // 1. Update this invoice with cumulative payment information
       const paymentNote = notes 
         ? `${notes} - Payment of Ksh ${amountPaid.toLocaleString()} recorded on ${parsedPaymentDate.toLocaleDateString()}`
         : `Payment of Ksh ${amountPaid.toLocaleString()} recorded on ${parsedPaymentDate.toLocaleDateString()}`;
@@ -754,17 +720,14 @@ export const recordBillInvoicePayment = async (req, res) => {
         },
         include: {
           tenant: {
-            select: {
-              fullName: true,
-              unit: {
-                select: { unitNo: true, property: { select: { name: true } } }
-              }
+            include: {
+              unit: { include: { property: true } }
             }
-          }
+          },
+          bill: true
         }
       });
 
-      // 2. Update original bill for consistency
       const billNewAmountPaid = billInvoice.bill.amountPaid + amountPaid;
       const billGrandTotal = Number(billInvoice.bill.grandTotal);
       const billFinalAmountPaid = Math.min(billNewAmountPaid, billGrandTotal);
@@ -792,12 +755,19 @@ export const recordBillInvoicePayment = async (req, res) => {
       return [updatedInvoice, updatedBill];
     });
 
-    // 3. Regenerate PDF with updated payment information
+    // Regenerate PDF with updated payment information -- uses `updatedInvoice`
+    // (the POST-payment record), not the stale pre-payment `billInvoice`,
+    // so the regenerated document actually reflects the new balance.
     let pdfUrl = null;
     try {
-      const pdfBuffer = await generateBillInvoicePDF(updatedInvoice, billInvoice.bill.description);
+      const pdfBuffer = await generatePDF(buildBillInvoiceHtml(updatedInvoice), {
+        displayHeaderFooter: true,
+        headerTemplate: '<div></div>',
+        footerTemplate: buildBillInvoiceFooterTemplate(),
+        margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+      });
       pdfUrl = await uploadToStorage(pdfBuffer, `${updatedInvoice.invoiceNumber}.pdf`);
-      
+
       await prisma.billInvoice.update({
         where: { id: updatedInvoice.id },
         data: { pdfUrl }
@@ -860,7 +830,6 @@ export const downloadBillInvoice = async (req, res) => {
 
     const propertyId = billInvoice.tenant?.unit?.propertyId;
     
-    // Check DOWNLOAD_BILL_INVOICE permission
     const hasDownloadPermission = await checkBillInvoicePermission(userId, userRole, propertyId, 'download');
     
     if (!hasDownloadPermission) {
@@ -872,8 +841,13 @@ export const downloadBillInvoice = async (req, res) => {
       });
     }
 
-    // Generate PDF
-    const pdfBuffer = await generateBillInvoicePDF(billInvoice, billInvoice.bill?.description);
+    // Generate PDF -- same generator used for WhatsApp sends
+    const pdfBuffer = await generatePDF(buildBillInvoiceHtml(billInvoice), {
+      displayHeaderFooter: true,
+      headerTemplate: '<div></div>',
+      footerTemplate: buildBillInvoiceFooterTemplate(),
+      margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+    });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${billInvoice.invoiceNumber}.pdf"`);
@@ -898,7 +872,6 @@ export const deleteBillInvoice = async (req, res) => {
       force = false 
     } = req.body;
     
-    // Check DELETE_BILL_INVOICE permission
     const hasDeletePermission = await checkBillInvoiceWriteAccess(userId, userRole, id, 'delete');
     
     if (!hasDeletePermission) {
@@ -910,7 +883,6 @@ export const deleteBillInvoice = async (req, res) => {
       });
     }
     
-    // Find bill invoice with payment report and all linked invoices info
     const billInvoice = await prisma.billInvoice.findUnique({
       where: { id },
       include: {
@@ -971,9 +943,8 @@ export const deleteBillInvoice = async (req, res) => {
       });
     }
     
-    // Check if invoice is within allowed deletion period
     const invoiceAge = Date.now() - new Date(billInvoice.createdAt).getTime();
-    const maxAgeForDeletion = 60 * 24 * 60 * 60 * 1000; // 60 days
+    const maxAgeForDeletion = 60 * 24 * 60 * 60 * 1000;
     
     if (!force && invoiceAge > maxAgeForDeletion) {
       return res.status(400).json({
@@ -1002,7 +973,6 @@ export const deleteBillInvoice = async (req, res) => {
       }
     };
     
-    // Track linked bill invoices info
     let linkedBillInvoices = [];
     if (billInvoice.paymentReport) {
       result.paymentReportInfo = {
@@ -1019,13 +989,10 @@ export const deleteBillInvoice = async (req, res) => {
       linkedBillInvoices = billInvoice.paymentReport.billInvoices;
     }
     
-    // Array to store all delete operations
     const deleteOperations = [];
     const deletedBillInvoiceIds = new Set();
     
-    // Function to delete bill invoice and its PDF
     const deleteBillInvoiceAndPDF = async (invoiceToDelete, isMainInvoice = false) => {
-      // Delete PDF file if exists
       let pdfDeleted = false;
       if (invoiceToDelete.pdfUrl) {
         try {
@@ -1047,7 +1014,6 @@ export const deleteBillInvoice = async (req, res) => {
         }
       }
       
-      // Add to delete operations
       deleteOperations.push(
         prisma.billInvoice.delete({
           where: { id: invoiceToDelete.id }
@@ -1067,7 +1033,6 @@ export const deleteBillInvoice = async (req, res) => {
       return pdfDeleted;
     };
     
-    // Case 1: Delete linked invoices + payment report
     if (deleteLinkedInvoices && deletePaymentReport && billInvoice.paymentReportId) {
       for (const linkedInvoice of linkedBillInvoices) {
         await deleteBillInvoiceAndPDF(linkedInvoice, linkedInvoice.id === id);
@@ -1083,7 +1048,6 @@ export const deleteBillInvoice = async (req, res) => {
       );
       
     } 
-    // Case 2: Delete linked invoices only (keep payment report)
     else if (deleteLinkedInvoices && billInvoice.paymentReportId) {
       for (const linkedInvoice of linkedBillInvoices) {
         await deleteBillInvoiceAndPDF(linkedInvoice, linkedInvoice.id === id);
@@ -1091,7 +1055,6 @@ export const deleteBillInvoice = async (req, res) => {
       result.paymentReportRemains = true;
       
     }
-    // Case 3: Delete payment report only if it has 1 invoice
     else if (deletePaymentReport && billInvoice.paymentReportId) {
       const paymentReport = billInvoice.paymentReport;
       
@@ -1122,17 +1085,14 @@ export const deleteBillInvoice = async (req, res) => {
         });
       }
     }
-    // Case 4: Delete only this bill invoice (default behavior)
     else {
       await deleteBillInvoiceAndPDF(billInvoice, true);
     }
     
-    // Execute all delete operations
     if (deleteOperations.length > 0) {
       await Promise.all(deleteOperations);
     }
     
-    // Update the original bill's amountPaid if this invoice had payments
     if (billInvoice.amountPaid > 0) {
       try {
         const currentBill = await prisma.bill.findUnique({
@@ -1173,7 +1133,6 @@ export const deleteBillInvoice = async (req, res) => {
       }
     }
     
-    // Prepare response message
     let message = 'Bill invoice deleted successfully';
     if (result.linkedBillInvoicesDeleted > 0) {
       message += ` along with ${result.linkedBillInvoicesDeleted} linked bill invoice(s)`;
@@ -1220,586 +1179,6 @@ export const deleteBillInvoice = async (req, res) => {
   }
 };
 
-
-// Helper function to generate Bill Invoice PDF
-export async function generateBillInvoicePDF(billInvoice, billDescription) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ 
-        margin: 40,
-        size: 'A4'
-      });
-      const chunks = [];
-
-      doc.on('data', (chunk) => chunks.push(chunk));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
-
-      /* =====================================================
-         LETTERHEAD IMAGE HANDLING (SAFE & SERVER-READY)
-      ====================================================== */
-
-      const projectRoot = process.cwd();
-      const possiblePaths = [
-        path.join(projectRoot, 'src', 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, '..', 'letterHeads', 'letterhead.png'),
-        path.join(__dirname, '..', 'src', 'letterHeads', 'letterhead.png'),
-        '/root/Interpark-property-system-backend/src/letterHeads/letterhead.png',
-        '/home/ubuntu/Interpark-property-system-backend/src/letterHeads/letterhead.png',
-        '/var/www/Interpark-property-system-backend/src/letterHeads/letterhead.png',
-      ];
-
-      let letterheadPath = null;
-      let imageLoaded = false;
-      const startY = 120;
-
-      for (const possiblePath of possiblePaths) {
-        if (fs.existsSync(possiblePath)) {
-          const stats = fs.statSync(possiblePath);
-          if (stats.size > 0) {
-            letterheadPath = possiblePath;
-            console.log(`✓ Letterhead found: ${possiblePath}`);
-            break;
-          }
-        }
-      }
-
-      if (letterheadPath) {
-        try {
-          const imageBuffer = fs.readFileSync(letterheadPath);
-          const dimensions = sizeOf(imageBuffer);
-
-          // Max usable width (page width minus margins)
-          const maxWidth = doc.page.width - 100;
-
-          // Calculate proportional height
-          const scale = maxWidth / dimensions.width;
-          const scaledHeight = dimensions.height * scale;
-
-          // Optional: cap height if image is extremely tall
-          const finalHeight = Math.min(scaledHeight, 120);
-
-          // Recalculate width if height was capped
-          const finalWidth =
-            finalHeight !== scaledHeight
-              ? (dimensions.width * finalHeight) / dimensions.height
-              : maxWidth;
-
-          const xPosition = 50 + (maxWidth - finalWidth) / 2;
-
-          doc.image(imageBuffer, xPosition, 30, {
-            width: finalWidth,
-          });
-
-          doc.y = 30 + finalHeight + 20;
-          imageLoaded = true;
-
-          console.log('✓ Letterhead rendered with correct proportions');
-        } catch (err) {
-          console.warn('✗ Letterhead failed to load:', err.message);
-        }
-      }
-      // Fallback if no image loaded
-      if (!imageLoaded) {
-        console.warn('Using fallback text header');
-        doc.y = 40;
-        doc.fontSize(18)
-          .fillColor('#2563eb')
-          .font('Helvetica-Bold')
-          .text('INTERPARK ENTERPRISES LIMITED', { 
-            align: 'center'
-          });
-        doc.moveDown(0.5);
-      }
-
-      console.log('=== End Debug Info ===\n');
-      // Safe number formatting functions
-      const safeNum = (val) => {
-        const num = Number(val);
-        return isNaN(num) ? 0 : num;
-      };
-      
-      const safeStr = (val) => safeNum(val).toFixed(2);
-      const formatCurrency = (val) => `Ksh ${safeNum(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-      // Helper function to move down with overflow check (simplified for single page)
-      const moveDownWithCheck = (lines = 1) => {
-        const lineHeight = doc.currentLineHeight();
-        const newY = doc.y + (lineHeight * lines);
-        
-        // Check if we're near the bottom of the page
-        if (newY > doc.page.height - 80) {
-          // Try to compress content instead of adding new page
-          doc.moveDown(lines * 0.7); // Reduce spacing
-          return;
-        }
-        
-        doc.moveDown(lines);
-      };
-
-      // Extract safe values
-      const previousReading = safeNum(billInvoice.previousReading);
-      const currentReading = safeNum(billInvoice.currentReading);
-      const units = safeNum(billInvoice.units);
-      const chargePerUnit = safeNum(billInvoice.chargePerUnit);
-      const totalAmount = safeNum(billInvoice.totalAmount);
-      const vatRate = safeNum(billInvoice.vatRate);
-      const vatAmount = safeNum(billInvoice.vatAmount);
-      const grandTotal = safeNum(billInvoice.grandTotal);
-      const amountPaid = safeNum(billInvoice.amountPaid);
-      const balance = safeNum(billInvoice.balance);
-      const status = billInvoice.status || 'UNPAID';
-      const description = billDescription || null;
-
-      // ===========================================
-      // INVOICE TITLE
-      // ===========================================
-      
-      doc.fontSize(20)
-         .fillColor('#1e293b')
-         .font('Helvetica-Bold')
-         .text('UTILITY BILL INVOICE', { 
-           align: 'center'
-         })
-         .moveDown(0.3);
-      
-      // Property name below the title (bold but smaller)
-      const propertyName = billInvoice.tenant?.unit?.property?.name || 'N/A';
-      doc.fontSize(14)
-         .fillColor('#005478') // Using the blue color from your design
-         .font('Helvetica-Bold')
-         .text(propertyName, { align: 'center' })
-         .font('Helvetica') // Reset to regular font
-         .moveDown(1);
-
-      // ===========================================
-      // DESCRIPTION (if available)
-      // ===========================================
-      
-      if (description) {
-        doc.fillColor('#374151')
-           .fontSize(11)
-           .font('Helvetica-Bold')
-           .text('Description:', { 
-             align: 'center',
-             width: 510
-           })
-           .moveDown(0.2);
-        
-        doc.fillColor('#4b5563')
-           .fontSize(10)
-           .font('Helvetica')
-           .text(description, { 
-             align: 'center',
-             width: 510
-           })
-           .moveDown(0.5);
-      }
-
-      // ===========================================
-      // INVOICE DETAILS & BILLED TO - SIDE BY SIDE
-      // ===========================================
-      
-      const infoTop = doc.y;
-      
-      // Left Column - Invoice Details
-      doc.fontSize(9)
-         .fillColor('#374151')
-         .font('Helvetica-Bold')
-         .text('INVOICE DETAILS:', 40, infoTop, { underline: true });
-      
-      // Adjust Y positions based on whether description was added
-      let invoiceDetailsY = infoTop + 12;
-      const lineHeight = 12;
-      
-      doc.font('Helvetica')
-         .fontSize(8.5)
-         .text(`Invoice No: ${billInvoice.invoiceNumber || 'N/A'}`, 40, invoiceDetailsY);
-      
-      invoiceDetailsY += lineHeight;
-      doc.text(`Issue Date: ${billInvoice.issueDate ? new Date(billInvoice.issueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
-      
-      invoiceDetailsY += lineHeight;
-      doc.text(`Due Date: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
-      
-      // MOVED UP: Bill Ref now immediately follows Due Date (no blank space)
-      invoiceDetailsY += lineHeight;
-      doc.text(`Bill Ref: ${billInvoice.billReferenceNumber || 'N/A'}`, 40, invoiceDetailsY);
-      
-      invoiceDetailsY += lineHeight;
-      doc.text(`Bill Date: ${billInvoice.billReferenceDate ? new Date(billInvoice.billReferenceDate).toLocaleDateString('en-US') : 'N/A'}`, 40, invoiceDetailsY);
-
-      // Right Column - Billed To (with KRA Pin)
-      const billedToTop = infoTop;
-      doc.fontSize(9)
-         .fillColor('#374151')
-         .font('Helvetica-Bold')
-         .text('BILLED TO:', 280, billedToTop, { underline: true });
-      
-      let billedToY = billedToTop + 12;
-      doc.font('Helvetica')
-         .fontSize(8.5)
-         .text(billInvoice.tenant?.fullName || 'N/A', 280, billedToY);
-      
-      billedToY += lineHeight;
-      doc.text(`Contact: ${billInvoice.tenant?.contact || 'N/A'}`, 280, billedToY);
-      
-      billedToY += lineHeight;
-      doc.text(`KRA Pin: ${billInvoice.tenant?.KRAPin || 'N/A'}`, 280, billedToY);
-      
-      billedToY += lineHeight;
-      doc.text(`Unit: ${billInvoice.tenant?.unit?.unitNo || 'N/A'}`, 280, billedToY);
-      
-      // Update Y position to after the invoice details section
-      doc.y = Math.max(invoiceDetailsY + lineHeight, billedToY + lineHeight);
-      
-      moveDownWithCheck(0.3);
-
-      // ===========================================
-      // BILL TYPE & METER READINGS
-      // ===========================================
-      // Reset position to ensure clean centering
-      doc.x = 40; // Set x to left margin
-      
-      // BILL TYPE - Centered
-      doc.fillColor('#2563eb')
-         .fontSize(12)
-         .font('Helvetica-Bold')
-         .text(`BILL TYPE: ${billInvoice.billType || 'N/A'}`, { 
-           align: 'center',
-           width: 510,
-           underline: true 
-         });
-      
-      moveDownWithCheck(0.5);
-
-      // Meter Readings Table - Aligned left
-      const readingsTop = doc.y;
-      
-      doc.fillColor('#1e293b')
-         .fontSize(11)
-         .font('Helvetica-Bold')
-         .text('METER READING DETAILS', 40, readingsTop, { 
-           underline: true 
-         });
-      
-      moveDownWithCheck(0.3);
-
-      // Table headers
-      const tableRowHeight = 18;
-      let currentRowY = doc.y;
-      
-      doc.fillColor('#1e293b')
-         .fontSize(9)
-         .font('Helvetica-Bold')
-         .text('Description', 40, currentRowY)
-         .text('Reading', 250, currentRowY)
-         .text('Unit', 400, currentRowY);
-
-      // Separator line
-      currentRowY += 12;
-      doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
-      
-      // Previous Reading
-      currentRowY += 8;
-      doc.fillColor('#374151')
-         .fontSize(8.5)
-         .font('Helvetica')
-         .text('Previous Reading', 40, currentRowY)
-         .text(safeStr(previousReading), 250, currentRowY)
-         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 400, currentRowY);
-
-      // Current Reading
-      currentRowY += tableRowHeight;
-      doc.fillColor('#374151')
-         .text('Current Reading', 40, currentRowY)
-         .text(safeStr(currentReading), 250, currentRowY)
-         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 400, currentRowY);
-
-      // Separator line
-      currentRowY += 12;
-      doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
-      
-      // Total Units Consumed
-      currentRowY += 8;
-      doc.fillColor('#1e293b')
-         .fontSize(9.5)
-         .font('Helvetica-Bold')
-         .text('Total Units Consumed', 40, currentRowY)
-         .text(safeStr(units), 250, currentRowY)
-         .text(billInvoice.billType === 'ELECTRICITY' ? 'kWh' : 'm³', 400, currentRowY);
-
-      // Update doc.y to continue after the table
-      doc.y = currentRowY + tableRowHeight + 10;
-      moveDownWithCheck(0.5);
-
-      // ===========================================
-      // BILL CALCULATION & CHARGES
-      // ===========================================
-      
-      // BILL CALCULATION - Aligned left
-      doc.fillColor('#1e293b')
-         .fontSize(11)
-         .font('Helvetica-Bold')
-         .text('BILL CALCULATION', 40, doc.y, { 
-           underline: true 
-         });
-      
-      moveDownWithCheck(0.3);
-
-      const chargesTop = doc.y;
-      currentRowY = chargesTop;
-      
-      // Table headers
-      doc.fillColor('#1e293b')
-         .fontSize(9)
-         .font('Helvetica-Bold')
-         .text('Description', 40, currentRowY)
-         .text('Rate/Amount', 300, currentRowY)
-         .text('Amount (Ksh)', 450, currentRowY);
-
-      // Separator line
-      currentRowY += 12;
-      doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
-      
-      currentRowY += 8;
-
-      // Units Charge
-      doc.fillColor('#374151')
-         .fontSize(8.5)
-         .font('Helvetica')
-         .text(`${safeStr(units)} units consumed`, 40, currentRowY)
-         .text(`@ Ksh ${safeStr(chargePerUnit)} per unit`, 300, currentRowY)
-         .text(formatCurrency(totalAmount), 450, currentRowY);
-
-      currentRowY += tableRowHeight;
-
-      // VAT (if applicable)
-      if (vatAmount > 0 && vatRate > 0) {
-        doc.text(`VAT (${safeStr(vatRate)}%)`, 40, currentRowY)
-           .text('', 300, currentRowY)
-           .text(formatCurrency(vatAmount), 450, currentRowY);
-        currentRowY += tableRowHeight;
-      }
-
-      // Separator line before total
-      currentRowY += 5;
-      doc.rect(40, currentRowY, 510, 0.5).fillAndStroke('#cbd5e1', '#cbd5e1');
-      currentRowY += 10;
-
-      // Grand Total
-      doc.fillColor('#1e293b')
-         .fontSize(11)
-         .font('Helvetica-Bold')
-         .text('GRAND TOTAL', 40, currentRowY)
-         .text(formatCurrency(grandTotal), 450, currentRowY);
-
-      currentRowY += tableRowHeight + 8;
-
-      // Amount Paid (if any)
-      if (amountPaid > 0) {
-        doc.fillColor('#10b981')
-           .fontSize(9)
-           .font('Helvetica-Bold')
-           .text('Amount Paid', 40, currentRowY)
-           .text(formatCurrency(amountPaid), 450, currentRowY);
-        currentRowY += tableRowHeight + 5;
-      }
-
-      // Balance Due
-      const balanceColor = balance === 0 ? '#10b981' : 
-                          status === 'OVERDUE' ? '#dc2626' : '#ef4444';
-      
-      doc.fillColor(balanceColor)
-         .fontSize(11)
-         .font('Helvetica-Bold')
-         .text('BALANCE DUE', 40, currentRowY)
-         .text(formatCurrency(balance), 450, currentRowY);
-
-      // Update doc.y to continue after the calculations table
-      doc.y = currentRowY + tableRowHeight + 10;
-      moveDownWithCheck(0.5);
-
-      // ===========================================
-      // PAYMENT INSTRUCTIONS (only for unpaid invoices)
-      // ===========================================
-
-      if (['UNPAID', 'PARTIAL', 'OVERDUE'].includes(status)) {
-        // PAYMENT INSTRUCTIONS - Aligned left
-        doc.fillColor('#1e293b')
-          .fontSize(10)
-          .font('Helvetica-Bold')
-          .text('PAYMENT INSTRUCTIONS', 40, doc.y, { 
-            underline: true 
-          });
-        
-        moveDownWithCheck(0.3);
-
-        // Get property payment details
-        const property = billInvoice.tenant?.unit?.property;
-        
-        // Due date
-        doc.fillColor('#374151')
-          .fontSize(9)
-          .font('Helvetica')
-          .text(`Please pay by: ${billInvoice.dueDate ? new Date(billInvoice.dueDate).toLocaleDateString('en-US') : 'N/A'}`, 40, doc.y);
-        
-        moveDownWithCheck(0.5);
-
-        // Bank Transfer Details (if available)
-        if (property && (property.accountName || property.accountNo || property.bank)) {
-          doc.fillColor('#1e293b')
-            .fontSize(9)
-            .font('Helvetica-Bold')
-            .text('Bank Transfer Details:', 40, doc.y);
-          
-          moveDownWithCheck(0.3);
-          
-          let bankDetailsY = doc.y;
-          
-          if (property.accountName) {
-            doc.fillColor('#374151')
-              .fontSize(8.5)
-              .font('Helvetica')
-              .text(`Account Name: ${property.accountName}`, 40, bankDetailsY);
-            bankDetailsY += 15;
-          }
-          
-          if (property.accountNo) {
-            doc.fillColor('#374151')
-              .fontSize(8.5)
-              .font('Helvetica')
-              .text(`Account Number: ${property.accountNo}`, 40, bankDetailsY);
-            bankDetailsY += 15;
-          }
-          
-          if (property.bank) {
-            doc.fillColor('#374151')
-              .fontSize(8.5)
-              .font('Helvetica')
-              .text(`Bank: ${property.bank}`, 40, bankDetailsY);
-            bankDetailsY += 15;
-          }
-          
-          if (property.branch) {
-            doc.fillColor('#374151')
-              .fontSize(8.5)
-              .font('Helvetica')
-              .text(`Branch: ${property.branch}`, 40, bankDetailsY);
-            bankDetailsY += 15;
-          }
-          
-          if (property.branchCode) {
-            doc.fillColor('#374151')
-              .fontSize(8.5)
-              .font('Helvetica')
-              .text(`Branch Code: ${property.branchCode}`, 40, bankDetailsY);
-            bankDetailsY += 15;
-          }
-          
-          doc.y = bankDetailsY;
-          moveDownWithCheck(0.5);
-        } else {
-          // Default payment methods if no bank details
-          doc.fillColor('#374151')
-            .fontSize(9)
-            .font('Helvetica')
-            .text('Payment Methods: Bank Transfer, Mobile Money, or Cash', 40, doc.y);
-          
-          moveDownWithCheck(0.5);
-        }
-
-        // Contact information
-        doc.fillColor('#374151')
-          .fontSize(9)
-          .font('Helvetica')
-          .text('For assistance, contact property management', 40, doc.y);
-        
-        moveDownWithCheck(0.5);
-      }
-
-      // ===========================================
-      // NOTES SECTION (combined notes and payment policy)
-      // ===========================================
-      
-      // Create combined notes array
-      const notesArray = [];
-      
-      // Add custom notes if available
-      if (billInvoice.notes) {
-        notesArray.push(billInvoice.notes);
-      }
-      
-      // Always add payment policy note for utility bills
-      const paymentPolicyNote = 'This is a monthly utility invoice. Bills are generated monthly based on consumption.';
-      notesArray.push(paymentPolicyNote);
-      
-      // Display combined notes if we have any
-      if (notesArray.length > 0) {
-        // NOTES - Aligned left
-        doc.fillColor('#1e293b')
-           .fontSize(10)
-           .font('Helvetica-Bold')
-           .text('NOTES', 40, doc.y, { 
-             underline: true 
-           });
-        
-        moveDownWithCheck(0.3);
-
-        // Join notes with line breaks
-        const combinedNotes = notesArray.join('\n\n');
-        
-        doc.fillColor('#374151')
-           .fontSize(9)
-           .font('Helvetica')
-           .text(combinedNotes, 40, doc.y, { 
-             width: 510,
-             align: 'left',
-             lineGap: 4
-           });
-        
-        moveDownWithCheck(0.5);
-      }
-
-      // ===========================================
-      // FOOTER
-      // ===========================================
-
-      // Add significant space before footer to make it look like a proper footer
-      // First, check if we're near the bottom of the page
-      if (doc.y < doc.page.height - 100) {
-        // Add more space to push footer to bottom
-        doc.y = doc.page.height - 60; // Position footer 60px from bottom
-      } else {
-        // If we're already near bottom, just add some space
-        moveDownWithCheck(3); // Add 3 lines of space
-      }
-
-      // Footer separator
-      doc.rect(40, doc.y, 510, 0.5).fillAndStroke('#e5e7eb', '#e5e7eb');
-            
-      moveDownWithCheck(0.5);
-
-      // FOOTER - Left aligned
-      doc.fillColor('#6b7280')
-         .fontSize(8)
-         .font('Helvetica')
-         .text('Interpark Enterprises Limited | Tel: 0110 060 088 | Email: info@interparkenterprises.co.ke | Website: www.interparkenterprises.co.ke', 40, doc.y, {
-           align: 'left',
-           width: 510
-         });
-
-      moveDownWithCheck(0.3);
-
-      doc.end();
-    } catch (error) {
-      console.error('PDF Generation Error:', error);
-      reject(error);
-    }
-  });
-}
-
 // @desc    Delete bill invoice PDF only (keep database record)
 // @route   DELETE /api/bill-invoices/:id/pdf
 // @access  Private (Admin only or users with DELETE_BILL_INVOICE permission)
@@ -1809,7 +1188,6 @@ export const deleteBillInvoicePDF = async (req, res) => {
     const userRole = req.user.role;
     const { id } = req.params;
     
-    // Check DELETE_BILL_INVOICE permission
     const hasDeletePermission = await checkBillInvoiceWriteAccess(userId, userRole, id, 'delete');
     
     if (!hasDeletePermission) {
@@ -1839,7 +1217,6 @@ export const deleteBillInvoicePDF = async (req, res) => {
       });
     }
     
-    // Delete PDF file from storage
     const filePath = path.join(
       process.cwd(), 
       'uploads', 
@@ -1856,7 +1233,6 @@ export const deleteBillInvoicePDF = async (req, res) => {
     
     await fs.promises.unlink(filePath);
     
-    // Update bill invoice to remove PDF URL
     await prisma.billInvoice.update({
       where: { id },
       data: { pdfUrl: null }

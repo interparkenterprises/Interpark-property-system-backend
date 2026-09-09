@@ -1,7 +1,4 @@
-import { PrismaClient } from '@prisma/client';
-
-// Use a shared Prisma instance (or inject if using DI)
-const prisma = new PrismaClient();
+import prisma from '../lib/prisma.js';
 
 /**
  * Helper: Get month range for commission period grouping

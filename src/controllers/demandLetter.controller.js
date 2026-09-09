@@ -4,8 +4,7 @@ import { generateDemandLetterPDF } from '../utils/demandLetterTemplate.js';
 import { uploadDocument } from '../utils/uploadHelper.js';
 import { generateFileName } from '../utils/storage.js';
 import permissionService from "../services/permissionService.js";
-import fs from 'fs';
-import path from 'path';
+
 // ======================================================
 // PERMISSION HELPER FUNCTIONS
 // ======================================================
@@ -312,85 +311,26 @@ export const generateDemandLetter = async (req, res) => {
       }
     });
 
-    // Prepare data for PDF generation
-    const pdfData = {
-      // Property Information
-      propertyName: property.name,
-      propertyAddress: property.address,
-      propertyLRNumber: property.lrNumber,
-      
-      // Landlord Information
-      landlordName: landlord.name,
-      landlordPOBox: landlord.address || 'P.O. Box …………….',
-      landlordPhone: landlord.phone || '……………………',
-      landlordEmail: landlord.email || '…………………………',
-      
-      // Tenant Information
-      tenantName: tenant.fullName,
-      tenantPOBox: tenant.POBox || '………………………',
-      tenantContact: tenant.contact,
-      tenantEmail: tenant.email,
-      
-      // Letter Details
-      letterNumber,
-      issueDate: new Date().toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      }),
-      referenceNumber: demandLetter.referenceNumber,
-      
-      // Financial Information
-      outstandingAmount: parseFloat(outstandingAmount).toLocaleString('en-KE', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }),
-      rentalPeriod,
-      rentAmount: tenant.rent.toLocaleString('en-KE', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }),
-      paymentPolicy: formatPaymentPolicy(tenant.paymentPolicy),
-      dueDate: new Date(dueDate).toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      }),
-      demandPeriod,
-      
-      // Unit Information
-      unitNo: unit.unitNo || 'N/A',
-      
-      // Optional fields
-      partialPayment: partialPayment ? parseFloat(partialPayment).toLocaleString('en-KE', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }) : null,
-      partialPaymentDate: partialPaymentDate ? new Date(partialPaymentDate).toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric'
-      }) : null,
-      
-      notes
-    };
-
     // Generate PDF
-    const pdfBuffer = await generateDemandLetterPDF(pdfData);
+    const pdfBuffer = await generateDemandLetterPDF({
+  ...demandLetter,
+  tenant,
+  landlord,
+  property,
+  unit,
+  invoice
+});
 
     // Generate filename and upload
     const fileName = generateFileName(`demand_letter_${letterNumber}`);
     const filePath = `demand-letters/${fileName}`;
     const uploadResult = await uploadDocument(pdfBuffer, filePath);
 
-    //  FIX: Extract just the URL string
-    const documentUrl = uploadResult.url;
-
     // Update demand letter with document URL and status
     const updatedDemandLetter = await prisma.demandLetter.update({
       where: { id: demandLetter.id },
       data: {
-        documentUrl,  // Now this is a string
+        documentUrl: uploadResult.url,
         status: 'GENERATED',
         generatedAt: new Date()
       },
@@ -1144,26 +1084,13 @@ export const downloadDemandLetter = async (req, res) => {
       }
     }
 
-    // Get the file path from the document URL
-    const filePath = demandLetter.documentUrl.replace('/uploads/', '');
-    const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-    const fullPath = path.join(uploadDir, filePath);
-
-    // Check if file exists
-    if (!fs.existsSync(fullPath)) {
-      return res.status(404).json({
-        success: false,
-        message: 'PDF file not found on server'
-      });
-    }
-
-    // Set headers for file download
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="demand_letter_${demandLetter.letterNumber}.pdf"`);
-    
-    // Stream the file
-    const fileStream = fs.createReadStream(fullPath);
-    fileStream.pipe(res);
+    res.json({
+      success: true,
+      data: {
+        documentUrl: demandLetter.documentUrl,
+        letterNumber: demandLetter.letterNumber
+      }
+    });
 
   } catch (error) {
     console.error('Error downloading demand letter:', error);

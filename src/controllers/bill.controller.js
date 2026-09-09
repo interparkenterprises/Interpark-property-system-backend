@@ -2,7 +2,8 @@ import prisma from "../lib/prisma.js";
 import { generateBillInvoiceNumber } from '../utils/invoiceHelpers.js';
 import { uploadToStorage } from '../utils/storage.js';
 import permissionService from "../services/permissionService.js";
-import { generateBillInvoicePDF } from "./billinvoice.controller.js";
+import { buildBillInvoiceHtml, buildBillInvoiceFooterTemplate } from '../services/pdf/billInvoicePdf.js';
+import { generatePDF } from '../utils/pdfGenerator.js';
 
 // ======================================================
 // PERMISSION HELPER FUNCTIONS
@@ -842,31 +843,39 @@ export const payBill = async (req, res) => {
         const invoiceNumber = await generateBillInvoiceNumber();
         const billReferenceNumber = `BILL-${bill.type}-${bill.id.substring(0, 8).toUpperCase()}`;
 
-        invoice = await tx.billInvoice.create({
-          data: {
-            invoiceNumber,
-            billId: bill.id,
-            billReferenceNumber,
-            billReferenceDate: bill.issuedAt,
-            tenantId: bill.tenantId,
-            issueDate: now,
-            dueDate: bill.dueDate || now,
-            billType: bill.type,
-            previousReading: Number(bill.previousReading) || 0,
-            currentReading: Number(bill.currentReading) || 0,
-            units: Number(bill.units) || 0,
-            chargePerUnit: Number(bill.chargePerUnit) || 0,
-            totalAmount: Number(bill.totalAmount) || 0,
-            vatRate: bill.vatRate ? Number(bill.vatRate) : null,
-            vatAmount: bill.vatAmount ? Number(bill.vatAmount) : null,
-            grandTotal: grandTotal,
-            amountPaid: newAmountPaid,
-            balance: balance,
-            status: invoiceStatus,
-            notes: `Initial payment of Ksh ${amount.toLocaleString()} recorded on ${now.toLocaleDateString()}`
-          }
-        });
+invoice = await tx.billInvoice.create({
+  data: {
+    invoiceNumber,
+    billId: bill.id,
+    billReferenceNumber,
+    billReferenceDate: bill.issuedAt,
+    tenantId: bill.tenantId,
+    issueDate: now,
+    dueDate: bill.dueDate || now,
+    billType: bill.type,
+    previousReading: Number(bill.previousReading) || 0,
+    currentReading: Number(bill.currentReading) || 0,
+    units: Number(bill.units) || 0,
+    chargePerUnit: Number(bill.chargePerUnit) || 0,
+    totalAmount: Number(bill.totalAmount) || 0,
+    vatRate: bill.vatRate ? Number(bill.vatRate) : null,
+    vatAmount: bill.vatAmount ? Number(bill.vatAmount) : null,
+    grandTotal: grandTotal,
+    amountPaid: newAmountPaid,
+    balance: balance,
+    status: invoiceStatus,
+    notes: `Initial payment of Ksh ${amount.toLocaleString()} recorded on ${now.toLocaleDateString()}`
+  },
+  include: {
+    tenant: {
+      include: {
+        unit: { include: { property: true } }
       }
+    },
+    bill: true
+  }
+});
+  }
 
       return { updatedBill, invoice };
     }, {
@@ -877,14 +886,19 @@ export const payBill = async (req, res) => {
     let pdfUrl = null;
     if (invoice) {
       try {
-        const pdfBuffer = await generateBillInvoicePDF(invoice);
-        pdfUrl = await uploadToStorage(pdfBuffer, `${invoice.invoiceNumber}.pdf`);
-        
-        await prisma.billInvoice.update({
-          where: { id: invoice.id },
-          data: { pdfUrl }
-        });
-      } catch (pdfError) {
+    const pdfBuffer = await generatePDF(buildBillInvoiceHtml(invoice), {
+      displayHeaderFooter: true,
+      headerTemplate: '<div></div>',
+      footerTemplate: buildBillInvoiceFooterTemplate(),
+      margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
+    });
+    pdfUrl = await uploadToStorage(pdfBuffer, `${invoice.invoiceNumber}.pdf`);
+    
+    await prisma.billInvoice.update({
+      where: { id: invoice.id },
+      data: { pdfUrl }
+    });
+  } catch (pdfError) {
         console.error("Invoice PDF generation failed:", pdfError);
       }
     }

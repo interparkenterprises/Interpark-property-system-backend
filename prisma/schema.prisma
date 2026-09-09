@@ -1,12 +1,11 @@
 generator client {
   provider = "prisma-client-js"
+  output   = "../generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
-
 model User {
   id         String  @id @default(uuid())
   name       String
@@ -103,6 +102,7 @@ model Property {
   incomes            Income[]
   leads              Lead[]
   commissions        ManagerCommission[]
+  whatsappLogs  WhatsAppLog[]
   offerLetters       OfferLetter[]
   landlord           Landlord?           @relation(fields: [landlordId], references: [id])
   manager            User?               @relation(fields: [managerId], references: [id])
@@ -116,6 +116,7 @@ model Property {
   roleAccess CustomRolePropertyAccess[]
   userAccess PropertyAccess[]
 }
+
 
 // ============== RBAC Models ==============
 
@@ -429,6 +430,7 @@ model Tenant {
   paymentReports      PaymentReport[]
   serviceCharge       ServiceCharge?
   unit                Unit                 @relation(fields: [unitId], references: [id])
+  whatsappLogs  WhatsAppLog[]
 }
 
 model ServiceCharge {
@@ -1210,6 +1212,28 @@ enum OfferStatus {
 enum LetterType {
   COMMERCIAL
   RESIDENTIAL
+}
+
+model WhatsAppLog {
+  id                String    @id @default(cuid())
+  tenantId          String
+  tenant            Tenant    @relation(fields: [tenantId], references: [id])
+  propertyId        String
+  property          Property  @relation(fields: [propertyId], references: [id])
+  documentType      String    // "Payment Report", "Invoice", "Demand Letter", "Bill Invoices"
+  recipientPhone    String    // Tenant's phone number in international format (e.g., +254712345678)
+  whatsappMessageId String?   // Message ID returned by WhatsApp API
+  mediaUrl          String?   // URL of the uploaded media
+  status            String    @default("pending") // "pending", "sent", "delivered", "failed"
+  errorMessage      String?   // Error details if status is "failed"
+  sentAt            DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([tenantId])
+  @@index([propertyId])
+  @@index([documentType])
+  @@index([sentAt])
 }
 
 model Employee {

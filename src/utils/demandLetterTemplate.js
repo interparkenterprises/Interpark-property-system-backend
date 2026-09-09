@@ -1,24 +1,27 @@
 import { generatePDF } from './pdfGenerator.js';
+import { buildDemandLetterHtml,  buildDemandLetterFooterTemplate,} from '../services/pdf/demandLetterPdf.js';
+ 
 
 /**
  * Generate demand letter PDF from data
  * @param {Object} data - Demand letter data
  * @returns {Promise<Buffer>} PDF buffer
  */
-export const generateDemandLetterPDF = async (data) => {
-  const htmlContent = generateDemandLetterHTML(data);
-  
-  const pdfBuffer = await generatePDF(htmlContent, {
-    format: 'A4',
-    margin: {
-      top: '2.5cm',
-      right: '2.5cm',
-      bottom: '2.5cm',
-      left: '2.5cm'
-    },
-    printBackground: true
-  });
 
+export const generateDemandLetterPDF = async (demandLetterRecord) => {
+  const html = buildDemandLetterHtml(demandLetterRecord);
+ 
+  const pdfBuffer = await generatePDF(html, {
+    displayHeaderFooter: true,
+    headerTemplate: '<div></div>', // empty -- letterhead is already in the HTML content
+    footerTemplate: buildDemandLetterFooterTemplate(demandLetterRecord),
+    margin: {
+      top: '20px',
+      right: '20px',
+      bottom: '60px', // room so content never collides with the footer
+      left: '20px',
+    },
+  });
   return pdfBuffer;
 };
 
