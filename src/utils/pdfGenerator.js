@@ -2,6 +2,9 @@ import puppeteer from 'puppeteer';
 import fs from 'fs';
 
 let browserInstance = null;
+let isBrowserValid = false;
+let browserErrorCount = 0;
+const MAX_BROWSER_ERRORS = 3;
 
 /**
  * Get Chrome executable path - works for both local and production
@@ -39,199 +42,299 @@ const getChromeExecutablePath = () => {
     }
   }
   
-  // 3. Check for Puppeteer's bundled Chrome (development fallback)
-  try {
-    // This is where puppeteer typically installs Chrome
-    const puppeteerChromePath = './node_modules/puppeteer/.local-chromium';
-    if (fs.existsSync(puppeteerChromePath)) {
-      console.log('Using Puppeteer bundled Chrome');
-      return null; // Let puppeteer use its bundled version
-    }
-  } catch (e) {
-    // Skip
-  }
-  
   console.log('No Chrome found, will use puppeteer bundled version');
   return null;
+};
+
+/**
+ * Check if browser instance is still valid
+ */
+const isBrowserHealthy = async () => {
+  if (!browserInstance) return false;
+  
+  try {
+    // Try to get the browser version to check if connection is alive
+    await browserInstance.version();
+    return true;
+  } catch (error) {
+    console.warn('Browser health check failed:', error.message);
+    return false;
+  }
 };
 
 /**
  * Get or create browser instance with better error handling
  */
 const getBrowser = async () => {
-  if (!browserInstance) {
-    const executablePath = getChromeExecutablePath();
-    
-    // Launch options optimized for both development and production
-    const launchOptions = {
-      headless: 'new',
-      args: [
-        '--no-sandbox',                    // Required for Linux production
-        '--disable-setuid-sandbox',        // Required for Linux production
-        '--disable-dev-shm-usage',         // Fix for Docker/Linux
-        '--disable-gpu',                   // Fix for Linux
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',                // Better for production
-        '--disable-extensions',
-        '--disable-default-apps',
-        '--disable-popup-blocking',
-        '--disable-translate',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-web-security',          // For production if needed
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-features=BlockInsecurePrivateNetworkRequests',
-        '--disable-features=OutOfBlinkCors',
-        '--disable-blink-features=AutomationControlled',
-        '--window-size=1920,1080',
-      ],
-      timeout: 60000,
-      // Set a timeout for browser launch
-      protocolTimeout: 60000,
-    };
-
-    // If we found a system Chrome, use it (preferred for production)
-    if (executablePath) {
-      launchOptions.executablePath = executablePath;
-      console.log(`Launching browser with Chrome: ${executablePath}`);
-    } else {
-      // Let puppeteer use its bundled Chrome (good for development)
-      console.log('Launching browser with Puppeteer bundled Chrome');
-    }
-
-    try {
-      console.log('Attempting to launch browser...');
-      browserInstance = await puppeteer.launch(launchOptions);
-      console.log('Browser launched successfully!');
-      
-      // Get browser version for verification
-      const version = await browserInstance.version();
-      console.log(`Browser version: ${version}`);
-      
+  // Check if we need to recreate the browser
+  if (browserInstance) {
+    const healthy = await isBrowserHealthy();
+    if (healthy && isBrowserValid) {
       return browserInstance;
-    } catch (error) {
-      console.error('Failed to launch browser:', error.message);
+    }
+    // Browser is not healthy, close and recreate
+    console.log('Browser instance is not healthy, recreating...');
+    await closeBrowser();
+  }
+
+  const executablePath = getChromeExecutablePath();
+  
+  // Launch options optimized for both development and production
+  const launchOptions = {
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-extensions',
+      '--disable-default-apps',
+      '--disable-popup-blocking',
+      '--disable-translate',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-features=BlockInsecurePrivateNetworkRequests',
+      '--disable-features=OutOfBlinkCors',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1920,1080',
+      // Additional stability flags
+      '--disable-accelerated-2d-canvas',
+      '--disable-accelerated-jpeg-decoding',
+      '--disable-accelerated-mjpeg-decode',
+      '--disable-accelerated-video-decode',
+      '--disable-background-networking',
+      '--disable-breakpad',
+      '--disable-component-extensions-with-background-pages',
+      '--disable-component-update',
+      '--disable-domain-reliability',
+      '--disable-ipc-flooding-protection',
+      '--disable-renderer-process-reuse',
+      '--disable-sync',
+      '--disable-windows10-custom-titlebar',
+      '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+      '--disable-ipc-flooding-protection',
+      '--enable-features=NetworkService,NetworkServiceInProcess',
+      '--force-color-profile=srgb',
+      '--hide-scrollbars',
+      '--ignore-certificate-errors',
+      '--ignore-ssl-errors',
+      '--mute-audio',
+      '--no-default-browser-check',
+      '--no-pings',
+      '--password-store=basic',
+      '--use-mock-keychain',
+      '--disable-software-rasterizer',
+    ],
+    timeout: 60000,
+    protocolTimeout: 60000,
+    // Increase connection stability
+    handleSIGINT: false,
+    handleSIGTERM: false,
+    handleSIGHUP: false,
+    handleSIGQUIT: false,
+    // Reuse browser context across pages
+    waitForInitialPage: false,
+  };
+
+  // If we found a system Chrome, use it (preferred for production)
+  if (executablePath) {
+    launchOptions.executablePath = executablePath;
+    console.log(`Launching browser with Chrome: ${executablePath}`);
+  } else {
+    console.log('Launching browser with Puppeteer bundled Chrome');
+  }
+
+  try {
+    console.log('Attempting to launch browser...');
+    browserInstance = await puppeteer.launch(launchOptions);
+    
+    // Set up connection error handlers
+    browserInstance.on('disconnected', () => {
+      console.warn('Browser disconnected unexpectedly');
+      isBrowserValid = false;
+      browserInstance = null;
+    });
+
+    browserInstance.on('error', (error) => {
+      console.error('Browser error:', error);
+      isBrowserValid = false;
+      browserInstance = null;
+    });
+
+    // Verify browser is working
+    const version = await browserInstance.version();
+    console.log(`Browser version: ${version}`);
+    
+    isBrowserValid = true;
+    browserErrorCount = 0;
+    console.log('Browser launched successfully!');
+    
+    return browserInstance;
+  } catch (error) {
+    console.error('Failed to launch browser:', error.message);
+    browserInstance = null;
+    isBrowserValid = false;
+    browserErrorCount++;
+    
+    // Try fallback with minimal options
+    console.log('Attempting fallback launch with minimal options...');
+    try {
+      const fallbackOptions = {
+        headless: 'new',
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        timeout: 60000,
+        protocolTimeout: 60000,
+      };
       
-      // Try fallback with minimal options
-      console.log('Attempting fallback launch with minimal options...');
-      try {
-        const fallbackOptions = {
-          headless: 'new',
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
-          timeout: 60000,
-        };
-        
-        // If we had a custom executable path, try without it
-        if (executablePath) {
-          console.log('Falling back to bundled Chrome...');
-          // Don't set executablePath, use bundled
-        }
-        
-        browserInstance = await puppeteer.launch(fallbackOptions);
-        console.log('Fallback browser launched successfully!');
-        return browserInstance;
-      } catch (fallbackError) {
-        console.error('All browser launch attempts failed:', fallbackError);
-        throw new Error(
-          `Could not launch Chrome browser. Please ensure Chrome is installed.\n` +
-          `For DigitalOcean: sudo apt-get install -y chromium-browser\n` +
-          `For local: npx puppeteer browsers install chrome\n` +
-          `Or set PUPPETEER_EXECUTABLE_PATH environment variable.\n` +
-          `Original error: ${error.message}`
-        );
-      }
+      browserInstance = await puppeteer.launch(fallbackOptions);
+      
+      browserInstance.on('disconnected', () => {
+        console.warn('Browser disconnected unexpectedly');
+        isBrowserValid = false;
+        browserInstance = null;
+      });
+
+      const version = await browserInstance.version();
+      console.log(`Fallback browser version: ${version}`);
+      
+      isBrowserValid = true;
+      browserErrorCount = 0;
+      console.log('Fallback browser launched successfully!');
+      return browserInstance;
+    } catch (fallbackError) {
+      console.error('All browser launch attempts failed:', fallbackError);
+      throw new Error(
+        `Could not launch Chrome browser. Please ensure Chrome is installed.\n` +
+        `For DigitalOcean: sudo apt-get install -y chromium-browser\n` +
+        `For local: npx puppeteer browsers install chrome\n` +
+        `Or set PUPPETEER_EXECUTABLE_PATH environment variable.\n` +
+        `Original error: ${error.message}`
+      );
     }
   }
-  return browserInstance;
 };
 
 /**
- * Generate PDF from HTML content
+ * Generate PDF from HTML content with improved stability
  */
 export const generatePDF = async (htmlContent, options = {}) => {
-  let page;
+  let page = null;
   const startTime = Date.now();
+  const maxRetries = 2;
+  let lastError = null;
   
-  try {
-    console.log('Starting PDF generation...');
-    const browser = await getBrowser();
-    
-    // Create a new page with fresh context
-    page = await browser.newPage();
-    
-    // Set viewport for consistent rendering
-    await page.setViewport({
-      width: 1200,
-      height: 1600,
-      deviceScaleFactor: 1,
-    });
-
-    // Set content with timeout and wait for network to be idle
-    console.log('Setting HTML content...');
-    await page.setContent(htmlContent, {
-      waitUntil: 'networkidle0',
-      timeout: 60000
-    });
-
-    // Wait for fonts to load
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      console.log('Waiting for fonts...');
-      await page.evaluateHandle('document.fonts.ready');
-      console.log('Fonts loaded');
-    } catch (e) {
-      console.warn('Font loading timeout, continuing anyway');
-    }
+      if (attempt > 0) {
+        console.log(`Retry attempt ${attempt} for PDF generation...`);
+        // Force browser recreation on retry
+        await closeBrowser();
+        // Small delay before retry
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      console.log(`Starting PDF generation (attempt ${attempt + 1})...`);
+      const browser = await getBrowser();
+      
+      // Create a new page with fresh context
+      page = await browser.newPage();
+      
+      // Set viewport for consistent rendering
+      await page.setViewport({
+        width: 1200,
+        height: 1600,
+        deviceScaleFactor: 1,
+      });
 
-    // Wait a bit for any dynamic content - FIXED: Use setTimeout instead of page.waitForTimeout
-    console.log('Waiting for content to stabilize...');
-    await new Promise(resolve => setTimeout(resolve, 500));
+      // Set content with timeout and wait for network to be idle
+      console.log('Setting HTML content...');
+      await page.setContent(htmlContent, {
+        waitUntil: 'networkidle0',
+        timeout: 60000
+      });
 
-    // Generate PDF
-    console.log('Generating PDF...');
-    const pdfBuffer = await page.pdf({
-      format: 'A4',
-      margin: {
-        top: '2.5cm',
-        right: '2cm',
-        bottom: '2.5cm',
-        left: '2cm'
-      },
-      printBackground: true,
-      preferCSSPageSize: true,
-      timeout: 60000,
-      ...options
-    });
-    
-    console.log(`PDF generated successfully in ${Date.now() - startTime}ms`);
-    await page.close();
-    return pdfBuffer;
-    
-  } catch (error) {
-    console.error('PDF generation error:', error);
-    
-    // Clean up page if it exists
-    if (page && !page.isClosed()) {
+      // Wait for fonts to load
+      try {
+        console.log('Waiting for fonts...');
+        await page.evaluateHandle('document.fonts.ready');
+        console.log('Fonts loaded');
+      } catch (e) {
+        console.warn('Font loading timeout, continuing anyway');
+      }
+
+      // Wait a bit for any dynamic content
+      console.log('Waiting for content to stabilize...');
+      await new Promise(resolve => setTimeout(resolve, 800));
+
+      // Generate PDF
+      console.log('Generating PDF...');
+      const pdfBuffer = await page.pdf({
+        format: 'A4',
+        margin: {
+          top: '2.5cm',
+          right: '2cm',
+          bottom: '2.5cm',
+          left: '2cm'
+        },
+        printBackground: true,
+        preferCSSPageSize: true,
+        timeout: 60000,
+        ...options
+      });
+      
+      console.log(`PDF generated successfully in ${Date.now() - startTime}ms`);
+      
+      // Close page properly
       try {
         await page.close();
-      } catch (e) {
-        console.warn('Error closing page:', e.message);
+      } catch (closeError) {
+        console.warn('Error closing page:', closeError.message);
       }
+      
+      // Reset error count on success
+      browserErrorCount = 0;
+      
+      return pdfBuffer;
+      
+    } catch (error) {
+      lastError = error;
+      console.error(`PDF generation error (attempt ${attempt + 1}):`, error.message);
+      
+      // Clean up page if it exists
+      if (page && !page.isClosed()) {
+        try {
+          await page.close();
+        } catch (e) {
+          console.warn('Error closing page:', e.message);
+        }
+        page = null;
+      }
+      
+      // If this was the last attempt, throw the error
+      if (attempt === maxRetries) {
+        break;
+      }
+      
+      // If it's a connection error, force browser recreation
+      if (error.message.includes('Connection closed') || 
+          error.message.includes('detached') ||
+          error.message.includes('Protocol error')) {
+        console.log('Connection error detected, will recreate browser on retry');
+        await closeBrowser();
+      }
+      
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, 1500));
     }
-    
-    // Provide more specific error messages
-    if (error.message.includes('Could not find Chrome')) {
-      throw new Error(
-        'Chrome browser not found. Please install Chrome:\n' +
-        'DigitalOcean/Ubuntu: sudo apt-get install -y chromium-browser\n' +
-        'Local: npx puppeteer browsers install chrome\n' +
-        'Then set: export PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser'
-      );
-    }
-    
-    throw new Error(`Failed to generate PDF: ${error.message}`);
   }
+  
+  // If we get here, all retries failed
+  throw new Error(`Failed to generate PDF after ${maxRetries + 1} attempts: ${lastError?.message || 'Unknown error'}`);
 };
 
 /**
@@ -242,36 +345,40 @@ export const closeBrowser = async () => {
     try {
       console.log('Closing browser instance...');
       await browserInstance.close();
-      browserInstance = null;
-      console.log('Browser closed successfully');
     } catch (error) {
-      console.error('Error closing browser:', error.message);
+      console.warn('Error closing browser:', error.message);
+    } finally {
       browserInstance = null;
+      isBrowserValid = false;
     }
   }
 };
 
-// Handle process exit
-process.on('exit', async () => {
+// Handle process exit - cleanup
+const cleanup = async () => {
+  console.log('Cleaning up browser...');
   await closeBrowser();
-});
+};
+
+// Handle process exit
+process.on('exit', cleanup);
 
 // Handle uncaught exceptions
 process.on('uncaughtException', async (error) => {
   console.error('Uncaught exception:', error);
-  await closeBrowser();
+  await cleanup();
 });
 
 // Handle SIGTERM (production)
 process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM, closing browser...');
-  await closeBrowser();
+  console.log('Received SIGTERM, cleaning up...');
+  await cleanup();
   process.exit(0);
 });
 
 // Handle SIGINT (development)
 process.on('SIGINT', async () => {
-  console.log('Received SIGINT, closing browser...');
-  await closeBrowser();
+  console.log('Received SIGINT, cleaning up...');
+  await cleanup();
   process.exit(0);
 });
