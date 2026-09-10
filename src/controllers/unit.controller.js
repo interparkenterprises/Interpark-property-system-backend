@@ -133,6 +133,42 @@ const prepareUnitData = (propertyUsage, unitType, data) => {
   return unitData;
 };
 
+// =============================================
+// HELPER: Attach the ACTIVE tenant to a unit object
+// Since Unit now has "tenants" (array), the API should still
+// expose a single "tenant" field for backward compatibility
+// =============================================
+const attachActiveTenant = (unit) => {
+  if (!unit) return unit;
+  
+  const activeTenant = unit.tenants?.find(t => t.status === 'ACTIVE') || null;
+  
+  // Remove the raw "tenants" array, replace with a single "tenant" field
+  const { tenants, ...rest } = unit;
+  
+  return {
+    ...rest,
+    tenant: activeTenant
+  };
+};
+
+// =============================================
+// HELPER: Include clause for fetching ACTIVE tenant only (with serviceCharge)
+// =============================================
+const activeTenantInclude = {
+  where: { status: 'ACTIVE' },
+  include: {
+    serviceCharge: true
+  }
+};
+
+// =============================================
+// HELPER: Include clause for fetching ACTIVE tenant only (simple)
+// =============================================
+const activeTenantIncludeSimple = {
+  where: { status: 'ACTIVE' }
+};
+
 // @desc    Get all units
 // @route   GET /api/units
 // @access  Private
@@ -156,7 +192,7 @@ export const getUnits = async (req, res) => {
               form: true
             }
           },
-          tenant: true
+          tenants: activeTenantIncludeSimple
         },
         orderBy: { property: { name: 'asc' } }
       });
@@ -178,7 +214,7 @@ export const getUnits = async (req, res) => {
               form: true
             }
           },
-          tenant: true
+          tenants: activeTenantIncludeSimple
         },
         orderBy: { property: { name: 'asc' } }
       });
@@ -213,7 +249,7 @@ export const getUnits = async (req, res) => {
               form: true
             }
           },
-          tenant: true
+          tenants: activeTenantIncludeSimple
         },
         orderBy: { property: { name: 'asc' } }
       });
@@ -221,7 +257,10 @@ export const getUnits = async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    res.json(units);
+    // Map to attach "tenant" (singular) from the "tenants" array
+    const mappedUnits = units.map(attachActiveTenant);
+
+    res.json(mappedUnits);
   } catch (error) {
     console.error('Get units error:', error);
     res.status(400).json({ message: error.message });
@@ -264,11 +303,15 @@ export const getUnitsByProperty = async (req, res) => {
             form: true
           }
         },
-        tenant: true
+        tenants: activeTenantIncludeSimple
       },
       orderBy: { unitNo: 'asc' }
     });
-    res.json(units);
+
+    // Map to attach "tenant" (singular) from the "tenants" array
+    const mappedUnits = units.map(attachActiveTenant);
+
+    res.json(mappedUnits);
   } catch (error) {
     console.error('Get units by property error:', error);
     res.status(400).json({ message: error.message });
@@ -293,11 +336,7 @@ export const getUnit = async (req, res) => {
             manager: { select: { id: true, name: true, email: true } }
           }
         },
-        tenant: {
-          include: {
-            serviceCharge: true
-          }
-        }
+        tenants: activeTenantInclude
       }
     });
 
@@ -312,7 +351,8 @@ export const getUnit = async (req, res) => {
       return res.status(403).json({ message: 'Access denied to view this unit' });
     }
 
-    res.json(unit);
+    // Attach "tenant" (singular) from the "tenants" array
+    res.json(attachActiveTenant(unit));
   } catch (error) {
     console.error('Get unit error:', error);
     res.status(400).json({ message: error.message });
@@ -450,15 +490,17 @@ export const createUnit = async (req, res) => {
             form: true
           }
         },
-        tenant: true
+        tenants: activeTenantIncludeSimple
       }
     });
 
+    // Attach "tenant" (singular) from the "tenants" array
+    let response = attachActiveTenant(unit);
+
     // Add calculation info to response for PER_SQFT type
-    let response = unit;
     if (rentType === 'PER_SQFT') {
       response = {
-        ...unit,
+        ...response,
         calculationInfo: {
           ratePerSqFt: parsedRentAmount,
           sizeSqFt: parsedSizeSqFt,
@@ -504,7 +546,7 @@ export const updateUnit = async (req, res) => {
         property: {
           select: { usage: true, name: true, managerId: true }
         },
-        tenant: true
+        tenants: activeTenantIncludeSimple
       }
     });
 
@@ -522,8 +564,11 @@ export const updateUnit = async (req, res) => {
       });
     }
 
-    // Check if unit has a tenant - if yes, restrict rent amount updates
-    if (existingUnit.tenant && rentAmount !== undefined) {
+    // Get the ACTIVE tenant (if any)
+    const activeTenant = existingUnit.tenants?.find(t => t.status === 'ACTIVE') || null;
+
+    // Check if unit has an ACTIVE tenant - if yes, restrict rent amount updates
+    if (activeTenant && rentAmount !== undefined) {
       return res.status(400).json({
         message: 'Cannot update rent amount for an occupied unit. Please update the tenant\'s rent instead.'
       });
@@ -645,20 +690,18 @@ export const updateUnit = async (req, res) => {
             form: true
           }
         },
-        tenant: {
-          include: {
-            serviceCharge: true
-          }
-        }
+        tenants: activeTenantInclude
       }
     });
 
+    // Attach "tenant" (singular) from the "tenants" array
+    let response = attachActiveTenant(unit);
+
     // Add calculation info to response for PER_SQFT type
-    let response = unit;
     if (finalRentType === 'PER_SQFT') {
       const ratePerSqFt = finalRentAmount / unit.sizeSqFt;
       response = {
-        ...unit,
+        ...response,
         calculationInfo: {
           ratePerSqFt: ratePerSqFt,
           sizeSqFt: unit.sizeSqFt,
@@ -694,17 +737,21 @@ export const deleteUnit = async (req, res) => {
       });
     }
 
-    // Check if unit has a tenant
+    // Check if unit has an ACTIVE tenant
     const unit = await prisma.unit.findUnique({
       where: { id },
-      include: { tenant: true }
+      include: {
+        tenants: activeTenantIncludeSimple
+      }
     });
 
     if (!unit) {
       return res.status(404).json({ message: 'Unit not found' });
     }
 
-    if (unit.tenant) {
+    // Now check for active tenant in the array
+    const activeTenant = unit.tenants?.find(t => t.status === 'ACTIVE');
+    if (activeTenant) {
       return res.status(400).json({
         message: 'Cannot delete unit with active tenant. Please remove tenant first.'
       });
@@ -894,11 +941,7 @@ export const getOccupiedUnits = async (req, res) => {
               form: true
             }
           },
-          tenant: {
-            include: {
-              serviceCharge: true
-            }
-          }
+          tenants: activeTenantInclude
         },
         orderBy: { property: { name: 'asc' } }
       });
@@ -920,11 +963,7 @@ export const getOccupiedUnits = async (req, res) => {
               form: true
             }
           },
-          tenant: {
-            include: {
-              serviceCharge: true
-            }
-          }
+          tenants: activeTenantInclude
         },
         orderBy: { property: { name: 'asc' } }
       });
@@ -959,11 +998,7 @@ export const getOccupiedUnits = async (req, res) => {
               form: true
             }
           },
-          tenant: {
-            include: {
-              serviceCharge: true
-            }
-          }
+          tenants: activeTenantInclude
         },
         orderBy: { property: { name: 'asc' } }
       });
@@ -971,7 +1006,10 @@ export const getOccupiedUnits = async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    res.json(units);
+    // Map to attach "tenant" (singular) from the "tenants" array
+    const mappedUnits = units.map(attachActiveTenant);
+
+    res.json(mappedUnits);
   } catch (error) {
     console.error('Get occupied units error:', error);
     res.status(400).json({ message: error.message });

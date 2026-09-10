@@ -385,14 +385,14 @@ model Unit {
   unitType      UnitType
   usage         String?
   offerLetters  OfferLetter[]
-  tenant        Tenant?
+  tenants       Tenant[] 
   property      Property       @relation(fields: [propertyId], references: [id])
   demandLetters DemandLetter[]
 }
 
 model Tenant {
   id                  String               @id @default(uuid())
-  unitId              String               @unique
+  unitId              String              //no longer unique
   leaseTerm           String
   rent                Float
   termStart           DateTime

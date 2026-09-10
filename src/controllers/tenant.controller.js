@@ -1749,12 +1749,15 @@ export const updateTenant = async (req, res) => {
     let unitPriceWarning = null;
 
     if (unitId && unitId !== existingTenant.unitId) {
-      // Fetch the target unit with tenant relation
+      // Fetch the target unit with ACTIVE tenants only
       targetUnit = await prisma.unit.findUnique({
         where: { id: unitId },
         include: {
           property: true,
-          tenant: true // Include the tenant relation to check if occupied
+          // Only fetch ACTIVE tenants to check if unit is currently occupied
+          tenants: {
+            where: { status: 'ACTIVE' }
+          }
         }
       });
 
@@ -1769,40 +1772,44 @@ export const updateTenant = async (req, res) => {
         });
       }
 
-      // IMPORTANT: Check if the unit is occupied
-      const isUnitOccupied = targetUnit.status === 'OCCUPIED' || targetUnit.tenant !== null;
-      
+      // IMPORTANT: Check if the unit is occupied by an ACTIVE tenant
+      const activeTenantInTarget = targetUnit.tenants?.[0] || null;
+      const isUnitOccupied = targetUnit.status === 'OCCUPIED' || activeTenantInTarget !== null;
+
       if (isUnitOccupied) {
         let detailedMessage = "Target unit is not vacant.";
         const reasons = [];
-        
+
         if (targetUnit.status === 'OCCUPIED') {
           reasons.push(`Unit status is 'OCCUPIED'`);
         }
-        if (targetUnit.tenant !== null) {
-          reasons.push(`Unit has tenant: ${targetUnit.tenant.fullName}`);
+        if (activeTenantInTarget) {
+          reasons.push(`Unit has tenant: ${activeTenantInTarget.fullName}`);
         }
-        
+
         if (reasons.length > 0) {
           detailedMessage += ` (${reasons.join(', ')})`;
         }
-        
+
         return res.status(400).json({
           message: detailedMessage,
           unitStatus: targetUnit.status,
-          hasTenant: !!targetUnit.tenant,
-          tenantName: targetUnit.tenant?.fullName || null
+          hasTenant: !!activeTenantInTarget,
+          tenantName: activeTenantInTarget?.fullName || null
         });
       }
 
-      // Double-check if target unit has any tenant relation (extra safety)
-      const existingTenantInTarget = await prisma.tenant.findFirst({
-        where: { unitId: targetUnit.id }
+      // Double-check if target unit has any ACTIVE tenant (extra safety)
+      const existingActiveTenantInTarget = await prisma.tenant.findFirst({
+        where: {
+          unitId: targetUnit.id,
+          status: 'ACTIVE'
+        }
       });
 
-      if (existingTenantInTarget) {
+      if (existingActiveTenantInTarget) {
         return res.status(400).json({
-          message: `Target unit is already assigned to another tenant: ${existingTenantInTarget.fullName}`
+          message: `Target unit is already assigned to another tenant: ${existingActiveTenantInTarget.fullName}`
         });
       }
 
@@ -1899,7 +1906,7 @@ export const updateTenant = async (req, res) => {
     // =============================================
     // WITHHOLDING TAX VALIDATION FOR UPDATE
     // =============================================
-    
+
     // Validate withholding tax rate
     let parsedWithholdingTaxRate = undefined;
     if (withholdingTaxRate !== undefined) {
@@ -1952,7 +1959,7 @@ export const updateTenant = async (req, res) => {
           });
         }
         finalRent = parsedRent;
-        
+
         // Also update the target unit's rent to match if different
         if (targetUnit.rentAmount !== parsedRent) {
           await prisma.unit.update({
@@ -2026,19 +2033,22 @@ export const updateTenant = async (req, res) => {
       const freshTargetUnit = await prisma.unit.findUnique({
         where: { id: targetUnit.id },
         include: {
-          tenant: true
+          tenants: {
+            where: { status: 'ACTIVE' }
+          }
         }
       });
 
       if (freshTargetUnit) {
-        const isOccupied = freshTargetUnit.status === 'OCCUPIED' || freshTargetUnit.tenant !== null;
-        
+        const freshActiveTenant = freshTargetUnit.tenants?.[0] || null;
+        const isOccupied = freshTargetUnit.status === 'OCCUPIED' || freshActiveTenant !== null;
+
         if (isOccupied) {
           return res.status(400).json({
             message: "Target unit is no longer vacant. It may have been occupied during the process.",
             unitStatus: freshTargetUnit.status,
-            hasTenant: !!freshTargetUnit.tenant,
-            tenantName: freshTargetUnit.tenant?.fullName || null
+            hasTenant: !!freshActiveTenant,
+            tenantName: freshActiveTenant?.fullName || null
           });
         }
       }
@@ -2048,7 +2058,7 @@ export const updateTenant = async (req, res) => {
         // 1. Free up the old unit (set to VACANT)
         await tx.unit.update({
           where: { id: oldUnitId },
-          data: { 
+          data: {
             status: 'VACANT'
           }
         });
@@ -2056,7 +2066,7 @@ export const updateTenant = async (req, res) => {
         // 2. Update the new unit to OCCUPIED
         await tx.unit.update({
           where: { id: targetUnit.id },
-          data: { 
+          data: {
             status: 'OCCUPIED'
           }
         });
@@ -2113,7 +2123,7 @@ export const updateTenant = async (req, res) => {
             where: { tenantId: req.params.id },
           });
         }
-      } 
+      }
       // Case 2: serviceCharge is an object (update or create)
       else if (serviceCharge && typeof serviceCharge === 'object') {
         // Validate type if provided
@@ -2157,26 +2167,26 @@ export const updateTenant = async (req, res) => {
 
         // Build update data with CORRECT field names
         const serviceChargeUpdateData = {};
-        
+
         if (normalizedType !== undefined) {
           serviceChargeUpdateData.type = normalizedType;
         }
-        
+
         if (serviceCharge.fixedAmount !== undefined) {
-          serviceChargeUpdateData.fixedAmount = serviceCharge.fixedAmount !== null 
-            ? parseFloat(serviceCharge.fixedAmount) 
+          serviceChargeUpdateData.fixedAmount = serviceCharge.fixedAmount !== null
+            ? parseFloat(serviceCharge.fixedAmount)
             : null;
         }
-        
+
         if (serviceCharge.percentage !== undefined) {
-          serviceChargeUpdateData.percentage = serviceCharge.percentage !== null 
-            ? parseFloat(serviceCharge.percentage) 
+          serviceChargeUpdateData.percentage = serviceCharge.percentage !== null
+            ? parseFloat(serviceCharge.percentage)
             : null;
         }
-        
+
         if (serviceCharge.perSqFtRate !== undefined) {
-          serviceChargeUpdateData.perSqFtRate = serviceCharge.perSqFtRate !== null 
-            ? parseFloat(serviceCharge.perSqFtRate) 
+          serviceChargeUpdateData.perSqFtRate = serviceCharge.perSqFtRate !== null
+            ? parseFloat(serviceCharge.perSqFtRate)
             : null;
         }
 
@@ -2184,7 +2194,7 @@ export const updateTenant = async (req, res) => {
         if (normalizedServiceVatType !== undefined) {
           serviceChargeUpdateData.vatType = normalizedServiceVatType;
         }
-        
+
         if (parsedServiceVatRate !== undefined) {
           serviceChargeUpdateData.vatRate = parsedServiceVatRate;
         }
@@ -2218,7 +2228,7 @@ export const updateTenant = async (req, res) => {
               vatType: serviceChargeUpdateData.vatType || "NOT_APPLICABLE",
               vatRate: serviceChargeUpdateData.vatRate ?? 0,
             };
-            
+
             await prisma.serviceCharge.create({
               data: createData,
             });
