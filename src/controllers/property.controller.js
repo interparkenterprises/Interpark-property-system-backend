@@ -9,6 +9,38 @@ async function getAccessiblePropertyIds(userId, userRole) {
   return await permissionService.getAccessiblePropertyIds(userId, userRole);
 }
 
+// =============================================
+// HELPER: Map a Unit (with tenants array) to expose a single "tenant" field
+// =============================================
+const mapUnitActiveTenant = (unit) => {
+  if (!unit) return unit;
+  
+  const activeTenant = unit.tenants?.find(t => t.status === 'ACTIVE') || null;
+  const { tenants, ...rest } = unit;
+  
+  return {
+    ...rest,
+    tenant: activeTenant
+  };
+};
+
+// =============================================
+// HELPER: Include clause for fetching ACTIVE tenant only
+// =============================================
+const activeTenantInclude = {
+  where: { status: 'ACTIVE' },
+  include: {
+    serviceCharge: true
+  }
+};
+
+// =============================================
+// HELPER: Include clause for fetching ACTIVE tenant only (simple)
+// =============================================
+const activeTenantIncludeSimple = {
+  where: { status: 'ACTIVE' }
+};
+
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -111,11 +143,7 @@ export const getProperty = async (req, res) => {
         manager: { select: { id: true, name: true, email: true } },
         units: {
           include: {
-            tenant: {
-              include: {
-                serviceCharge: true
-              }
-            }
+            tenants: activeTenantInclude
           }
         },
         serviceProviders: true,
@@ -135,6 +163,9 @@ export const getProperty = async (req, res) => {
     if (!hasAccess) {
       return res.status(403).json({ message: 'Access denied to this property' });
     }
+
+    // Map units to expose "tenant" (singular) from "tenants" array
+    property.units = property.units.map(mapUnitActiveTenant);
 
     res.json(property);
   } catch (error) {
@@ -179,7 +210,8 @@ export const getPropertyCollectionStatement = async (req, res) => {
         },
         units: {
           include: {
-            tenant: {
+            tenants: {
+              where: { status: 'ACTIVE' },
               include: {
                 serviceCharge: true,
                 invoices: {
@@ -255,9 +287,11 @@ export const getPropertyCollectionStatement = async (req, res) => {
     let occupiedUnits = 0;
     let vacantUnits = 0;
 
-    // Process each unit and its tenant
+    // Process each unit and its ACTIVE tenant
     const unitSummaries = property.units.map(unit => {
-      const tenant = unit.tenant;
+      // Extract ACTIVE tenant from the tenants array
+      const tenant = unit.tenants?.find(t => t.status === 'ACTIVE') || null;
+      
       let unitDeposit = 0;
       let unitRentCollected = 0;
       let unitServiceCharge = 0;
@@ -363,7 +397,8 @@ export const getPropertyCollectionStatement = async (req, res) => {
       totalCommissions += commission.commissionAmount;
       return acc;
     }, { pending: 0, paid: 0 });
-        // ========== NEW: Add manager name to each commission ==========
+
+    // Add manager name to each commission
     const commissionsWithManager = property.commissions.map(commission => ({
       ...commission,
       managerName: property.manager?.name || 'Unknown Manager'
@@ -818,16 +853,15 @@ export const updateProperty = async (req, res) => {
         manager: { select: { id: true, name: true, email: true } },
         units: {
           include: {
-            tenant: {
-              include: {
-                serviceCharge: true
-              }
-            }
+            tenants: activeTenantInclude
           }
         },
         serviceProviders: true
       }
     });
+
+    // Map units to expose "tenant" (singular) from "tenants" array
+    property.units = property.units.map(mapUnitActiveTenant);
 
     // Invalidate cache for this property
     await permissionService.invalidatePropertyAccessCache(propertyId);
@@ -915,7 +949,7 @@ export const getManagerProperties = async (req, res) => {
         landlord: true,
         units: {
           include: {
-            tenant: true
+            tenants: activeTenantIncludeSimple
           }
         },
         serviceProviders: true,
@@ -928,6 +962,11 @@ export const getManagerProperties = async (req, res) => {
         }
       },
       orderBy: { createdAt: 'desc' }
+    });
+
+    // Map units to expose "tenant" (singular) from "tenants" array
+    properties.forEach(property => {
+      property.units = property.units.map(mapUnitActiveTenant);
     });
 
     res.json(properties);
