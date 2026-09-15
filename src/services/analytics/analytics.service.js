@@ -1,4 +1,3 @@
-// analytics.service.js
 import prisma from '../../lib/prisma.js';
 import permissionService from '../permissionService.js';
 import {
@@ -96,6 +95,17 @@ const billInvoiceSelect = {
   updatedAt: true,
   units: true,
   chargePerUnit: true
+};
+
+// Shared select for unit occupancy queries — Unit has MANY tenants now,
+// so we must select the array (filtered to ACTIVE) and check length.
+const unitOccupancySelect = {
+  id: true,
+  status: true,
+  tenants: {
+    where: { status: 'ACTIVE' },
+    select: { id: true }
+  }
 };
 
 const envelope = (data, filters, propertyIds, dataQuality = {}) => ({
@@ -289,16 +299,21 @@ export class AnalyticsService {
     const propertyIds = await this.resolveScope(user, filters);
     const units = await this.prisma.unit.findMany({
       where: { propertyId: { in: propertyIds } },
-      select: { id: true, status: true, tenant: { select: { id: true } } }
+      select: unitOccupancySelect
     });
-    const occupiedWithoutTenant = units.filter(unit => unit.status === 'OCCUPIED' && !unit.tenant).length;
+    const occupiedWithoutTenant = units.filter(
+      unit => unit.status === 'OCCUPIED' && unit.tenants.length === 0
+    ).length;
     return envelope(calculateOccupancy(units), filters, propertyIds, { occupiedWithoutTenant });
   }
 
   async getTenantsSummary(user, filters) {
     const propertyIds = await this.resolveScope(user, filters);
     const currentTenants = await this.prisma.tenant.count({
-      where: { unit: { propertyId: { in: propertyIds } } }
+      where: {
+        unit: { propertyId: { in: propertyIds } },
+        status: 'ACTIVE'
+      }
     });
     return envelope({ currentTenants }, filters, propertyIds, { lifecycleStatusUnavailable: true });
   }
@@ -310,9 +325,14 @@ export class AnalyticsService {
       this.openInvoices(propertyIds, filters),
       this.prisma.unit.findMany({
         where: { propertyId: { in: propertyIds } },
-        select: { id: true, status: true, tenant: { select: { id: true } } }
+        select: unitOccupancySelect
       }),
-      this.prisma.tenant.count({ where: { unit: { propertyId: { in: propertyIds } } } })
+      this.prisma.tenant.count({
+        where: {
+          unit: { propertyId: { in: propertyIds } },
+          status: 'ACTIVE'
+        }
+      })
     ]);
 
     return envelope({
@@ -321,7 +341,9 @@ export class AnalyticsService {
       tenants: { currentTenants }
     }, filters, propertyIds, {
       excludedCancelledInvoices: true,
-      occupiedWithoutTenant: units.filter(unit => unit.status === 'OCCUPIED' && !unit.tenant).length,
+      occupiedWithoutTenant: units.filter(
+        unit => unit.status === 'OCCUPIED' && unit.tenants.length === 0
+      ).length,
       lifecycleStatusUnavailable: true
     });
   }
@@ -736,6 +758,7 @@ export class AnalyticsService {
           fullName: true,
           rent: true,
           deposit: true,
+          status: true,
           createdAt: true,
           updatedAt: true,
           unit: { select: { status: true } },
@@ -751,7 +774,7 @@ export class AnalyticsService {
       }),
       this.prisma.unit.findMany({
         where: { propertyId: { in: propertyIds } },
-        select: { id: true, status: true, tenant: { select: { id: true } } }
+        select: unitOccupancySelect
       }),
       // Get all open invoices (not date filtered) to check for arrears
       this.prisma.invoice.findMany({
@@ -942,11 +965,11 @@ export class AnalyticsService {
       }),
       this.prisma.tenant.findMany({
         where: { unit: { propertyId: { in: propertyIds } } },
-        select: { id: true, unit: { select: { status: true } } }
+        select: { id: true, status: true, unit: { select: { status: true } } }
       }),
       this.prisma.unit.findMany({
         where: { propertyId: { in: propertyIds } },
-        select: { id: true, status: true, tenant: { select: { id: true } } }
+        select: unitOccupancySelect
       }),
       this.prisma.paymentReport.findMany({
         where: { 
@@ -1215,7 +1238,7 @@ export class AnalyticsService {
     const propertyIds = await this.resolveScope(user, filters);
     const rows = await this.prisma.tenant.findMany({ 
       where: { unit: { propertyId: { in: propertyIds } } }, 
-      select: { id: true, rent: true, deposit: true, paymentPolicy: true, createdAt: true, unit: { select: { property: { select: { id: true, name: true } } } } } 
+      select: { id: true, rent: true, deposit: true, paymentPolicy: true, status: true, createdAt: true, unit: { select: { property: { select: { id: true, name: true } } } } } 
     });
     const shaped = rows.map(row => ({ ...row, property: row.unit?.property }));
     const rentRoll = rows.reduce((sum, row) => sum + amount(row.rent), 0);

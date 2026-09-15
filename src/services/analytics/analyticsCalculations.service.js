@@ -330,14 +330,40 @@ export const calculateCollectionsTrend = (reports, grain) => {
 };
 
 // ========== OCCUPANCY ==========
+/**
+ * Occupancy calculation.
+ *
+ * IMPORTANT: `units` here must already be selected with the array relation:
+ *   select: { id: true, status: true, tenants: { where: { status: 'ACTIVE' }, select: { id: true } } }
+ *
+ * A unit is "occupied with tenant" when its status is OCCUPIED AND it has
+ * at least one ACTIVE tenant in `unit.tenants`. The two flags below expose
+ * data inconsistencies that used to be silently ignored.
+ */
 export const calculateOccupancy = units => {
+  const totalUnits = units.length;
   const occupiedUnits = units.filter(unit => unit.status === 'OCCUPIED').length;
   const vacantUnits = units.filter(unit => unit.status === 'VACANT').length;
-  const totalUnits = occupiedUnits + vacantUnits;
+
+  const occupiedWithTenant = units.filter(
+    unit => unit.status === 'OCCUPIED' && (unit.tenants?.length ?? 0) > 0
+  ).length;
+
+  const occupiedWithoutTenant = units.filter(
+    unit => unit.status === 'OCCUPIED' && (unit.tenants?.length ?? 0) === 0
+  ).length;
+
+  const vacantWithTenant = units.filter(
+    unit => unit.status === 'VACANT' && (unit.tenants?.length ?? 0) > 0
+  ).length;
+
   return {
     totalUnits,
     occupiedUnits,
     vacantUnits,
+    occupiedWithTenant,
+    occupiedWithoutTenant,
+    vacantWithTenant,
     occupancyRate: totalUnits > 0 ? money((occupiedUnits / totalUnits) * 100) : null
   };
 };
@@ -397,22 +423,46 @@ export const calculateBillAnalytics = (bills) => {
 };
 
 // ========== TENANT LIFECYCLE ==========
-export const calculateTenantLifecycle = (tenants, units) => {
-  const activeTenants = tenants.filter(t => t.unit?.status === 'OCCUPIED');
-  const churnedTenants = tenants.filter(t => t.unit?.status !== 'OCCUPIED' && t.createdAt);
-  
+/**
+ * Tenant lifecycle calculation.
+ *
+ * Uses the new `Tenant.status` field (`ACTIVE` / `LEFT`) instead of inferring
+ * lifecycle from `unit.status`. A unit may now have multiple tenants (past
+ * and present), so we can no longer use the unit as a proxy for the tenant's
+ * lifecycle state.
+ *
+ * `units` (when supplied) is expected to include `tenants` (array), but this
+ * function primarily relies on the `tenants` array passed in as the first arg.
+ */
+export const calculateTenantLifecycle = (tenants, units = []) => {
+  const totalTenants = tenants.length;
+  const activeTenants = tenants.filter(t => t.status === 'ACTIVE');
+  const churnedTenants = tenants.filter(t => t.status === 'LEFT');
+  const terminatedTenants = churnedTenants.length;
+
   const averageRent = activeTenants.reduce((sum, t) => sum + positive(t.rent), 0) / (activeTenants.length || 1);
-  const totalDeposits = tenants.reduce((sum, t) => sum + positive(t.deposit), 0);
-  
+  const totalDeposits = activeTenants.reduce((sum, t) => sum + positive(t.deposit), 0);
+
+  const retentionRate = totalTenants > 0
+    ? money(((totalTenants - churnedTenants.length) / totalTenants) * 100)
+    : null;
+
+  // Optional cross-check using units (useful for data-quality reporting downstream).
+  const unitsOccupiedWithoutActiveTenant = units.filter(
+    u => u.status === 'OCCUPIED' && (u.tenants?.length ?? 0) === 0
+  ).length;
+
   return {
     summary: {
-      totalTenants: tenants.length,
+      totalTenants,
       activeTenants: activeTenants.length,
-      churnedTenants: churnedTenants.length,
-      retentionRate: tenants.length > 0 ? 
-        money(((tenants.length - churnedTenants.length) / tenants.length) * 100) : null,
+      churnedTenants: terminatedTenants,
+      retentionRate,
       averageRent: money(averageRent),
       totalDeposits: money(totalDeposits)
+    },
+    dataQuality: {
+      unitsOccupiedWithoutActiveTenant
     }
   };
 };
@@ -441,6 +491,14 @@ export const calculateLeadAnalytics = (leads) => {
 };
 
 // ========== DATA QUALITY ==========
+/**
+ * Data quality calculation.
+ *
+ * `units` MUST be selected with the array relation:
+ *   select: { id: true, status: true, tenants: { where: { status: 'ACTIVE' }, select: { id: true } } }
+ *
+ * `tenants` MUST be selected with at least `{ id, status, unit: { select: { status: true } } }`.
+ */
 export const calculateDataQuality = (data) => {
   const {
     invoices = [],
@@ -452,8 +510,17 @@ export const calculateDataQuality = (data) => {
   
   return {
     orphanedInvoices: invoices.filter(i => i.status === 'PAID' && positive(i.balance) > 0).length,
-    inconsistentTenants: tenants.filter(t => t.unit?.status !== 'OCCUPIED').length,
-    orphanedUnits: units.filter(u => u.status === 'OCCUPIED' && !u.tenant).length,
+    // A tenant whose own status is ACTIVE but whose unit is not OCCUPIED (or vice versa) is inconsistent.
+    inconsistentTenants: tenants.filter(t => {
+      if (!t.unit) return true; // tenant without a unit is always inconsistent
+      const tenantActive = t.status === 'ACTIVE';
+      const unitOccupied = t.unit.status === 'OCCUPIED';
+      return tenantActive !== unitOccupied;
+    }).length,
+    // Unit marked OCCUPIED with no ACTIVE tenant attached — orphaned occupancy record.
+    orphanedUnits: units.filter(
+      u => u.status === 'OCCUPIED' && (u.tenants?.length ?? 0) === 0
+    ).length,
     missingPaymentAllocations: paymentReports.filter(p => p.invoices?.length === 0 && p.billInvoices?.length === 0).length,
     duplicateRecords: {
       invoices: findDuplicates(invoices, 'invoiceNumber'),
