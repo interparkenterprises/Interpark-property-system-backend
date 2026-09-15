@@ -2,10 +2,34 @@ import prisma from '../lib/prisma.js';
 import { generateOtherIncomeInvoiceNumber } from '../utils/invoiceHelpers.js';
 import { uploadToStorage, generateFileName } from '../utils/storage.js';
 import { uploadDocument, deleteDocument, fileExists } from '../utils/uploadHelper.js';
-import PDFDocument from 'pdfkit';
-import { Readable } from 'stream';
+import puppeteer from 'puppeteer';
+import fsSync from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
+
+// ============================================
+// MODULE-LEVEL SETUP
+// ============================================
+
+// Load letterhead once at module load
+let letterheadBase64 = '';
+try {
+  const letterheadPath = path.join(process.cwd(), 'src/letterHeads/letterhead.jpg');
+  const letterhead = fsSync.readFileSync(letterheadPath);
+  // Detect mime type from extension
+  const ext = path.extname(letterheadPath).toLowerCase();
+  const mime = ext === '.png' ? 'image/png' : 'image/jpeg';
+  letterheadBase64 = `data:${mime};base64,${letterhead.toString('base64')}`;
+} catch (err) {
+  console.warn('Letterhead not found, PDF will render without logo:', err.message);
+}
+
+// Currency formatter
+const formatCurrency = (value) =>
+  Number(value ?? 0).toLocaleString('en-KE', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 
 /**
  * Get all other incomes for a manager
@@ -487,31 +511,61 @@ export const downloadOtherIncomeInvoice = async (req, res) => {
       });
     }
 
-    // If PDF exists and is accessible, return it
+    // If PDF exists, try to serve it from disk
     if (income.pdfUrl) {
-      const pdfPath = path.join(process.cwd(), income.pdfUrl);
-      try {
-        await fs.access(pdfPath);
-        return res.download(pdfPath, `invoice-${income.invoiceNumber}.pdf`);
-      } catch (error) {
-        // If PDF doesn't exist, regenerate it
-        console.log('PDF not found, regenerating...');
+      // Use the same path resolution helper used for attachments —
+      // it correctly handles absolute URLs, /uploads/ prefixes,
+      // and falls back to alternative locations.
+      const candidates = [
+        getFullFilePath(income.pdfUrl),
+        ...getAlternativePaths(income.pdfUrl),
+      ];
+
+      for (const candidate of candidates) {
+        try {
+          await fs.access(candidate);
+          console.log('Serving existing invoice PDF from:', candidate);
+          return res.download(candidate, `invoice-${income.invoiceNumber}.pdf`);
+        } catch {
+          // try next candidate
+        }
       }
+
+      console.warn(
+        'PDF URL present in DB but file not found on disk. Regenerating...',
+        { pdfUrl: income.pdfUrl, tried: candidates }
+      );
     }
 
-    // Generate and return PDF
+    // Generate and return PDF buffer (fallback)
     const pdfBuffer = await generateOtherIncomePDFBuffer(income);
-    
+
+    // Optionally: persist the regenerated PDF so next time it's served from disk.
+    try {
+      const savedUrl = await generateOtherIncomePDF(income);
+      await prisma.otherIncome.update({
+        where: { id },
+        data: { pdfUrl: savedUrl },
+      });
+    } catch (persistErr) {
+      console.warn('Could not persist regenerated invoice PDF:', persistErr.message);
+    }
+
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=invoice-${income.invoiceNumber}.pdf`);
-    res.send(pdfBuffer);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename=invoice-${income.invoiceNumber}.pdf`
+    );
+    return res.send(pdfBuffer);
   } catch (error) {
     console.error('Error downloading invoice:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to download invoice',
-      error: error.message
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to download invoice',
+        error: error.message
+      });
+    }
   }
 };
 
@@ -1094,114 +1148,356 @@ async function generateOtherIncomePDF(income) {
   return url;
 }
 
-// Helper function to generate PDF buffer
+// ============================================
+// PDF GENERATION (HTML + Puppeteer)
+// ============================================
+
+/**
+ * Helper function to generate PDF buffer using HTML + Puppeteer.
+ * Renders a professional invoice with letterhead, centered layout, and repeating footer.
+ */
 async function generateOtherIncomePDFBuffer(income) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
-      const chunks = [];
-      
-      doc.on('data', chunk => chunks.push(chunk));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
+  const html = buildOtherIncomeInvoiceHtml(income);
+  const footerTemplate = buildOtherIncomeFooterTemplate();
 
-      // Header
-      doc.fontSize(20).text('INVOICE', { align: 'center' });
-      doc.moveDown();
-
-      // Invoice details
-      doc.fontSize(10);
-      doc.text(`Invoice Number: ${income.invoiceNumber}`, { align: 'right' });
-      doc.text(`Date: ${new Date(income.issueDate).toLocaleDateString()}`, { align: 'right' });
-      if (income.dueDate) {
-        doc.text(`Due Date: ${new Date(income.dueDate).toLocaleDateString()}`, { align: 'right' });
-      }
-      doc.moveDown();
-
-      // Bill To
-      doc.fontSize(12).text('Bill To:', { underline: true });
-      doc.fontSize(10);
-      doc.text(income.clientName);
-      if (income.clientCompany) doc.text(income.clientCompany);
-      if (income.clientAddress) doc.text(income.clientAddress);
-      if (income.clientEmail) doc.text(`Email: ${income.clientEmail}`);
-      if (income.clientPhone) doc.text(`Phone: ${income.clientPhone}`);
-      doc.moveDown();
-
-      // Invoice items
-      const tableTop = doc.y;
-      doc.fontSize(10);
-      
-      // Table headers
-      const headers = ['Description', 'Amount', 'VAT', 'Total'];
-      const colWidths = [250, 100, 80, 100];
-      const xPositions = [50, 300, 400, 480];
-      
-      doc.font('Helvetica-Bold');
-      headers.forEach((header, i) => {
-        doc.text(header, xPositions[i], tableTop, { width: colWidths[i] });
-      });
-      
-      doc.moveDown();
-      const lineY = doc.y;
-      doc.moveTo(50, lineY).lineTo(550, lineY).stroke();
-      doc.moveDown();
-      
-      // Item row
-      doc.font('Helvetica');
-      const desc = income.description || income.title;
-      doc.text(desc, 50, doc.y, { width: 250 });
-      doc.text(`KES ${income.amount.toFixed(2)}`, 300, doc.y, { width: 100, align: 'right' });
-      
-      const vatText = income.vatType !== 'NOT_APPLICABLE' 
-        ? `${income.vatRate}% (KES ${(income.vatAmount || 0).toFixed(2)})`
-        : 'N/A';
-      doc.text(vatText, 400, doc.y, { width: 80 });
-      doc.text(`KES ${income.totalAmount.toFixed(2)}`, 480, doc.y, { width: 100, align: 'right' });
-      
-      doc.moveDown(2);
-      
-      // Total
-      const totalY = doc.y;
-      doc.moveTo(350, totalY).lineTo(550, totalY).stroke();
-      doc.moveDown();
-      
-      doc.font('Helvetica-Bold');
-      doc.text('Total Amount:', 350, doc.y, { width: 100, align: 'right' });
-      doc.text(`KES ${income.totalAmount.toFixed(2)}`, 480, doc.y, { width: 100, align: 'right' });
-      
-      // VAT Summary
-      if (income.vatType !== 'NOT_APPLICABLE') {
-        doc.moveDown();
-        doc.font('Helvetica');
-        doc.fontSize(9);
-        doc.text(`VAT (${income.vatRate}%): KES ${(income.vatAmount || 0).toFixed(2)}`, 350, doc.y, { align: 'right' });
-        doc.text(`VAT Type: ${income.vatType}`, 350, doc.y, { align: 'right' });
-      }
-      
-      doc.moveDown(2);
-      
-      // Payment Information
-      if (income.bankName || income.accountName) {
-        doc.fontSize(10).text('Payment Information:', { underline: true });
-        if (income.bankName) doc.text(`Bank: ${income.bankName}`);
-        if (income.accountName) doc.text(`Account Name: ${income.accountName}`);
-        if (income.accountNumber) doc.text(`Account Number: ${income.accountNumber}`);
-        if (income.branch) doc.text(`Branch: ${income.branch}`);
-        if (income.bankCode) doc.text(`Bank Code: ${income.bankCode}`);
-        if (income.swiftCode) doc.text(`SWIFT Code: ${income.swiftCode}`);
-      }
-      
-      doc.moveDown();
-      
-      // Footer
-      doc.fontSize(8);
-      doc.text('Thank you for your business!', { align: 'center' });
-      doc.text(`Generated by ${income.manager?.name || 'System'}`, { align: 'center' });
-
-      doc.end();
-    } catch (error) {
-      reject(error);
-    }
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      displayHeaderFooter: true,
+      headerTemplate: '<div></div>', // empty header (letterhead is in body)
+      footerTemplate,
+      margin: {
+        top: '20px',
+        bottom: '80px',   // reserve space for footer
+        left: '40px',
+        right: '40px',
+      },
+    });
+
+    return Buffer.from(pdfBuffer);
+  } finally {
+    await browser.close();
+  }
+}
+
+/**
+ * Build the HTML template for an Other Income invoice.
+ * Uses a letterhead image, centered content, and a clean table layout.
+ */
+function buildOtherIncomeInvoiceHtml(income) {
+  const issueDate = income.issueDate
+    ? new Date(income.issueDate).toLocaleDateString('en-KE')
+    : '-';
+  const dueDate = income.dueDate
+    ? new Date(income.dueDate).toLocaleDateString('en-KE')
+    : '-';
+
+  const hasVat = income.vatType && income.vatType !== 'NOT_APPLICABLE';
+  const vatLabel = hasVat
+    ? `VAT (${income.vatRate ?? 0}% - ${income.vatType})`
+    : 'VAT';
+
+  const statusColor =
+    income.status === 'PAID'
+      ? '#16a34a'
+      : income.status === 'OVERDUE'
+      ? '#dc2626'
+      : '#f59e0b';
+
+  const bankDetails = [
+    income.bankName && `<p><strong>Bank:</strong> ${income.bankName}</p>`,
+    income.accountName && `<p><strong>Account Name:</strong> ${income.accountName}</p>`,
+    income.accountNumber && `<p><strong>Account Number:</strong> ${income.accountNumber}</p>`,
+    income.branch && `<p><strong>Branch:</strong> ${income.branch}</p>`,
+    income.bankCode && `<p><strong>Bank Code:</strong> ${income.bankCode}</p>`,
+    income.swiftCode && `<p><strong>SWIFT Code:</strong> ${income.swiftCode}</p>`,
+  ]
+    .filter(Boolean)
+    .join('');
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 13px;
+    color: #333;
+    margin: 0;
+    padding: 0;
+  }
+  .letterhead {
+    width: 100%;
+    text-align: center;
+    margin-bottom: 20px;
+  }
+  .letterhead img {
+    max-width: 100%;
+    max-height: 130px;
+    object-fit: contain;
+  }
+  .title {
+    text-align: center;
+    font-size: 28px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    color: #004f79;
+    margin: 20px 0 5px 0;
+  }
+  .subtitle {
+    text-align: center;
+    font-size: 13px;
+    color: #64748b;
+    margin-bottom: 25px;
+  }
+  .divider {
+    border: none;
+    border-top: 2px solid #004f79;
+    margin: 15px 0 25px 0;
+  }
+  .meta {
+    width: 100%;
+    margin: 0 auto 25px auto;
+    text-align: center;
+  }
+  .meta table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .meta td {
+    padding: 6px 10px;
+    text-align: center;
+    font-size: 12px;
+  }
+  .meta .label {
+    color: #64748b;
+    font-weight: bold;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+  }
+  .status {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 4px;
+    background: ${statusColor};
+    color: #fff;
+    font-weight: bold;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+  }
+  .bill-to {
+    text-align: center;
+    margin: 25px 0;
+    padding: 18px 20px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+  }
+  .bill-to .heading {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #64748b;
+    margin-bottom: 8px;
+  }
+  .bill-to .name {
+    font-size: 16px;
+    font-weight: bold;
+    color: #1e293b;
+    margin-bottom: 4px;
+  }
+  .bill-to p {
+    margin: 3px 0;
+    font-size: 12px;
+    color: #475569;
+  }
+  table.items {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+  }
+  table.items thead th {
+    background: #004f79;
+    color: #fff;
+    padding: 12px 10px;
+    font-size: 12px;
+    text-align: left;
+    letter-spacing: 0.5px;
+  }
+  table.items thead th.center { text-align: center; }
+  table.items thead th.right { text-align: right; }
+  table.items tbody td {
+    padding: 12px 10px;
+    border: 1px solid #e2e8f0;
+    font-size: 12px;
+    vertical-align: top;
+  }
+  table.items tbody td.center { text-align: center; }
+  table.items tbody td.right { text-align: right; }
+  table.items tfoot td {
+    padding: 10px;
+    border: 1px solid #e2e8f0;
+    font-size: 12px;
+  }
+  table.items tfoot td.right { text-align: right; }
+  table.items tfoot tr.grand-total td {
+    background: #004f79;
+    color: #fff;
+    font-weight: bold;
+    font-size: 14px;
+    padding: 12px 10px;
+  }
+  .bank {
+    margin-top: 35px;
+    padding: 18px 22px;
+    background: #f8fafc;
+    border-left: 4px solid #004f79;
+    border-radius: 4px;
+  }
+  .bank h3 {
+    margin: 0 0 10px 0;
+    font-size: 14px;
+    color: #004f79;
+    letter-spacing: 0.5px;
+  }
+  .bank p {
+    margin: 4px 0;
+    font-size: 12px;
+    color: #334155;
+  }
+  .notes {
+    margin-top: 25px;
+    padding: 15px 18px;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #78350f;
+    text-align: center;
+  }
+  .notes strong { display: block; margin-bottom: 5px; }
+</style>
+</head>
+<body>
+
+  ${letterheadBase64 ? `
+    <div class="letterhead">
+      <img src="${letterheadBase64}" alt="Letterhead">
+    </div>
+  ` : ''}
+
+  <div class="title">INVOICE</div>
+  <div class="subtitle">${income.category ? income.category.replace(/_/g, ' ') : 'Other Income'}</div>
+
+  <hr class="divider">
+
+  <div class="meta">
+    <table>
+      <tr>
+        <td class="label">Invoice No</td>
+        <td class="label">Issue Date</td>
+        <td class="label">Due Date</td>
+        <td class="label">Status</td>
+      </tr>
+      <tr>
+        <td><strong>${income.invoiceNumber ?? '-'}</strong></td>
+        <td>${issueDate}</td>
+        <td>${dueDate}</td>
+        <td><span class="status">${income.status ?? 'UNPAID'}</span></td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="bill-to">
+    <div class="heading">Bill To</div>
+    <div class="name">${income.clientName ?? '-'}</div>
+    ${income.clientCompany ? `<p>${income.clientCompany}</p>` : ''}
+    ${income.clientAddress ? `<p>${income.clientAddress}</p>` : ''}
+    ${income.clientEmail ? `<p>Email: ${income.clientEmail}</p>` : ''}
+    ${income.clientPhone ? `<p>Phone: ${income.clientPhone}</p>` : ''}
+  </div>
+
+  <table class="items">
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th class="center">Qty</th>
+        <th class="right">Amount (${income.currency || 'KES'})</th>
+        <th class="right">VAT</th>
+        <th class="right">Total</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>
+          <strong>${income.title ?? '-'}</strong>
+          ${income.description ? `<br><span style="color:#64748b;font-size:11px;">${income.description}</span>` : ''}
+        </td>
+        <td class="center">1</td>
+        <td class="right">${formatCurrency(income.amount)}</td>
+        <td class="right">${hasVat ? formatCurrency(income.vatAmount) : 'N/A'}</td>
+        <td class="right">${formatCurrency(income.totalAmount)}</td>
+      </tr>
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="4" class="right"><strong>Subtotal</strong></td>
+        <td class="right">${formatCurrency(income.amount)}</td>
+      </tr>
+      <tr>
+        <td colspan="4" class="right"><strong>${vatLabel}</strong></td>
+        <td class="right">${hasVat ? formatCurrency(income.vatAmount) : '0.00'}</td>
+      </tr>
+      <tr class="grand-total">
+        <td colspan="4" class="right">TOTAL DUE</td>
+        <td class="right"> ${formatCurrency(income.totalAmount)}</td>
+      </tr>
+    </tfoot>
+  </table>
+
+  ${bankDetails ? `
+    <div class="bank">
+      <h3>Payment Details</h3>
+      ${bankDetails}
+    </div>
+  ` : ''}
+
+  ${income.description ? `
+    <div class="notes">
+      <strong>Notes</strong>
+      ${income.description}
+    </div>
+  ` : ''}
+
+</body>
+</html>
+  `;
+}
+
+/**
+ * Puppeteer footerTemplate for Other Income invoices.
+ * Renders on every printed page via page.pdf({ displayHeaderFooter: true, footerTemplate }).
+ * Must be self-contained inline CSS.
+ */
+function buildOtherIncomeFooterTemplate() {
+  return `
+<div style="font-size:9px; color:#777; width:100%; text-align:center; padding:0 40px; font-family:Arial,Helvetica,sans-serif; border-top:1px solid #cbd5e1; padding-top:6px;">
+  <strong style="color:#004f79;">INTERPARK PROPERTY MANAGEMENT</strong><br>
+  Property Management Solutions
+  &nbsp;&middot;&nbsp; Page <span class="pageNumber"></span> of <span class="totalPages"></span>
+</div>
+  `;
 }
