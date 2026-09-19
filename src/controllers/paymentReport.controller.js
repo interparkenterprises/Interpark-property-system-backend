@@ -4236,7 +4236,7 @@ export const downloadPaymentReceipt = async (req, res) => {
 };
 
 // @desc    Get arrears for a property
-// @route   GET /api/payments/arrears/:propertyId
+// @route   GET /api/payments/arrears/:propertyId?tenantStatus=ACTIVE|LEFT|ALL
 // @access  Private (requires VIEW_ARREARS permission)
 export async function getPropertyArrears(req, res) {
   try {
@@ -4244,43 +4244,100 @@ export async function getPropertyArrears(req, res) {
     const userRole = req.user.role;
     const { propertyId } = req.params;
 
+    // =============================================
+    // NEW: tenantStatus query param (ACTIVE | LEFT | ALL)
+    // =============================================
+    const tenantStatusParam = (req.query.tenantStatus || 'ACTIVE').toUpperCase();
+    const allowedStatuses = ['ACTIVE', 'LEFT', 'ALL'];
+
+    if (!allowedStatuses.includes(tenantStatusParam)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid tenantStatus. Allowed values: ${allowedStatuses.join(', ')}`
+      });
+    }
+
     if (!propertyId) {
       return res.status(400).json({ error: 'Property ID is required' });
     }
 
+    // =============================================
+    // Permission checks
+    // =============================================
     if (userRole !== 'ADMIN') {
       const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
       if (!canView) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view arrears for this property' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view arrears for this property'
         });
       }
-      
+
       const hasArrearsPermission = await permissionService.hasPermission(
-        userId, 
-        'VIEW_ARREARS', 
+        userId,
+        'VIEW_ARREARS',
         propertyId
       );
-      
+
       if (!hasArrearsPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view arrears' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view arrears'
         });
       }
+
+      // =============================================
+      // NEW: Only ADMIN (or MANAGER with explicit permission) can query LEFT/ALL
+      // Non-admin users default to ACTIVE-only
+      // =============================================
+      if (tenantStatusParam !== 'ACTIVE') {
+        const canQueryFormerTenants =
+          userRole === 'MANAGER'
+            ? await permissionService.hasPermission(userId, 'VIEW_FORMER_TENANT_ARREARS', propertyId)
+            : await permissionService.hasPermission(userId, 'VIEW_FORMER_TENANT_ARREARS', propertyId);
+
+        // Fallback: if the permission doesn't exist yet in your system, allow MANAGER
+        // (Remove this fallback once you add VIEW_FORMER_TENANT_ARREARS to your Permission table)
+        const isManagerFallback = userRole === 'MANAGER';
+
+        if (!canQueryFormerTenants && !isManagerFallback) {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have permission to view former tenant arrears'
+          });
+        }
+      }
     }
+
+    // =============================================
+    // Build tenant filter based on tenantStatusParam
+    // =============================================
+    // tenantFilter is used BOTH for:
+    //   1. The unit-level `some` filter (ensure unit has matching tenants)
+    //   2. The `include.tenants.where` filter (load only matching tenants)
+    //
+    // When 'ALL' -> {} (no filter, match any tenant)
+    // When 'ACTIVE' -> { status: 'ACTIVE' }
+    // When 'LEFT' -> { status: 'LEFT' }
+    // =============================================
+    const tenantFilter =
+      tenantStatusParam === 'ALL'
+        ? {}
+        : { status: tenantStatusParam };
 
     const units = await prisma.unit.findMany({
       where: {
         propertyId: propertyId,
-        status: 'OCCUPIED',
-        tenant: {
-          isNot: null
+        // Note: keep status OCCUPIED for ACTIVE, but for LEFT/ALL we should NOT
+        // restrict to OCCUPIED because a unit may be vacant after a tenant left.
+        ...(tenantStatusParam === 'ACTIVE' ? { status: 'OCCUPIED' } : {}),
+        tenants: {
+          some: tenantFilter
         }
       },
       include: {
-        tenant: {
+        tenants: {
+          where: tenantFilter,
           include: {
             invoices: {
               where: {
@@ -4317,111 +4374,138 @@ export async function getPropertyArrears(req, res) {
       }
     });
 
+    // =============================================
+    // Process units -> tenants -> invoices
+    // =============================================
     const arrearsData = [];
 
     for (const unit of units) {
-      if (!unit.tenant) continue;
+      for (const tenant of unit.tenants) {
+        const creditBalance = await getTenantCreditBalance(prisma, tenant.id);
 
-      const tenant = unit.tenant;
-      
-      const creditBalance = await getTenantCreditBalance(prisma, tenant.id);
-      
-      // =============================================
-      // FIXED: Only include invoices with balance > 0
-      // =============================================
-      for (const invoice of tenant.invoices) {
-        // CRITICAL FIX: Only include invoices with balance > 0
-        const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
-        
-        // Use small epsilon to avoid floating point issues
-        if (balance > 0.01) {
-          arrearsData.push({
-            id: `invoice-${invoice.id}`,
-            tenantId: tenant.id,
-            tenantName: tenant.fullName,
-            tenantContact: tenant.contact,
-            unitType: unit.type || 'Unit',
-            unitNo: unit.unitNo || 'N/A',
-            floor: unit.floor || 'N/A',
-            invoiceNumber: invoice.invoiceNumber,
-            invoiceType: 'RENT',
-            expectedAmount: invoice.totalDue,
-            paidAmount: invoice.amountPaid,
-            balance: balance,
-            dueDate: invoice.dueDate,
-            status: invoice.status,
-            description: `Rent for ${unit.property.name} - ${unit.type || 'Unit'} ${unit.unitNo || ''}`,
-            invoiceId: invoice.id,
-            paymentPeriod: invoice.paymentPeriod,
-            hasCreditBalance: creditBalance > 0,
-            creditBalance: creditBalance,
-            isFullyPaid: false, // Not fully paid since balance > 0
-            daysOverdue: Math.max(0, Math.ceil((new Date() - new Date(invoice.dueDate)) / (1000 * 60 * 60 * 24)))
-          });
+        // Include tenant's status so frontend can distinguish ACTIVE vs LEFT
+        const tenantStatus = tenant.status;
+
+        // =============================================
+        // Rent invoices
+        // =============================================
+        for (const invoice of tenant.invoices) {
+          const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
+
+          if (balance > 0.01) {
+            arrearsData.push({
+              id: `invoice-${invoice.id}`,
+              tenantId: tenant.id,
+              tenantName: tenant.fullName,
+              tenantContact: tenant.contact,
+              tenantStatus, // NEW: expose tenant status
+              unitType: unit.type || 'Unit',
+              unitNo: unit.unitNo || 'N/A',
+              floor: unit.floor || 'N/A',
+              invoiceNumber: invoice.invoiceNumber,
+              invoiceType: 'RENT',
+              expectedAmount: invoice.totalDue,
+              paidAmount: invoice.amountPaid,
+              balance: balance,
+              dueDate: invoice.dueDate,
+              status: invoice.status,
+              description: `Rent for ${unit.property.name} - ${unit.type || 'Unit'} ${unit.unitNo || ''}`,
+              invoiceId: invoice.id,
+              paymentPeriod: invoice.paymentPeriod,
+              hasCreditBalance: creditBalance > 0,
+              creditBalance: creditBalance,
+              isFullyPaid: false,
+              daysOverdue: Math.max(
+                0,
+                Math.ceil((new Date() - new Date(invoice.dueDate)) / (1000 * 60 * 60 * 24))
+              )
+            });
+          }
         }
-      }
 
-      // =============================================
-      // FIXED: Only include bill invoices with balance > 0
-      // =============================================
-      for (const billInvoice of tenant.billInvoices) {
-        const balance = billInvoice.balance || (billInvoice.grandTotal - billInvoice.amountPaid);
-        
-        if (balance > 0.01) {
-          arrearsData.push({
-            id: `bill-invoice-${billInvoice.id}`,
-            tenantId: tenant.id,
-            tenantName: tenant.fullName,
-            tenantContact: tenant.contact,
-            unitType: unit.type || 'Unit',
-            unitNo: unit.unitNo || 'N/A',
-            floor: unit.floor || 'N/A',
-            invoiceNumber: billInvoice.invoiceNumber,
-            invoiceType: 'BILL',
-            billType: billInvoice.billType,
-            expectedAmount: billInvoice.grandTotal,
-            paidAmount: billInvoice.amountPaid,
-            balance: balance,
-            dueDate: billInvoice.dueDate,
-            status: billInvoice.status,
-            description: `${billInvoice.billType} charge - ${billInvoice.billReferenceNumber || ''}`,
-            billInvoiceId: billInvoice.id,
-            billReferenceNumber: billInvoice.billReferenceNumber,
-            isFullyPaid: false,
-            daysOverdue: Math.max(0, Math.ceil((new Date() - new Date(billInvoice.dueDate)) / (1000 * 60 * 60 * 24)))
-          });
+        // =============================================
+        // Bill invoices (water/electricity)
+        // =============================================
+        for (const billInvoice of tenant.billInvoices) {
+          const balance =
+            billInvoice.balance || (billInvoice.grandTotal - billInvoice.amountPaid);
+
+          if (balance > 0.01) {
+            arrearsData.push({
+              id: `bill-invoice-${billInvoice.id}`,
+              tenantId: tenant.id,
+              tenantName: tenant.fullName,
+              tenantContact: tenant.contact,
+              tenantStatus, // NEW: expose tenant status
+              unitType: unit.type || 'Unit',
+              unitNo: unit.unitNo || 'N/A',
+              floor: unit.floor || 'N/A',
+              invoiceNumber: billInvoice.invoiceNumber,
+              invoiceType: 'BILL',
+              billType: billInvoice.billType,
+              expectedAmount: billInvoice.grandTotal,
+              paidAmount: billInvoice.amountPaid,
+              balance: balance,
+              dueDate: billInvoice.dueDate,
+              status: billInvoice.status,
+              description: `${billInvoice.billType} charge - ${billInvoice.billReferenceNumber || ''}`,
+              billInvoiceId: billInvoice.id,
+              billReferenceNumber: billInvoice.billReferenceNumber,
+              isFullyPaid: false,
+              daysOverdue: Math.max(
+                0,
+                Math.ceil((new Date() - new Date(billInvoice.dueDate)) / (1000 * 60 * 60 * 24))
+              )
+            });
+          }
         }
       }
     }
 
-    // Sort arrears by due date (oldest first) and then by balance
+    // =============================================
+    // Sort: oldest due date first, then largest balance
+    // =============================================
     arrearsData.sort((a, b) => {
       const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
       if (dateDiff !== 0) return dateDiff;
       return b.balance - a.balance;
     });
 
+    // =============================================
+    // Summary calculations
+    // =============================================
     const totalArrears = arrearsData.reduce((sum, item) => sum + item.balance, 0);
     const totalExpected = arrearsData.reduce((sum, item) => sum + item.expectedAmount, 0);
     const totalPaid = arrearsData.reduce((sum, item) => sum + item.paidAmount, 0);
-    const totalCreditAvailable = arrearsData.reduce((sum, item) => sum + (item.creditBalance || 0), 0);
-    
-    // Calculate summary statistics
+    const totalCreditAvailable = arrearsData.reduce(
+      (sum, item) => sum + (item.creditBalance || 0),
+      0
+    );
+
     const totalInvoices = arrearsData.length;
-    const rentInvoices = arrearsData.filter(item => item.invoiceType === 'RENT').length;
-    const billInvoices = arrearsData.filter(item => item.invoiceType === 'BILL').length;
-    
-    // Categorize by overdue days
+    const rentInvoices = arrearsData.filter((item) => item.invoiceType === 'RENT').length;
+    const billInvoices = arrearsData.filter((item) => item.invoiceType === 'BILL').length;
+
+    // =============================================
+    // NEW: Per-status breakdown (helps when tenantStatus=ALL)
+    // =============================================
+    const activeArrears = arrearsData.filter((item) => item.tenantStatus === 'ACTIVE');
+    const leftArrears = arrearsData.filter((item) => item.tenantStatus === 'LEFT');
+
+    const activeArrearsTotal = activeArrears.reduce((sum, item) => sum + item.balance, 0);
+    const leftArrearsTotal = leftArrears.reduce((sum, item) => sum + item.balance, 0);
+
     const overdueCategories = {
-      '0-30': arrearsData.filter(item => item.daysOverdue <= 30).length,
-      '31-60': arrearsData.filter(item => item.daysOverdue > 30 && item.daysOverdue <= 60).length,
-      '61-90': arrearsData.filter(item => item.daysOverdue > 60 && item.daysOverdue <= 90).length,
-      '91+': arrearsData.filter(item => item.daysOverdue > 90).length
+      '0-30': arrearsData.filter((item) => item.daysOverdue <= 30).length,
+      '31-60': arrearsData.filter((item) => item.daysOverdue > 30 && item.daysOverdue <= 60).length,
+      '61-90': arrearsData.filter((item) => item.daysOverdue > 60 && item.daysOverdue <= 90).length,
+      '91+': arrearsData.filter((item) => item.daysOverdue > 90).length
     };
 
     return res.status(200).json({
       success: true,
       data: {
+        tenantStatusFilter: tenantStatusParam, // echo back what was queried
         arrears: arrearsData,
         summary: {
           totalArrears: parseFloat(totalArrears.toFixed(2)),
@@ -4431,21 +4515,38 @@ export async function getPropertyArrears(req, res) {
           itemCount: totalInvoices,
           rentInvoices: rentInvoices,
           billInvoices: billInvoices,
-          tenantsWithCredit: arrearsData.filter(item => item.hasCreditBalance).length,
+          tenantsWithCredit: arrearsData.filter((item) => item.hasCreditBalance).length,
           overdueCategories: overdueCategories,
-          averageOverdueDays: totalInvoices > 0 
-            ? parseFloat((arrearsData.reduce((sum, item) => sum + item.daysOverdue, 0) / totalInvoices).toFixed(0))
-            : 0
+          averageOverdueDays:
+            totalInvoices > 0
+              ? parseFloat(
+                  (
+                    arrearsData.reduce((sum, item) => sum + item.daysOverdue, 0) /
+                    totalInvoices
+                  ).toFixed(0)
+                )
+              : 0,
+
+          // NEW: split between active and left tenant arrears
+          byTenantStatus: {
+            active: {
+              itemCount: activeArrears.length,
+              totalArrears: parseFloat(activeArrearsTotal.toFixed(2))
+            },
+            left: {
+              itemCount: leftArrears.length,
+              totalArrears: parseFloat(leftArrearsTotal.toFixed(2))
+            }
+          }
         }
       }
     });
-
   } catch (error) {
     console.error('Error fetching property arrears:', error);
-    return res.status(500).json({ 
+    return res.status(500).json({
       success: false,
       message: 'Failed to fetch arrears data',
-      details: error.message 
+      details: error.message
     });
   }
 }
