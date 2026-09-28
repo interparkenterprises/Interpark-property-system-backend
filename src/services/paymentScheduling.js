@@ -70,6 +70,49 @@ const getMonthStart = (date) => {
   return d;
 };
 
+// =============================================
+// ✅ NEW: Robust period parsing helper
+// =============================================
+/**
+ * Parse an invoice/payment period string into a "YYYY-MM" key.
+ * Handles:
+ *   - ISO date strings ("2026-09-28T16:30:49.818Z")
+ *   - "Month YYYY" ("May 2026")
+ *   - "Month YYYY - Month YYYY" ("May 2026 - July 2026")
+ *   - Direct Date instances
+ * Returns null if it can't be parsed.
+ */
+const parsePeriodToMonthKey = (paymentPeriod) => {
+  if (!paymentPeriod) return null;
+
+  // If already a Date, use it
+  if (paymentPeriod instanceof Date && !isNaN(paymentPeriod.getTime())) {
+    return getMonthStart(paymentPeriod).toISOString().slice(0, 7);
+  }
+
+  // Try ISO / directly-parseable date string first
+  const iso = new Date(paymentPeriod);
+  if (!isNaN(iso.getTime())) {
+    return getMonthStart(iso).toISOString().slice(0, 7);
+  }
+
+  // Match "Month YYYY - ..." or "Month YYYY"
+  const match = String(paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
+  if (match) {
+    const monthNames = [
+      'january','february','march','april','may','june',
+      'july','august','september','october','november','december'
+    ];
+    const mIdx = monthNames.indexOf(match[1].toLowerCase());
+    if (mIdx >= 0) {
+      const d = new Date(parseInt(match[2], 10), mIdx, 1);
+      return getMonthStart(d).toISOString().slice(0, 7);
+    }
+  }
+
+  return null;
+};
+
 /**
  * Add billing period while preserving the day of month
  */
@@ -118,7 +161,7 @@ const calculateGracePeriodEnd = (dueDate, paymentPolicy, rentStartDate, periodIn
 /**
  * Calculate the next payment due date based on payment history and policy
  * UPDATED: Now checks invoice status for accurate outstanding balance
- * and handles prepaid periods correctly
+ * and handles prepaid periods correctly (with month-range matching).
  */
 export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const { paymentPolicy, rentStart } = tenant;
@@ -126,15 +169,15 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const currentDateEndOfDay = setToEndOfDay(today);
   const rentStartDate = setToStartOfDay(new Date(rentStart));
   const policyMonths = getPolicyMonths(paymentPolicy);
-  
+
   const rentInfo = calculateEscalatedRent(tenant);
   const monthlyRent = rentInfo.currentRent;
-  
+
   const totalDueResult = calculateTotalDuePerPeriodWithWithholding(tenant, monthlyRent, paymentPolicy);
   const totalDuePerPeriod = totalDueResult.totalDueWithWithholding;
   const totalDueWithoutWithholding = totalDueResult.totalDueWithoutWithholding;
   const totalWithheld = totalDueResult.totalWithheld;
-  
+
   if (rentStartDate > currentDateEndOfDay) {
     const nextDueDate = setToEndOfDay(rentStartDate);
     const gracePeriodEnd = calculateGracePeriodEnd(nextDueDate, paymentPolicy, rentStartDate, 0);
@@ -168,25 +211,25 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
     };
   }
-  
+
   const sortedPayments = [...paymentReports].sort((a, b) => new Date(a.datePaid) - new Date(b.datePaid));
   let lastPaymentDate = null;
   let paymentsMade = 0;
-  
+
   const nonCreditPayments = sortedPayments.filter(p => p.status !== 'CREDIT');
   if (nonCreditPayments.length > 0) {
     lastPaymentDate = new Date(nonCreditPayments[nonCreditPayments.length - 1].datePaid);
     paymentsMade = nonCreditPayments.length;
   }
-  
+
   const invoices = tenant.invoices || [];
-  
+
   // =============================================
-  // FIXED: Identify prepaid periods
+  // Identify prepaid periods
   // =============================================
   const prepaidReports = nonCreditPayments.filter(p => p.status === 'PREPAID');
   const prepaidPeriods = new Set();
-  
+
   for (const prepaid of prepaidReports) {
     if (prepaid.paymentPeriod) {
       try {
@@ -200,47 +243,41 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
     }
   }
-  
+
   // =============================================
-  // FIXED: Build invoice period map
+  // ✅ Range-based prepaid matcher
+  // A prepaid report stored as "2026-11-30T21:00:00.000Z" (Dec 2026 start)
+  // covers all months Dec 2026 – Feb 2027 for QUARTERLY tenants.
+  // =============================================
+  const isMonthCoveredByPrepaid = (monthStart, policyMonthsLocal) => {
+    if (!prepaidPeriods || prepaidPeriods.size === 0) return false;
+    const check = new Date(monthStart);
+    for (const prepaidKey of prepaidPeriods) {
+      const start = new Date(prepaidKey);
+      const end = new Date(start.getFullYear(), start.getMonth() + policyMonthsLocal, 1);
+      if (check >= start && check < end) return true;
+    }
+    return false;
+  };
+
+  // =============================================
+  // Build invoice period map
   // =============================================
   let totalOutstandingFromInvoices = 0;
   let unpaidInvoicesCount = 0;
   let partialInvoicesCount = 0;
   let paidInvoicesCount = 0;
-  let invoicePeriods = {};
-  
+  const invoicePeriods = {};
+
   for (const invoice of invoices) {
-    // Parse the payment period string
-    let periodKey = null;
-    if (invoice.paymentPeriod) {
-      try {
-        const periodDate = new Date(invoice.paymentPeriod + " 1");
-        if (!isNaN(periodDate.getTime())) {
-          periodKey = periodDate.toISOString().slice(0, 7);
-        } else {
-          const fallbackDate = new Date(invoice.paymentPeriod);
-          if (!isNaN(fallbackDate.getTime())) {
-            periodKey = fallbackDate.toISOString().slice(0, 7);
-          }
-        }
-      } catch (e) {
-        try {
-          const fallbackDate = new Date(invoice.paymentPeriod);
-          if (!isNaN(fallbackDate.getTime())) {
-            periodKey = fallbackDate.toISOString().slice(0, 7);
-          }
-        } catch (e2) {
-          console.warn(`Could not parse paymentPeriod: ${invoice.paymentPeriod}`);
-        }
-      }
-    }
-    
-    // =============================================
-    // FIXED: Skip invoices for prepaid periods when calculating outstanding
-    // =============================================
-    const isPrepaidPeriod = periodKey && prepaidPeriods.has(periodKey);
-    
+    // ✅ FIX: robust parser handles "May 2026 - July 2026", ISO, and "May 2026"
+    const periodKey = parsePeriodToMonthKey(invoice.paymentPeriod);
+
+    // ✅ Range-based prepaid check
+    const isPrepaidPeriod = periodKey
+      ? isMonthCoveredByPrepaid(new Date(periodKey + '-01T00:00:00Z'), policyMonths)
+      : false;
+
     if (invoice.status === 'PAID') {
       paidInvoicesCount++;
       if (periodKey) {
@@ -256,11 +293,9 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
       continue;
     } else if (invoice.status === 'PARTIAL') {
-      // Only count partial invoices that actually have a balance
       const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
-      
+
       if (isPrepaidPeriod) {
-        // Prepaid period - treat as paid regardless of status
         paidInvoicesCount++;
         if (periodKey) {
           invoicePeriods[periodKey] = {
@@ -275,9 +310,8 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
         }
         continue;
       }
-      
+
       if (balance <= 0.01) {
-        // Balance is effectively zero, treat as paid
         paidInvoicesCount++;
         if (periodKey) {
           invoicePeriods[periodKey] = {
@@ -307,7 +341,6 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
     } else if (invoice.status === 'UNPAID' || invoice.status === 'OVERDUE') {
       if (isPrepaidPeriod) {
-        // Prepaid period - treat as paid regardless of status
         paidInvoicesCount++;
         if (periodKey) {
           invoicePeriods[periodKey] = {
@@ -322,19 +355,18 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
         }
         continue;
       }
-      
+
       // Check if this is a future period that shouldn't be counted yet
       let isFuturePeriod = false;
       if (periodKey) {
-        const periodDate = new Date(periodKey);
+        const periodDate = new Date(periodKey + '-01T00:00:00Z');
         const todayStart = setToStartOfDay(today);
         if (periodDate > todayStart) {
           isFuturePeriod = true;
         }
       }
-      
+
       if (isFuturePeriod) {
-        // Future period - don't count as outstanding yet
         paidInvoicesCount++;
         if (periodKey) {
           invoicePeriods[periodKey] = {
@@ -366,61 +398,44 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
     }
   }
-  
+
   const monthsSinceStart = calculateMonthsDifference(rentStartDate, today);
   const expectedPayments = Math.max(0, Math.floor(monthsSinceStart / policyMonths));
-  
+
   // =============================================
-  // FIXED: Process payment periods
+  // Process payment periods
   // =============================================
   const periodPayments = {};
   const periodTotalDue = {};
   let totalPaidAllPeriods = 0;
-  
+
   const paymentPeriods = nonCreditPayments.filter(p => p.paymentPeriod && p.status !== 'PREPAID');
-  
+
   paymentPeriods.forEach(payment => {
-    let periodKey = null;
-    if (payment.paymentPeriod) {
-      try {
-        const paymentDate = new Date(payment.paymentPeriod + " 1");
-        if (!isNaN(paymentDate.getTime())) {
-          const monthStart = getMonthStart(paymentDate);
-          periodKey = monthStart.toISOString();
-        }
-      } catch (e) {
-        try {
-          const paymentDate = new Date(payment.paymentPeriod);
-          if (!isNaN(paymentDate.getTime())) {
-            const monthStart = getMonthStart(paymentDate);
-            periodKey = monthStart.toISOString();
-          }
-        } catch (e2) {
-          // Ignore
-        }
-      }
+    // ✅ FIX: robust parser
+    const monthKey = parsePeriodToMonthKey(payment.paymentPeriod);
+    if (!monthKey) return;
+
+    const periodKey = new Date(monthKey + '-01T00:00:00Z').toISOString();
+
+    if (!periodPayments[periodKey]) {
+      periodPayments[periodKey] = 0;
     }
-    
-    if (periodKey) {
-      if (!periodPayments[periodKey]) {
-        periodPayments[periodKey] = 0;
-      }
-      periodPayments[periodKey] += payment.amountPaid || 0;
-      totalPaidAllPeriods += payment.amountPaid || 0;
-      
-      if (payment.totalDue && !periodTotalDue[periodKey]) {
-        periodTotalDue[periodKey] = parseFloat(payment.totalDue.toFixed(2));
-      }
+    periodPayments[periodKey] += payment.amountPaid || 0;
+    totalPaidAllPeriods += payment.amountPaid || 0;
+
+    if (payment.totalDue && !periodTotalDue[periodKey]) {
+      periodTotalDue[periodKey] = parseFloat(payment.totalDue.toFixed(2));
     }
   });
-  
+
   // Handle payments without period (legacy)
   const paymentsWithoutPeriod = nonCreditPayments.filter(p => !p.paymentPeriod || p.status === 'PREPAID');
   let legacyTotalPaid = 0;
   paymentsWithoutPeriod.forEach(p => {
     legacyTotalPaid += p.amountPaid || 0;
   });
-  
+
   if (legacyTotalPaid > 0) {
     const firstPeriodKey = getMonthStart(rentStartDate).toISOString();
     if (!periodPayments[firstPeriodKey]) {
@@ -429,10 +444,10 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     periodPayments[firstPeriodKey] += legacyTotalPaid;
     totalPaidAllPeriods += legacyTotalPaid;
   }
-  
+
   const periodKeys = Object.keys(periodTotalDue);
   let actualTotalDuePerPeriod = totalDuePerPeriod;
-  
+
   if (periodKeys.length > 0) {
     const reportedTotalDue = periodTotalDue[periodKeys[0]];
     if (reportedTotalDue > 0) {
@@ -445,40 +460,37 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
     }
   }
-  
+
   actualTotalDuePerPeriod = parseFloat(actualTotalDuePerPeriod.toFixed(2));
-  
+
   const periodsSinceStart = Math.max(0, Math.floor(monthsSinceStart / policyMonths));
   const totalPeriodsToCheck = Math.max(periodsSinceStart + 24, 36);
-  
+
   const allPeriods = [];
-  
+
   // Build all periods and determine which are fully paid
   for (let i = 0; i < totalPeriodsToCheck; i++) {
     const periodDate = new Date(rentStartDate);
     periodDate.setMonth(periodDate.getMonth() + (i * policyMonths));
     const periodMonthStart = getMonthStart(periodDate);
     const periodKey = periodMonthStart.toISOString();
-    
+
     const periodEnd = new Date(periodMonthStart);
     periodEnd.setMonth(periodEnd.getMonth() + policyMonths);
     periodEnd.setDate(periodEnd.getDate() - 1);
     periodEnd.setHours(23, 59, 59, 999);
-    
+
     const periodMonthKey = periodMonthStart.toISOString().slice(0, 7);
     const invoiceForPeriod = invoicePeriods[periodMonthKey];
-    
-    // =============================================
-    // FIXED: Check if this period is prepaid
-    // =============================================
-    const isPrepaid = prepaidPeriods.has(periodKey);
-    
+
+    // ✅ Range-based prepaid check
+    const isPrepaid = isMonthCoveredByPrepaid(periodMonthStart, policyMonths);
+
     let amountPaid = periodPayments[periodKey] || 0;
     let isFullyPaid = false;
     let remainingBalance = actualTotalDuePerPeriod;
-    
+
     if (isPrepaid) {
-      // Prepaid period - fully paid
       isFullyPaid = true;
       remainingBalance = 0;
       amountPaid = actualTotalDuePerPeriod;
@@ -519,14 +531,13 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
         remainingBalance = actualTotalDuePerPeriod - amountPaid;
       }
     }
-    
-    // Round to avoid floating point issues
+
     remainingBalance = parseFloat(remainingBalance.toFixed(2));
     if (Math.abs(remainingBalance) < 0.01) {
       remainingBalance = 0;
       isFullyPaid = true;
     }
-    
+
     allPeriods.push({
       index: i,
       startDate: new Date(periodMonthStart),
@@ -541,42 +552,38 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       isPrepaid: isPrepaid
     });
   }
-  
+
   // Process periods and carry over payments
   let carryOverAmount = 0;
   let fullyPaidPeriods = 0;
   let firstUnpaidPeriodIndex = -1;
-  
+
   for (let i = 0; i < allPeriods.length; i++) {
     const period = allPeriods[i];
     const invoiceForPeriod = invoicePeriods[period.monthKey];
-    
-    // If prepaid, it's fully paid
+
     if (period.isPrepaid) {
       period.isFullyPaid = true;
       period.remainingBalance = 0;
       fullyPaidPeriods++;
       continue;
     }
-    
-    // If there's a PAID invoice, it's fully paid
+
     if (invoiceForPeriod && invoiceForPeriod.status === 'PAID') {
       period.isFullyPaid = true;
       period.remainingBalance = 0;
       fullyPaidPeriods++;
       continue;
     }
-    
-    // If already marked as fully paid, count it
+
     if (period.isFullyPaid) {
       fullyPaidPeriods++;
       continue;
     }
-    
-    // Check if payments cover this period
+
     const totalAvailable = period.amountPaid + carryOverAmount;
     const periodDue = period.remainingBalance || actualTotalDuePerPeriod;
-    
+
     if (totalAvailable >= periodDue) {
       period.isFullyPaid = true;
       period.remainingBalance = 0;
@@ -591,62 +598,46 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       }
     }
   }
-  
+
   // =============================================
-  // FIXED: Calculate payments behind (excluding prepaid)
+  // Calculate payments behind (excluding prepaid)
   // =============================================
   let paymentsBehind = 0;
   const periodsToCheck = Math.min(periodsSinceStart, allPeriods.length);
-  
+
   for (let i = 0; i < periodsToCheck; i++) {
     const period = allPeriods[i];
     const invoiceForPeriod = invoicePeriods[period.monthKey];
-    
-    // Skip prepaid periods
-    if (period.isPrepaid) {
-      continue;
-    }
-    
-    // If there's a PAID invoice, it's not behind
-    if (invoiceForPeriod && invoiceForPeriod.status === 'PAID') {
-      continue;
-    }
-    
+
+    if (period.isPrepaid) continue;
+    if (invoiceForPeriod && invoiceForPeriod.status === 'PAID') continue;
+
     if (!period.isFullyPaid) {
       paymentsBehind++;
     }
   }
-  
+
   // =============================================
-  // FIXED: Determine the next due date
+  // Determine the next due date
   // =============================================
   let nextDueDate;
   let nextPeriodIndex = 0;
   let foundUnpaid = false;
-  
-  // Find the first unpaid period (excluding prepaid)
+
   for (let i = 0; i < allPeriods.length; i++) {
     const period = allPeriods[i];
     const invoiceForPeriod = invoicePeriods[period.monthKey];
-    
-    // Skip prepaid periods
-    if (period.isPrepaid) {
-      continue;
-    }
-    
-    // Skip periods with PAID invoices
-    if (invoiceForPeriod && invoiceForPeriod.status === 'PAID') {
-      continue;
-    }
-    
+
+    if (period.isPrepaid) continue;
+    if (invoiceForPeriod && invoiceForPeriod.status === 'PAID') continue;
+
     if (!period.isFullyPaid) {
       nextPeriodIndex = i;
       foundUnpaid = true;
       break;
     }
   }
-  
-  // If no unpaid period found, the next due date is the next period after the last fully paid period
+
   if (!foundUnpaid) {
     const nextDate = new Date(rentStartDate);
     const fullyPaidCount = fullyPaidPeriods;
@@ -657,71 +648,54 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     nextDate.setMonth(nextDate.getMonth() + (nextPeriodIndex * policyMonths));
     nextDueDate = setToEndOfDay(nextDate);
   }
-  
+
   // =============================================
-  // FIXED: Determine if the tenant is overdue (excluding prepaid)
+  // Determine if the tenant is overdue (excluding prepaid)
   // =============================================
   let isOverdue = false;
   let isInGracePeriod = false;
   let gracePeriodEnd = null;
-  
+
   const currentDateMidnight = setToStartOfDay(today);
   const dueDateMidnight = setToStartOfDay(nextDueDate);
-  
-  // Calculate grace period end for the next due date
+
   gracePeriodEnd = calculateGracePeriodEnd(
     nextDueDate,
     paymentPolicy,
     rentStartDate,
     nextPeriodIndex
   );
-  
+
   const gracePeriodEndMidnight = setToStartOfDay(gracePeriodEnd);
-  
-  // Check if the current date is past the grace period end
+
   isOverdue = currentDateMidnight > gracePeriodEndMidnight;
   isInGracePeriod = !isOverdue && currentDateMidnight > dueDateMidnight;
-  
+
   // =============================================
-  // FIXED: Calculate the ACTUAL outstanding balance (excluding prepaid)
+  // Calculate the ACTUAL outstanding balance (excluding prepaid)
   // =============================================
   let actualOutstandingBalance = 0;
-  
-  // Add up balances from invoices that are NOT for prepaid periods
+
   for (const invoice of invoices) {
-    let periodKey = null;
-    if (invoice.paymentPeriod) {
-      try {
-        const periodDate = new Date(invoice.paymentPeriod + " 1");
-        if (!isNaN(periodDate.getTime())) {
-          periodKey = getMonthStart(periodDate).toISOString();
-        }
-      } catch (e) {
-        // Ignore
-      }
-    }
-    
-    // Skip if this invoice is for a prepaid period
-    if (periodKey && prepaidPeriods.has(periodKey)) {
+    // ✅ FIX: robust parser
+    const monthKey = parsePeriodToMonthKey(invoice.paymentPeriod);
+    const periodKey = monthKey ? new Date(monthKey + '-01T00:00:00Z').toISOString() : null;
+
+    // ✅ Range-based prepaid check
+    if (periodKey && isMonthCoveredByPrepaid(new Date(periodKey), policyMonths)) {
       continue;
     }
-    
-    // Skip paid invoices
-    if (invoice.status === 'PAID') {
-      continue;
-    }
-    
-    // For partial invoices, add the balance
+
+    if (invoice.status === 'PAID') continue;
+
     if (invoice.status === 'PARTIAL') {
       const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
       if (balance > 0.01) {
         actualOutstandingBalance += balance;
       }
     }
-    
-    // For unpaid invoices, add the total due (only if not future)
+
     if (invoice.status === 'UNPAID' || invoice.status === 'OVERDUE') {
-      // Check if this is a future period
       let isFuturePeriod = false;
       if (periodKey) {
         const periodDate = new Date(periodKey);
@@ -730,19 +704,17 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
           isFuturePeriod = true;
         }
       }
-      
       if (!isFuturePeriod) {
         actualOutstandingBalance += invoice.totalDue;
       }
     }
   }
-  
-  // Round the outstanding balance
+
   actualOutstandingBalance = parseFloat(actualOutstandingBalance.toFixed(2));
   if (Math.abs(actualOutstandingBalance) < 0.01) {
     actualOutstandingBalance = 0;
   }
-  
+
   // =============================================
   // Calculate time remaining
   // =============================================
@@ -790,17 +762,14 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
       };
     }
   }
-  
+
   let remainingBalanceForNextPeriod = 0;
   if (foundUnpaid && nextPeriodIndex < allPeriods.length) {
     remainingBalanceForNextPeriod = allPeriods[nextPeriodIndex].remainingBalance;
   } else {
     remainingBalanceForNextPeriod = 0;
   }
-  
-  // =============================================
-  // Return the corrected payment info
-  // =============================================
+
   return {
     nextDueDate,
     gracePeriodEnd,
@@ -820,7 +789,6 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
     remainingBalanceForNextPeriod,
     carryOverAmount,
     isRentStarted: true,
-    // FIXED: Include the corrected outstanding balance
     actualOutstandingBalance: actualOutstandingBalance,
     prepaidPeriods: Array.from(prepaidPeriods),
     invoiceSummary: {
@@ -1004,34 +972,50 @@ export const calculateOverdueStatus = (dueDate, currentDate, paymentPolicy, rent
 };
 
 /**
- * Get payment summary for a tenant (UPDATED - properly handles PAID invoices and prepaid periods)
+ * Get payment summary for a tenant
+ * UPDATED: Uses range-based prepaid matching so prepaid reports
+ * are correctly applied even when their month starts don't exactly
+ * align with the tenant's policy-aligned period keys.
  */
 export const getPaymentSummary = (tenant) => {
   const paymentReports = tenant.paymentReports || [];
   const invoices = tenant.invoices || [];
   const monthlyRent = calculateEscalatedRent(tenant).currentRent;
-  
+
   // Get the next payment info which now includes withholding tax
   const nextPaymentInfo = calculateNextPaymentDue(tenant, paymentReports);
   const currentPeriod = getCurrentBillingPeriod(new Date(), tenant);
-  
+
   // Calculate total paid (excluding CREDIT records)
   const nonCreditPayments = paymentReports.filter(p => p.status !== 'CREDIT');
   const totalPaid = nonCreditPayments.reduce((sum, payment) => sum + payment.amountPaid, 0);
   const policyMonths = getPolicyMonths(tenant.paymentPolicy);
-  
+
   // Use the total due per period from nextPaymentInfo (already includes withholding tax)
   const totalDuePerPeriod = nextPaymentInfo.totalDuePerPeriod || 0;
   const totalDueWithoutWithholding = nextPaymentInfo.totalDueWithoutWithholding || 0;
   const totalWithheld = nextPaymentInfo.totalWithheld || 0;
-  
-  // =============================================
-  // FIXED: Use the ACTUAL outstanding balance from nextPaymentInfo
-  // =============================================
+
+  // Use the ACTUAL outstanding balance from nextPaymentInfo
   const outstandingBalance = nextPaymentInfo.actualOutstandingBalance || 0;
-  
+
   // =============================================
-  // FIXED: Calculate from INVOICES (source of truth)
+  // ✅ Range-based prepaid matcher (shared with calculateNextPaymentDue)
+  // =============================================
+  const prepaidPeriodKeys = nextPaymentInfo.prepaidPeriods || [];
+  const isMonthCoveredByPrepaid = (monthStart) => {
+    if (!prepaidPeriodKeys || prepaidPeriodKeys.length === 0) return false;
+    const check = new Date(monthStart);
+    for (const prepaidKey of prepaidPeriodKeys) {
+      const start = new Date(prepaidKey);
+      const end = new Date(start.getFullYear(), start.getMonth() + policyMonths, 1);
+      if (check >= start && check < end) return true;
+    }
+    return false;
+  };
+
+  // =============================================
+  // Calculate from INVOICES (source of truth)
   // =============================================
   let totalExpectedFromInvoices = 0;
   let totalPaidFromInvoices = 0;
@@ -1039,84 +1023,68 @@ export const getPaymentSummary = (tenant) => {
   let partialInvoices = 0;
   let unpaidInvoices = 0;
   let overdueInvoices = 0;
-  
+
   const today = new Date();
   const todayStart = setToStartOfDay(today);
-  
+
   for (const invoice of invoices) {
-    // Use invoice's own tracking (most accurate)
     const invoiceTotal = invoice.totalDue || 0;
     const invoicePaid = invoice.amountPaid || 0;
     const invoiceBalance = invoice.balance || (invoiceTotal - invoicePaid);
-    
+
     totalExpectedFromInvoices += invoiceTotal;
     totalPaidFromInvoices += invoicePaid;
-    
+
+    // ✅ FIX: use robust parser for prepaid check
+    let isPrepaid = false;
+    const monthKey = parsePeriodToMonthKey(invoice.paymentPeriod);
+    if (monthKey) {
+      isPrepaid = isMonthCoveredByPrepaid(new Date(monthKey + '-01T00:00:00Z'));
+    }
+
     if (invoice.status === 'PAID') {
       fullyPaidInvoices++;
       continue;
     } else if (invoice.status === 'PARTIAL') {
-      partialInvoices++;
-      // Only count as outstanding if balance > 0.01
-      if (invoiceBalance > 0.01) {
-        // Check if this invoice is for a prepaid period
-        let isPrepaid = false;
-        if (invoice.paymentPeriod) {
-          try {
-            const periodDate = new Date(invoice.paymentPeriod + " 1");
-            if (!isNaN(periodDate.getTime())) {
-              const periodKey = getMonthStart(periodDate).toISOString();
-              if (nextPaymentInfo.prepaidPeriods && 
-                  nextPaymentInfo.prepaidPeriods.includes(periodKey)) {
-                isPrepaid = true;
-              }
-            }
-          } catch (e) {
-            // Ignore
-          }
-        }
-        
-        if (!isPrepaid && new Date(invoice.dueDate) < today) {
+      if (isPrepaid) {
+        // Prepaid period → treat as paid
+        fullyPaidInvoices++;
+        continue;
+      }
+
+      if (invoiceBalance <= 0.01) {
+        fullyPaidInvoices++;
+      } else {
+        partialInvoices++;
+        if (new Date(invoice.dueDate) < today) {
           overdueInvoices++;
         }
-      } else {
-        // Balance is effectively zero, treat as paid
-        fullyPaidInvoices++;
       }
     } else if (invoice.status === 'UNPAID') {
-      unpaidInvoices++;
-      
-      // Check if this is a prepaid period
-      let isPrepaid = false;
-      if (invoice.paymentPeriod) {
-        try {
-          const periodDate = new Date(invoice.paymentPeriod + " 1");
-          if (!isNaN(periodDate.getTime())) {
-            const periodKey = getMonthStart(periodDate).toISOString();
-            if (nextPaymentInfo.prepaidPeriods && 
-                nextPaymentInfo.prepaidPeriods.includes(periodKey)) {
-              isPrepaid = true;
-            }
-          }
-        } catch (e) {
-          // Ignore
-        }
+      if (isPrepaid) {
+        // Prepaid period → treat as paid
+        fullyPaidInvoices++;
+        continue;
       }
-      
-      if (!isPrepaid && new Date(invoice.dueDate) < today) {
+      unpaidInvoices++;
+      if (new Date(invoice.dueDate) < today) {
         overdueInvoices++;
       }
     } else if (invoice.status === 'OVERDUE') {
+      if (isPrepaid) {
+        fullyPaidInvoices++;
+        continue;
+      }
       overdueInvoices++;
     }
   }
-  
+
   // =============================================
-  // FIXED: Determine status
+  // Determine status
   // =============================================
   let status = 'UP_TO_DATE';
   const rentStartStart = setToStartOfDay(new Date(tenant.rentStart));
-  
+
   if (rentStartStart > todayStart) {
     status = 'NOT_STARTED';
   } else if (overdueInvoices > 0) {
@@ -1136,14 +1104,13 @@ export const getPaymentSummary = (tenant) => {
   } else {
     status = 'UP_TO_DATE';
   }
-  
+
   // =============================================
-  // FIXED: Check for "final paid" payment reports
+  // Check for "final paid" payment reports
   // =============================================
   const finalPaidReports = [];
   for (const report of paymentReports) {
     if (report.status === 'PARTIAL') {
-      // Check if all linked invoices are fully paid
       const linkedInvoices = invoices.filter(inv => inv.paymentReportId === report.id);
       if (linkedInvoices.length > 0) {
         const allFullyPaid = linkedInvoices.every(inv => inv.status === 'PAID');
@@ -1158,7 +1125,7 @@ export const getPaymentSummary = (tenant) => {
       }
     }
   }
-  
+
   // =============================================
   // Build the final summary
   // =============================================
@@ -1167,9 +1134,9 @@ export const getPaymentSummary = (tenant) => {
     policyMonths,
     monthlyRent,
     paymentAmountPerPeriod: calculatePaymentByPolicy(monthlyRent, tenant.paymentPolicy),
-    totalDuePerPeriod: totalDuePerPeriod,
-    totalDueWithoutWithholding: totalDueWithoutWithholding,
-    totalWithheld: totalWithheld,
+    totalDuePerPeriod,
+    totalDueWithoutWithholding,
+    totalWithheld,
     withholdingBreakdown: nextPaymentInfo.withholdingBreakdown,
     invoiceStatus: {
       fullyPaid: fullyPaidInvoices,
@@ -1199,23 +1166,22 @@ export const getPaymentSummary = (tenant) => {
       periodEndFormatted: currentPeriod.periodEnd.toLocaleDateString()
     },
     paymentHistory: {
-      // Use invoice data as source of truth
       totalPaid: parseFloat(totalPaidFromInvoices.toFixed(2)),
       totalExpected: parseFloat(totalExpectedFromInvoices.toFixed(2)),
       outstandingBalance: parseFloat(outstandingBalance.toFixed(2)),
       paymentsMade: nonCreditPayments.length,
       expectedPaymentsCount: nextPaymentInfo.expectedPayments || 0,
       lastPaymentDate: nextPaymentInfo.lastPaymentDate,
-      lastPaymentDateFormatted: nextPaymentInfo.lastPaymentDate ? 
-        nextPaymentInfo.lastPaymentDate.toLocaleDateString() : null,
-      lastPaymentDateTime: nextPaymentInfo.lastPaymentDate ? 
-        nextPaymentInfo.lastPaymentDate.toLocaleString() : null
+      lastPaymentDateFormatted: nextPaymentInfo.lastPaymentDate
+        ? nextPaymentInfo.lastPaymentDate.toLocaleDateString()
+        : null,
+      lastPaymentDateTime: nextPaymentInfo.lastPaymentDate
+        ? nextPaymentInfo.lastPaymentDate.toLocaleString()
+        : null
     },
-    // Include reconciliation data for transparency
     reconciliation: {
       prepaidPeriods: nextPaymentInfo.prepaidPeriods || [],
       finalPaidReports: finalPaidReports,
-      // Count of payment reports that appear as PARTIAL but are effectively paid
       finalPaidCount: finalPaidReports.length
     },
     status,
