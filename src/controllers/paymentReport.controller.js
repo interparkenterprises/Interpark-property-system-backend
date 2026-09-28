@@ -921,6 +921,36 @@ async function canViewPaymentsForProperty(userId, userRole, propertyId) {
   return permissionService.checkPermission(userId, 'paymentReport', 'view', propertyId);
 }
 
+// ============================================
+// SAFE SCALAR EXTRACTION HELPER
+// ============================================
+/**
+ * Safely convert a possibly object, possibly scalar field into a plain number.
+ *
+ * computeExpectedChargesForPolicy() returns objects like:
+ *   rent: { amount, monthly, vatType, ... }
+ *   serviceCharge: { amount, monthly, exclusiveAmount, ... }
+ *   vat: { total, monthlyTotal, rent, serviceCharge, ... }
+ *
+ * But PaymentReport.rent / serviceCharge / vat are Prisma Float? scalars.
+ * This helper flattens either shape into a number, preserving 0 correctly.
+ *
+ * @param {*} value - The value to convert (object | number | string | null | undefined)
+ * @param {string} objectKey - The key to read from the object (default 'amount')
+ * @returns {number} - A finite number (0 if the value cannot be parsed)
+ */
+function toScalarNumber(value, objectKey = 'amount') {
+  if (value === null || value === undefined) return 0;
+
+  if (typeof value === 'object') {
+    const inner = value[objectKey];
+    const n = Number(inner);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
 // ======================================================
 // PAYMENT REPORT CRUD OPERATIONS WITH PERMISSIONS
 // ======================================================
@@ -2294,12 +2324,12 @@ export const getOutstandingInvoices = async (req, res) => {
 // @access  Private (ADMIN, MANAGER, or USER with RECORD_PAYMENTS permission)
 export const createPaymentReport = async (req, res) => {
   let transactionResult = null;
-  
+
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
-    const { 
-      tenantId, 
+    const {
+      tenantId,
       amountPaid,
       invoiceIds = [],
       notes,
@@ -2310,16 +2340,16 @@ export const createPaymentReport = async (req, res) => {
     } = req.body;
 
     if (!tenantId) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'tenantId is required' 
+      return res.status(400).json({
+        success: false,
+        message: 'tenantId is required'
       });
     }
 
     if (amountPaid == null || isNaN(amountPaid) || parseFloat(amountPaid) < 0) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Valid non-negative amountPaid is required' 
+      return res.status(400).json({
+        success: false,
+        message: 'Valid non-negative amountPaid is required'
       });
     }
 
@@ -2331,11 +2361,11 @@ export const createPaymentReport = async (req, res) => {
         unit: {
           include: {
             property: {
-              select: { 
-                id: true, 
-                name: true, 
+              select: {
+                id: true,
+                name: true,
                 managerId: true,
-                commissionFee: true 
+                commissionFee: true
               }
             }
           }
@@ -2345,9 +2375,9 @@ export const createPaymentReport = async (req, res) => {
     });
 
     if (!tenant) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Tenant not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Tenant not found'
       });
     }
 
@@ -2356,22 +2386,22 @@ export const createPaymentReport = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canRecordPayment = await canManagePaymentForProperty(userId, userRole, propertyId);
       if (!canRecordPayment) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to record payments for this property' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to record payments for this property'
         });
       }
-      
+
       const hasRecordPermission = await permissionService.hasPermission(
-        userId, 
-        'RECORD_PAYMENTS', 
+        userId,
+        'RECORD_PAYMENTS',
         propertyId
       );
-      
+
       if (!hasRecordPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to record payments' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to record payments'
         });
       }
     }
@@ -2380,9 +2410,9 @@ export const createPaymentReport = async (req, res) => {
     if (paymentPeriod) {
       paymentPeriodDate = new Date(paymentPeriod);
       if (isNaN(paymentPeriodDate.getTime())) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Invalid paymentPeriod date format' 
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid paymentPeriod date format'
         });
       }
     }
@@ -2398,9 +2428,9 @@ export const createPaymentReport = async (req, res) => {
     let invoicesToProcess = [];
     let totalInvoiceBalance = 0;
     let paymentPolicy = tenant.paymentPolicy;
-    let paymentPeriodStr = paymentPeriodDate ? 
-      paymentPeriodDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 
-      new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    let paymentPeriodStr = paymentPeriodDate
+      ? paymentPeriodDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+      : new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 
     // =============================================
     // Get invoices to process
@@ -2427,7 +2457,7 @@ export const createPaymentReport = async (req, res) => {
       totalInvoiceBalance = invoicesToProcess.reduce((sum, inv) => sum + inv.balance, 0);
       paymentPolicy = invoicesToProcess[0].paymentPolicy || tenant.paymentPolicy;
       paymentPeriodStr = invoicesToProcess[0].paymentPeriod || paymentPeriodStr;
-      
+
       console.log(`Processing ${invoicesToProcess.length} selected invoices with total balance: ${totalInvoiceBalance}`);
     } else {
       invoicesToProcess = await prisma.invoice.findMany({
@@ -2441,7 +2471,7 @@ export const createPaymentReport = async (req, res) => {
       });
 
       totalInvoiceBalance = invoicesToProcess.reduce((sum, inv) => sum + inv.balance, 0);
-      
+
       if (invoicesToProcess.length === 0) {
         if (createMissingInvoices) {
           const expected = await computeExpectedChargesForPolicy(
@@ -2449,25 +2479,19 @@ export const createPaymentReport = async (req, res) => {
             paymentPeriodDate,
             tenant.paymentPolicy || 'MONTHLY'
           );
-          
+
           const invoiceNumber = await generateInvoiceNumber();
-          
-          const rentAmount = typeof expected.rent === 'object' 
-            ? expected.rent.amount || expected.rent.monthly || 0
-            : expected.rent || 0;
-          
-          const serviceChargeAmount = typeof expected.serviceCharge === 'object'
-            ? expected.serviceCharge.amount || expected.serviceCharge.monthly || 0
-            : expected.serviceCharge || 0;
-          
-          const vatAmount = typeof expected.vat === 'object'
-            ? expected.vat.total || expected.vat.monthlyTotal || 0
-            : expected.vat || 0;
-          
-          const totalDueAmount = expected.totalDue || 0;
-          const totalDueWithoutWithholding = expected.totalDueWithoutWithholding || totalDueAmount;
-          const totalWithheld = expected.withholdingTax?.totalWithheld || 0;
-          
+
+          // SAFE SCALAR EXTRACTION (was the `||` object-fallback bug)
+          const rentAmount = toScalarNumber(expected.rent, 'amount');
+          const serviceChargeAmount = toScalarNumber(expected.serviceCharge, 'amount');
+          const vatAmount = toScalarNumber(expected.vat, 'total');
+          const totalDueAmount = toScalarNumber(expected.totalDue);
+
+          const totalDueWithoutWithholding =
+            toScalarNumber(expected.totalDueWithoutWithholding) || totalDueAmount;
+          const totalWithheld = toScalarNumber(expected.withholdingTax?.totalWithheld);
+
           const newInvoice = await prisma.invoice.create({
             data: {
               invoiceNumber,
@@ -2486,11 +2510,11 @@ export const createPaymentReport = async (req, res) => {
               notes: `Auto-generated ${(tenant.paymentPolicy || 'MONTHLY')} invoice. ` +
                      `Original amount without withholding: ${totalDueWithoutWithholding.toFixed(2)}, ` +
                      `Withholding tax: ${totalWithheld.toFixed(2)}. ` +
-                     `Monthly equivalent: ${expected.monthlyEquivalent?.toFixed(2) || totalDueAmount.toFixed(2)}` +
+                     `Monthly equivalent: ${Number(expected.monthlyEquivalent ?? totalDueAmount).toFixed(2)}` +
                      (expected.withholdingTax?.isExempt ? ' (Tenant exempt from withholding tax)' : '')
             }
           });
-          
+
           invoicesToProcess = [newInvoice];
           totalInvoiceBalance = totalDueAmount;
           paymentPeriodStr = newInvoice.paymentPeriod;
@@ -2514,7 +2538,7 @@ export const createPaymentReport = async (req, res) => {
     }
 
     const totalAvailable = parsedAmountPaid + existingCredit;
-    
+
     let overpaymentAmount = 0;
     let commissionBaseAmount = 0;
     let actualPaymentForCurrentPeriod = parsedAmountPaid;
@@ -2523,7 +2547,7 @@ export const createPaymentReport = async (req, res) => {
       overpaymentAmount = totalAvailable - totalInvoiceBalance;
       commissionBaseAmount = Math.min(totalInvoiceBalance, parsedAmountPaid);
       actualPaymentForCurrentPeriod = Math.max(0, totalInvoiceBalance - existingCredit);
-      
+
       console.log(`Overpayment detected: ${overpaymentAmount}`);
       console.log(`Commission base amount: ${commissionBaseAmount}`);
     } else {
@@ -2571,22 +2595,24 @@ export const createPaymentReport = async (req, res) => {
       if (creditUsed > 0) paymentNotes.push(`Applied Ksh ${creditUsed.toFixed(2)} from credit balance`);
       if (overpaymentAmount > 0) paymentNotes.push(`Overpayment: Ksh ${overpaymentAmount.toFixed(2)}`);
 
-      // Calculate totals from invoices
+      // =============================================
+      // Compute scalar totals from invoices (always numbers)
+      // =============================================
       const totalRent = invoicesToProcess.reduce((sum, inv) => {
         const rentValue = typeof inv.rent === 'number' ? inv.rent : 0;
         return sum + rentValue;
       }, 0);
-      
+
       const totalServiceCharge = invoicesToProcess.reduce((sum, inv) => {
         const scValue = typeof inv.serviceCharge === 'number' ? inv.serviceCharge : 0;
         return sum + scValue;
       }, 0);
-      
+
       const totalVat = invoicesToProcess.reduce((sum, inv) => {
         const vatValue = typeof inv.vat === 'number' ? inv.vat : 0;
         return sum + vatValue;
       }, 0);
-      
+
       const totalDue = invoicesToProcess.reduce((sum, inv) => {
         const dueValue = typeof inv.totalDue === 'number' ? inv.totalDue : 0;
         return sum + dueValue;
@@ -2601,7 +2627,7 @@ export const createPaymentReport = async (req, res) => {
           totalDue: totalDue,
           amountPaid: totalAvailable,
           arrears: Math.max(0, totalInvoiceBalance - totalAvailable),
-          status: totalAvailable >= totalInvoiceBalance ? 'PAID' : 
+          status: totalAvailable >= totalInvoiceBalance ? 'PAID' :
                   totalAvailable > 0 ? 'PARTIAL' : 'UNPAID',
           paymentPeriod: paymentPeriodDate || new Date(),
           datePaid: new Date(),
@@ -2622,10 +2648,10 @@ export const createPaymentReport = async (req, res) => {
           totalAvailable,
           report.id,
           paymentPeriodDate || new Date(),
-          totalAvailable >= totalInvoiceBalance ? 'PAID' : 
+          totalAvailable >= totalInvoiceBalance ? 'PAID' :
             totalAvailable > 0 ? 'PARTIAL' : 'UNPAID'
         );
-        
+
         if (invoiceUpdateResult.updatedInvoices.length > 0) {
           updatedInvoices.push(...invoiceUpdateResult.updatedInvoices.map(inv => ({
             ...inv,
@@ -2633,9 +2659,9 @@ export const createPaymentReport = async (req, res) => {
             selectionType: 'AUTO_PERIOD_MATCH'
           })));
         }
-        
+
         remainingPayment = invoiceUpdateResult.remainingPayment;
-        
+
         console.log(`Auto-updated ${invoiceUpdateResult.updatedInvoices.length} invoices for period ${paymentPeriodStr}, applied ${invoiceUpdateResult.totalApplied}`);
       } else {
         remainingPayment = totalAvailable;
@@ -2643,10 +2669,10 @@ export const createPaymentReport = async (req, res) => {
 
       let overpaymentRecords = [];
       let remainingOverpayment = overpaymentAmount;
-      
+
       if (overpaymentAmount > 0 && handleOverpayment) {
         console.log(`Handling overpayment of ${overpaymentAmount} with FIFO allocation`);
-        
+
         const otherUnpaidInvoices = await tx.invoice.findMany({
           where: {
             tenantId: tenantId,
@@ -2662,13 +2688,13 @@ export const createPaymentReport = async (req, res) => {
 
         for (const invoice of otherUnpaidInvoices) {
           if (remainingOverpayment <= 0) break;
-          
+
           const paymentToApply = Math.min(invoice.balance, remainingOverpayment);
           if (paymentToApply > 0) {
             const newAmountPaid = invoice.amountPaid + paymentToApply;
             const newBalance = invoice.balance - paymentToApply;
             let newStatus = invoice.status;
-            
+
             if (newBalance <= 0.01) {
               newStatus = 'PAID';
             } else if (paymentToApply > 0) {
@@ -2727,24 +2753,38 @@ export const createPaymentReport = async (req, res) => {
             remainingOverpayment,
             currentPolicyCharges.totalDue
           );
-          
+
           let futureDate = new Date(
             currentPolicyCharges.periodStart.getFullYear(),
             currentPolicyCharges.periodStart.getMonth(),
             1
           );
-          
+
           for (let i = 1; i <= periods; i++) {
             futureDate = addBillingPeriod(futureDate, paymentPolicy);
             const expected = await computeExpectedChargesForPolicy(tenantId, futureDate, paymentPolicy);
-            
+
+            // =============================================
+            // SAFE SCALAR EXTRACTION — THIS IS THE FIX
+            // =============================================
+            // `expected.rent`, `expected.serviceCharge`, and `expected.vat`
+            // are OBJECTS from computeExpectedChargesForPolicy().
+            // PaymentReport columns expect Float scalars.
+            // Using `||` previously caused `0` to fall through to the object.
+            // =============================================
+            const safeRent = toScalarNumber(expected.rent, 'amount');
+            const safeServiceCharge = toScalarNumber(expected.serviceCharge, 'amount');
+            const safeVat = toScalarNumber(expected.vat, 'total');
+            const safeTotalDue = toScalarNumber(expected.totalDue);
+            const safeWithheld = toScalarNumber(expected.withholdingTax?.totalWithheld);
+
             const futureReport = await tx.paymentReport.create({
               data: {
                 tenantId,
-                rent: expected.rent.amount || expected.rent || 0,
-                serviceCharge: expected.serviceCharge.amount || expected.serviceCharge || 0,
-                vat: expected.vat.total || expected.vat || 0,
-                totalDue: expected.totalDue,
+                rent: safeRent,
+                serviceCharge: safeServiceCharge,
+                vat: safeVat,
+                totalDue: safeTotalDue,
                 amountPaid: 0,
                 arrears: 0,
                 status: 'PREPAID',
@@ -2752,19 +2792,19 @@ export const createPaymentReport = async (req, res) => {
                 datePaid: new Date(),
                 notes: `Covered by overpayment from ${paymentPeriodStr}. Prepaid ${paymentPolicy} period: ${expected.paymentPeriodLabel}. ` +
                        `Original payment: ${parsedAmountPaid}. ` +
-                       `Withholding tax applied: ${expected.withholdingTax?.totalWithheld?.toFixed(2) || '0.00'}`
+                       `Withholding tax applied: ${safeWithheld.toFixed(2)}`
               }
             });
-            
+
             overpaymentRecords.push({
               type: 'PREPAID_PERIOD',
               period: expected.paymentPeriodLabel,
               reportId: futureReport.id,
-              amountCovered: expected.totalDue,
+              amountCovered: safeTotalDue,
               commissionApplicable: false
             });
           }
-          
+
           if (remainder > 0) {
             await updateTenantCreditBalance(tx, tenantId, remainder);
             overpaymentRecords.push({
@@ -2773,37 +2813,34 @@ export const createPaymentReport = async (req, res) => {
               commissionApplicable: false
             });
           }
-          
+
           console.log(`Created ${periods} prepaid ${paymentPolicy} records, credit balance: ${remainder}`);
         }
       }
 
       // =============================================
-      // FIXED: Process invoices with proper status updates
+      // Process invoices with proper status updates
       // =============================================
       const newlyPaidInvoiceIds = [];
-      
+
       for (const invoice of invoicesToProcess) {
         if (remainingPayment <= 0) break;
-        
+
         const alreadyUpdated = invoiceUpdateResult?.updatedInvoices?.find(
           ui => ui.id === invoice.id
         );
-        
+
         if (alreadyUpdated) {
           continue;
         }
-        
+
         const paymentToApply = Math.min(invoice.balance, remainingPayment);
         const newAmountPaid = invoice.amountPaid + paymentToApply;
         const newBalance = invoice.balance - paymentToApply;
-        
-        // =============================================
-        // FIXED: Determine new status based on balance
-        // =============================================
+
         let newStatus = invoice.status;
         const wasFullyPaid = newBalance <= 0.01;
-        
+
         if (wasFullyPaid) {
           newStatus = 'PAID';
         } else if (paymentToApply > 0 && invoice.status === 'UNPAID') {
@@ -2825,7 +2862,6 @@ export const createPaymentReport = async (req, res) => {
           }
         });
 
-        // Track newly paid invoices for reconciliation
         if (wasFullyPaid && invoice.status !== 'PAID') {
           newlyPaidInvoiceIds.push(invoice.id);
         }
@@ -2850,12 +2886,11 @@ export const createPaymentReport = async (req, res) => {
       }
 
       // =============================================
-      // FIXED: Reconcile previous payment reports when invoices become fully paid
+      // Reconcile previous payment reports when invoices become fully paid
       // =============================================
       if (newlyPaidInvoiceIds.length > 0) {
         console.log(`Reconciling payment reports for ${newlyPaidInvoiceIds.length} newly paid invoices`);
-        
-        // Find all payment reports linked to these invoices
+
         const linkedReports = await tx.paymentReport.findMany({
           where: {
             invoices: {
@@ -2868,24 +2903,20 @@ export const createPaymentReport = async (req, res) => {
             invoices: true
           }
         });
-        
+
         for (const linkedReport of linkedReports) {
-          // Get fresh invoice data for this report
           const reportInvoices = await tx.invoice.findMany({
             where: {
               paymentReportId: linkedReport.id
             }
           });
-          
-          // Check if all invoices are fully paid
+
           const allFullyPaid = reportInvoices.every(inv => inv.status === 'PAID');
-          
-          // Calculate actual totals
+
           const totalDue = reportInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
           const totalPaid = reportInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
           const actualArrears = Math.max(0, totalDue - totalPaid);
-          
-          // Determine correct status
+
           let correctStatus = linkedReport.status;
           if (allFullyPaid || actualArrears === 0) {
             correctStatus = 'PAID';
@@ -2894,11 +2925,10 @@ export const createPaymentReport = async (req, res) => {
           } else if (actualArrears > 0 && totalPaid === 0) {
             correctStatus = 'UNPAID';
           }
-          
-          // Update if status changed or arrears changed
-          if (correctStatus !== linkedReport.status || 
+
+          if (correctStatus !== linkedReport.status ||
               Math.abs(linkedReport.arrears - actualArrears) > 0.01) {
-            
+
             await tx.paymentReport.update({
               where: { id: linkedReport.id },
               data: {
@@ -2912,7 +2942,7 @@ export const createPaymentReport = async (req, res) => {
                 updatedAt: new Date()
               }
             });
-            
+
             console.log(`Reconciled payment report ${linkedReport.id}: ${linkedReport.status} -> ${correctStatus}`);
           }
         }
@@ -2934,34 +2964,34 @@ export const createPaymentReport = async (req, res) => {
 
       // Create commission if applicable
       let commission = null;
-      if (tenant.unit?.property?.commissionFee && 
-          tenant.unit?.property?.commissionFee > 0 && 
+      if (tenant.unit?.property?.commissionFee &&
+          tenant.unit?.property?.commissionFee > 0 &&
           commissionBaseAmount > 0) {
-        
+
         const propertyManagerId = tenant.unit?.property?.managerId;
-        
+
         if (propertyManagerId) {
           const manager = await tx.user.findUnique({
             where: { id: propertyManagerId },
             select: { id: true, role: true, name: true, email: true }
           });
-          
+
           if (manager && ['ADMIN', 'MANAGER'].includes(manager.role)) {
             let vatExclusiveCommissionBase = commissionBaseAmount;
             const tenantVatType = tenant.vatType || 'NOT_APPLICABLE';
             const tenantVatRate = tenant.vatRate || 0;
-            
+
             if (tenantVatType === 'INCLUSIVE' && tenantVatRate > 0) {
               vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
             } else if (tenantVatType === 'EXCLUSIVE') {
               vatExclusiveCommissionBase = commissionBaseAmount / (1 + (tenantVatRate / 100));
             }
-            
+
             const commissionAmount = (vatExclusiveCommissionBase * tenant.unit.property.commissionFee) / 100;
-            
+
             const periodStart = new Date();
             let periodEnd = new Date();
-            
+
             switch (frequency) {
               case 'QUARTERLY':
                 periodEnd.setMonth(periodEnd.getMonth() + 3);
@@ -2987,7 +3017,7 @@ export const createPaymentReport = async (req, res) => {
                 notes: `Commission for ${manager.role}: ${manager.name} (${manager.email}). VAT Type: ${tenantVatType}, VAT Rate: ${tenantVatRate}%, Credit used: ${creditUsed}. Payment recorded by: ${req.user.id}`
               }
             });
-            
+
             console.log(`Commission created for ${manager.role}: ${manager.name} - Amount: ${commissionAmount}`);
           }
         }
@@ -3108,46 +3138,46 @@ export const createPaymentReport = async (req, res) => {
           generatedAt: new Date()
         } : null
       },
-      message: 'Payment recorded successfully' + 
-        (transactionResult.invoiceUpdateResult ? 
-          ` (${transactionResult.invoiceUpdateResult.totalApplied} applied to existing invoices for period ${transactionResult.paymentPeriodStr})` : 
+      message: 'Payment recorded successfully' +
+        (transactionResult.invoiceUpdateResult ?
+          ` (${transactionResult.invoiceUpdateResult.totalApplied} applied to existing invoices for period ${transactionResult.paymentPeriodStr})` :
           '') +
-        (transactionResult.overpaymentAmount > 0 ? 
+        (transactionResult.overpaymentAmount > 0 ?
           ` (Overpayment of ${transactionResult.overpaymentAmount} allocated using FIFO)` : '') +
-        (transactionResult.creditUsed > 0 ? 
+        (transactionResult.creditUsed > 0 ?
           ` (${transactionResult.creditUsed} credit applied)` : '') +
         (receiptResult ? ' (Receipt generated)' : '') +
         (transactionResult.commission ? ` (Commission: ${transactionResult.commission.commissionAmount})` : '') +
-        (transactionResult.newlyPaidInvoiceIds?.length > 0 ? 
+        (transactionResult.newlyPaidInvoiceIds?.length > 0 ?
           ` (${transactionResult.newlyPaidInvoiceIds.length} invoices completed and payment reports reconciled)` : '')
     });
 
   } catch (error) {
     console.error('Error creating payment report:', error);
-    
+
     if (error.code === 'P2028') {
-      return res.status(408).json({ 
-        success: false, 
-        message: 'Transaction timeout. Please try again.' 
+      return res.status(408).json({
+        success: false,
+        message: 'Transaction timeout. Please try again.'
       });
     }
-    
+
     if (error.code === 'P2025') {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Related record not found. Please check the provided IDs.' 
+      return res.status(404).json({
+        success: false,
+        message: 'Related record not found. Please check the provided IDs.'
       });
     }
-    
+
     if (error.code === 'P2002') {
-      return res.status(409).json({ 
-        success: false, 
-        message: 'Duplicate entry. This payment may already exist.' 
+      return res.status(409).json({
+        success: false,
+        message: 'Duplicate entry. This payment may already exist.'
       });
     }
-    
-    res.status(400).json({ 
-      success: false, 
+
+    res.status(400).json({
+      success: false,
       message: error.message || 'Failed to create payment report',
       details: error.code ? `Error code: ${error.code}` : undefined
     });
@@ -3407,12 +3437,12 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
     const { id } = req.params;
-    const { 
-      amountPaid, 
-      paymentPeriod, 
+    const {
+      amountPaid,
+      paymentPeriod,
       notes,
       regenerateReceipt = false,
-      force = false // Add force parameter
+      force = false
     } = req.body;
 
     const existingReport = await prisma.paymentReport.findUnique({
@@ -3434,9 +3464,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     });
 
     if (!existingReport) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Payment report not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Payment report not found'
       });
     }
 
@@ -3446,22 +3476,22 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
       if (!canManage) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to update payment records for this property' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to update payment records for this property'
         });
       }
-      
+
       const hasEditPermission = await permissionService.hasPermission(
-        userId, 
-        'EDIT_PAYMENT_RECORDS', 
+        userId,
+        'EDIT_PAYMENT_RECORDS',
         propertyId
       );
-      
+
       if (!hasEditPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to update payment records' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to update payment records'
         });
       }
     }
@@ -3502,12 +3532,12 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     if (paymentPeriod) {
       periodDate = new Date(paymentPeriod);
       if (isNaN(periodDate.getTime())) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Invalid paymentPeriod date format' 
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid paymentPeriod date format'
         });
       }
-      
+
       expected = await computeExpectedChargesForPolicy(
         existingReport.tenantId,
         periodDate,
@@ -3515,22 +3545,35 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       );
     }
 
-    const arrears = parseFloat((expected.totalDue - parsedAmountPaid).toFixed(2));
-    const status = parsedAmountPaid >= expected.totalDue
+    const arrears = parseFloat((toScalarNumber(expected.totalDue) - parsedAmountPaid).toFixed(2));
+    const status = parsedAmountPaid >= toScalarNumber(expected.totalDue)
       ? 'PAID'
       : parsedAmountPaid > 0
         ? 'PARTIAL'
         : 'UNPAID';
 
     const result = await prisma.$transaction(async (tx) => {
+      // =============================================
+      //  SAFE SCALAR EXTRACTION — THIS IS THE FIX
+      // =============================================
+      // `expected.rent`, `expected.serviceCharge`, and `expected.vat`
+      // may be OBJECTS (from computeExpectedChargesForPolicy) or
+      // SCALARS (from existingReport fallback above).
+      // `toScalarNumber` handles both shapes.
+      // =============================================
+      const safeRent = toScalarNumber(expected.rent, 'amount');
+      const safeServiceCharge = toScalarNumber(expected.serviceCharge, 'amount');
+      const safeVat = toScalarNumber(expected.vat, 'total');
+      const safeTotalDue = toScalarNumber(expected.totalDue);
+
       // Update the payment report
       const updatedReport = await tx.paymentReport.update({
         where: { id },
         data: {
-          rent: expected.rent?.amount || expected.rent || 0,
-          serviceCharge: expected.serviceCharge?.amount || expected.serviceCharge || 0,
-          vat: expected.vat?.total || expected.vat || 0,
-          totalDue: expected.totalDue || 0,
+          rent: safeRent,
+          serviceCharge: safeServiceCharge,
+          vat: safeVat,
+          totalDue: safeTotalDue,
           amountPaid: parsedAmountPaid,
           arrears,
           status,
@@ -3598,14 +3641,14 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       if (existingReport.invoices && existingReport.invoices.length > 0) {
         for (const invoice of existingReport.invoices) {
           const rentBalance = arrears > 0 ? arrears : 0;
-          
+
           await tx.invoice.update({
             where: { id: invoice.id },
             data: {
-              rent: expected.rent?.amount || expected.rent || 0,
-              serviceCharge: expected.serviceCharge?.amount || expected.serviceCharge || 0,
-              vat: expected.vat?.total || expected.vat || 0,
-              totalDue: expected.totalDue || 0,
+              rent: safeRent,
+              serviceCharge: safeServiceCharge,
+              vat: safeVat,
+              totalDue: safeTotalDue,
               amountPaid: parsedAmountPaid,
               balance: rentBalance,
               status: status === 'PAID' ? 'PAID' : status === 'PARTIAL' ? 'PARTIAL' : 'UNPAID',
@@ -3660,7 +3703,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     let receiptResult = null;
     if (regenerateReceipt || paymentPeriod) {
       try {
-        // Get fresh data for receipt generation
         const freshInvoices = await prisma.invoice.findMany({
           where: { paymentReportId: result.updatedReport.id }
         });
@@ -3669,10 +3711,8 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           where: { paymentReportId: result.updatedReport.id }
         });
 
-        // Combine both types of invoices for receipt
         const allInvoices = [...freshInvoices, ...freshBillInvoices];
 
-        // Get overpayment and credit info from the report notes
         let overpaymentAmount = 0;
         let creditUsed = 0;
         if (result.updatedReport.notes) {
@@ -3686,7 +3726,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           }
         }
 
-        // Generate new receipt
         receiptResult = await generateAndUploadReceipt(
           result.updatedReport,
           result.updatedReport.tenant,
@@ -3695,30 +3734,23 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           creditUsed
         );
 
-        // Only update if receipt was generated successfully
         if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
           await prisma.paymentReport.update({
             where: { id: result.updatedReport.id },
-            data: { 
+            data: {
               receiptUrl: receiptResult.receiptUrl,
               updatedAt: new Date()
             }
           });
           console.log(`Receipt regenerated successfully: ${receiptResult.receiptNumber}`);
         } else if (receiptResult && receiptResult.error) {
-          // Log the error but DON'T add it to notes
           console.error('Receipt generation error:', receiptResult.error);
-          // Do NOT update notes with the error
         }
       } catch (receiptError) {
-        // Log the error but DON'T add it to notes
         console.error('Failed to regenerate receipt:', receiptError);
-        // Don't fail the whole update if receipt regeneration fails
-        // Do NOT update notes with the error
       }
     }
 
-    // Prepare the response
     const responseData = {
       paymentReport: {
         ...result.updatedReport,
@@ -3728,7 +3760,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       income: result.updatedIncome
     };
 
-    // Only add receipt info if it was generated
     if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
       responseData.receipt = {
         receiptNumber: receiptResult.receiptNumber,
@@ -3738,7 +3769,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       };
     }
 
-    // Determine the appropriate message
     let message = 'Payment report updated successfully';
     if (paymentPeriod) {
       message = 'Payment report updated with new payment period';
@@ -3757,9 +3787,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
 
   } catch (error) {
     console.error('Error updating payment report:', error);
-    res.status(400).json({ 
-      success: false, 
-      message: error.message || 'Failed to update payment report' 
+    res.status(400).json({
+      success: false,
+      message: error.message || 'Failed to update payment report'
     });
   }
 };
