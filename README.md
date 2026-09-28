@@ -1425,5 +1425,5 @@ For issues or questions:
 ## 📞 Contact & Support
 
 **Development Team:** [Contact information here]  
-**Email:** dev@interparkenterprises.co.ke  
+**Email:** themasterskimaru@gmail.com  
 **Issues & Bugs:** Use GitHub Issues tracker  
