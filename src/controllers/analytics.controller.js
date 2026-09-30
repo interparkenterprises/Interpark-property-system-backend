@@ -35,6 +35,9 @@ export const getTenantAnalytics = execute('getTenantAnalytics');
 export const getOtherIncomeAnalytics = execute('getOtherIncomeAnalytics');
 export const getEmployeeAnalytics = execute('getEmployeeAnalytics');
 
+// ========== NEW: COHORT VS CASH (single-call receivables comparison) ==========
+export const getCohortVsCash = execute('getCohortVsCash');
+
 // ========== NEW INVOICE ANALYTICS ==========
 export const getComprehensiveInvoiceAnalytics = execute('getComprehensiveInvoiceAnalytics');
 export const getRentInvoiceAnalytics = execute('getRentInvoiceAnalytics');
@@ -49,3 +52,6 @@ export const getLeadAnalytics = execute('getLeadAnalytics');
 export const getDataQualityAnalytics = execute('getDataQualityAnalytics');
 export const getPerformanceAnalytics = execute('getPerformanceAnalytics');
 export const getVATAnalytics = execute('getVATAnalytics');
+
+// ========== TENANT CHURN ANALYTICS (Departed tenants detail) ==========
+export const getTenantChurnAnalytics = execute('getTenantChurnAnalytics');

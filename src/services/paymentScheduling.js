@@ -1,5 +1,3 @@
-// services/paymentScheduling.js
-
 import { 
   calculateEscalatedRent, 
   calculatePaymentByPolicy, 
@@ -60,32 +58,44 @@ const setToStartOfDay = (date) => {
   return newDate;
 };
 
-/**
- * Get the month start date (first day of the month) for a given date
- */
+// =============================================
+// UTC-normalized month start
+// Returns midnight UTC on the 1st of the UTC calendar month that
+// contains the input instant. This keeps period keys consistent
+// across the whole scheduling pipeline, regardless of server TZ.
+// =============================================
 const getMonthStart = (date) => {
   const d = new Date(date);
-  d.setDate(1);
-  d.setHours(0, 0, 0, 0);
-  return d;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0, 0));
 };
 
 // =============================================
-// ✅ NEW: Robust period parsing helper
+// helper to build a UTC month-start Date
+// from a (year, month) pair with N months added.
+// =============================================
+const utcMonthStart = (year, month, monthsToAdd = 0) => {
+  return new Date(Date.UTC(year, month + monthsToAdd, 1, 0, 0, 0, 0));
+};
+
+// =============================================
+// Robust period parsing helper
 // =============================================
 /**
  * Parse an invoice/payment period string into a "YYYY-MM" key.
  * Handles:
  *   - ISO date strings ("2026-09-28T16:30:49.818Z")
+ *   - Direct Date instances
  *   - "Month YYYY" ("May 2026")
  *   - "Month YYYY - Month YYYY" ("May 2026 - July 2026")
- *   - Direct Date instances
- * Returns null if it can't be parsed.
+ *   - "Mon D, YYYY" / "Mon D, YYYY - Mon D, YYYY"
+ *        ("Jul 7, 2026", "Jul 7, 2026 - Oct 6, 2026")
+ *   - "D Mon YYYY" ("7 Jul 2026")
+ * Returns null if none match.
  */
 const parsePeriodToMonthKey = (paymentPeriod) => {
   if (!paymentPeriod) return null;
 
-  // If already a Date, use it
+  // If already a Date, use its UTC year/month
   if (paymentPeriod instanceof Date && !isNaN(paymentPeriod.getTime())) {
     return getMonthStart(paymentPeriod).toISOString().slice(0, 7);
   }
@@ -96,17 +106,48 @@ const parsePeriodToMonthKey = (paymentPeriod) => {
     return getMonthStart(iso).toISOString().slice(0, 7);
   }
 
-  // Match "Month YYYY - ..." or "Month YYYY"
-  const match = String(paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
-  if (match) {
-    const monthNames = [
-      'january','february','march','april','may','june',
-      'july','august','september','october','november','december'
-    ];
-    const mIdx = monthNames.indexOf(match[1].toLowerCase());
+  const str = String(paymentPeriod).trim();
+
+  const monthNamesShort = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+  const monthNamesLong = [
+    'january','february','march','april','may','june',
+    'july','august','september','october','november','december'
+  ];
+
+  const monthIndexFromToken = (token) => {
+    const lower = token.toLowerCase();
+    let idx = monthNamesShort.indexOf(lower);
+    if (idx === -1) idx = monthNamesLong.indexOf(lower);
+    return idx;
+  };
+
+  // Pattern A: "Month YYYY" or "Month YYYY - Month YYYY" (no day)
+  const noDayMatch = str.match(/^([A-Za-z]+)\s+(\d{4})/);
+  if (noDayMatch) {
+    const mIdx = monthIndexFromToken(noDayMatch[1]);
     if (mIdx >= 0) {
-      const d = new Date(parseInt(match[2], 10), mIdx, 1);
-      return getMonthStart(d).toISOString().slice(0, 7);
+      const year = parseInt(noDayMatch[2], 10);
+      return `${year}-${String(mIdx + 1).padStart(2, '0')}`;
+    }
+  }
+
+  // Pattern B: "Mon D, YYYY" or "Mon D, YYYY - ..."
+  const withDayMatch = str.match(/^([A-Za-z]+)\s+\d{1,2},\s+(\d{4})/);
+  if (withDayMatch) {
+    const mIdx = monthIndexFromToken(withDayMatch[1]);
+    if (mIdx >= 0) {
+      const year = parseInt(withDayMatch[2], 10);
+      return `${year}-${String(mIdx + 1).padStart(2, '0')}`;
+    }
+  }
+
+  // Pattern C: "D Mon YYYY" or "D Mon - D Mon YYYY"
+  const dayFirstMatch = str.match(/^\d{1,2}\s+([A-Za-z]+)\s+(\d{4})/);
+  if (dayFirstMatch) {
+    const mIdx = monthIndexFromToken(dayFirstMatch[1]);
+    if (mIdx >= 0) {
+      const year = parseInt(dayFirstMatch[2], 10);
+      return `${year}-${String(mIdx + 1).padStart(2, '0')}`;
     }
   }
 
@@ -162,13 +203,22 @@ const calculateGracePeriodEnd = (dueDate, paymentPolicy, rentStartDate, periodIn
  * Calculate the next payment due date based on payment history and policy
  * UPDATED: Now checks invoice status for accurate outstanding balance
  * and handles prepaid periods correctly (with month-range matching).
+ * All period arithmetic is UTC-consistent to avoid TZ drift.
  */
 export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const { paymentPolicy, rentStart } = tenant;
   const today = new Date();
   const currentDateEndOfDay = setToEndOfDay(today);
-  const rentStartDate = setToStartOfDay(new Date(rentStart));
   const policyMonths = getPolicyMonths(paymentPolicy);
+
+  // rentStartDate is UTC month-start (not local). This is the
+  // anchor for every period we generate below.
+  const rawRentStart = new Date(rentStart);
+  const rentStartDate = utcMonthStart(
+    rawRentStart.getUTCFullYear(),
+    rawRentStart.getUTCMonth(),
+    0
+  );
 
   const rentInfo = calculateEscalatedRent(tenant);
   const monthlyRent = rentInfo.currentRent;
@@ -233,10 +283,11 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   for (const prepaid of prepaidReports) {
     if (prepaid.paymentPeriod) {
       try {
-        const periodDate = new Date(prepaid.paymentPeriod);
-        if (!isNaN(periodDate.getTime())) {
-          const periodKey = getMonthStart(periodDate).toISOString();
-          prepaidPeriods.add(periodKey);
+        const periodKey = parsePeriodToMonthKey(prepaid.paymentPeriod);
+        if (periodKey) {
+          // Normalize to full ISO month start so the range matcher below
+          // can compare instants cleanly.
+          prepaidPeriods.add(`${periodKey}-01T00:00:00.000Z`);
         }
       } catch (e) {
         // Ignore
@@ -245,16 +296,18 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   }
 
   // =============================================
-  // ✅ Range-based prepaid matcher
-  // A prepaid report stored as "2026-11-30T21:00:00.000Z" (Dec 2026 start)
-  // covers all months Dec 2026 – Feb 2027 for QUARTERLY tenants.
+  // Range-based prepaid matcher
   // =============================================
   const isMonthCoveredByPrepaid = (monthStart, policyMonthsLocal) => {
     if (!prepaidPeriods || prepaidPeriods.size === 0) return false;
     const check = new Date(monthStart);
     for (const prepaidKey of prepaidPeriods) {
       const start = new Date(prepaidKey);
-      const end = new Date(start.getFullYear(), start.getMonth() + policyMonthsLocal, 1);
+      const end = utcMonthStart(
+        start.getUTCFullYear(),
+        start.getUTCMonth(),
+        policyMonthsLocal
+      );
       if (check >= start && check < end) return true;
     }
     return false;
@@ -270,10 +323,10 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const invoicePeriods = {};
 
   for (const invoice of invoices) {
-    // ✅ FIX: robust parser handles "May 2026 - July 2026", ISO, and "May 2026"
+    // Robust parser handles "May 2026 - July 2026", ISO, and "May 2026"
+    // and now also "Jul 7, 2026 - Oct 6, 2026".
     const periodKey = parsePeriodToMonthKey(invoice.paymentPeriod);
 
-    // ✅ Range-based prepaid check
     const isPrepaidPeriod = periodKey
       ? isMonthCoveredByPrepaid(new Date(periodKey + '-01T00:00:00Z'), policyMonths)
       : false;
@@ -412,10 +465,10 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   const paymentPeriods = nonCreditPayments.filter(p => p.paymentPeriod && p.status !== 'PREPAID');
 
   paymentPeriods.forEach(payment => {
-    // ✅ FIX: robust parser
     const monthKey = parsePeriodToMonthKey(payment.paymentPeriod);
     if (!monthKey) return;
 
+    // Use UTC month-start key consistently
     const periodKey = new Date(monthKey + '-01T00:00:00Z').toISOString();
 
     if (!periodPayments[periodKey]) {
@@ -437,7 +490,7 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   });
 
   if (legacyTotalPaid > 0) {
-    const firstPeriodKey = getMonthStart(rentStartDate).toISOString();
+    const firstPeriodKey = rentStartDate.toISOString();
     if (!periodPayments[firstPeriodKey]) {
       periodPayments[firstPeriodKey] = 0;
     }
@@ -468,22 +521,26 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
 
   const allPeriods = [];
 
-  // Build all periods and determine which are fully paid
+  // Build all periods using UTC arithmetic so period keys
+  // line up exactly with the payment period keys above.
   for (let i = 0; i < totalPeriodsToCheck; i++) {
-    const periodDate = new Date(rentStartDate);
-    periodDate.setMonth(periodDate.getMonth() + (i * policyMonths));
-    const periodMonthStart = getMonthStart(periodDate);
+    const periodMonthStart = utcMonthStart(
+      rentStartDate.getUTCFullYear(),
+      rentStartDate.getUTCMonth(),
+      i * policyMonths
+    );
     const periodKey = periodMonthStart.toISOString();
 
-    const periodEnd = new Date(periodMonthStart);
-    periodEnd.setMonth(periodEnd.getMonth() + policyMonths);
-    periodEnd.setDate(periodEnd.getDate() - 1);
-    periodEnd.setHours(23, 59, 59, 999);
+    const periodEnd = new Date(Date.UTC(
+      periodMonthStart.getUTCFullYear(),
+      periodMonthStart.getUTCMonth() + policyMonths,
+      0, 23, 59, 59, 999
+    ));
 
-    const periodMonthKey = periodMonthStart.toISOString().slice(0, 7);
+    const periodMonthKey = periodKey.slice(0, 7);
     const invoiceForPeriod = invoicePeriods[periodMonthKey];
 
-    // ✅ Range-based prepaid check
+    // Range-based prepaid check
     const isPrepaid = isMonthCoveredByPrepaid(periodMonthStart, policyMonths);
 
     let amountPaid = periodPayments[periodKey] || 0;
@@ -618,7 +675,7 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   }
 
   // =============================================
-  // Determine the next due date
+  // Determine the next due date (UTC arithmetic)
   // =============================================
   let nextDueDate;
   let nextPeriodIndex = 0;
@@ -639,13 +696,18 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   }
 
   if (!foundUnpaid) {
-    const nextDate = new Date(rentStartDate);
-    const fullyPaidCount = fullyPaidPeriods;
-    nextDate.setMonth(nextDate.getMonth() + (fullyPaidCount * policyMonths));
+    const nextDate = utcMonthStart(
+      rentStartDate.getUTCFullYear(),
+      rentStartDate.getUTCMonth(),
+      fullyPaidPeriods * policyMonths
+    );
     nextDueDate = setToEndOfDay(nextDate);
   } else {
-    const nextDate = new Date(rentStartDate);
-    nextDate.setMonth(nextDate.getMonth() + (nextPeriodIndex * policyMonths));
+    const nextDate = utcMonthStart(
+      rentStartDate.getUTCFullYear(),
+      rentStartDate.getUTCMonth(),
+      nextPeriodIndex * policyMonths
+    );
     nextDueDate = setToEndOfDay(nextDate);
   }
 
@@ -677,11 +739,10 @@ export const calculateNextPaymentDue = (tenant, paymentReports = []) => {
   let actualOutstandingBalance = 0;
 
   for (const invoice of invoices) {
-    // ✅ FIX: robust parser
     const monthKey = parsePeriodToMonthKey(invoice.paymentPeriod);
     const periodKey = monthKey ? new Date(monthKey + '-01T00:00:00Z').toISOString() : null;
 
-    // ✅ Range-based prepaid check
+    // Range-based prepaid check
     if (periodKey && isMonthCoveredByPrepaid(new Date(periodKey), policyMonths)) {
       continue;
     }
@@ -1000,7 +1061,7 @@ export const getPaymentSummary = (tenant) => {
   const outstandingBalance = nextPaymentInfo.actualOutstandingBalance || 0;
 
   // =============================================
-  // ✅ Range-based prepaid matcher (shared with calculateNextPaymentDue)
+  // Range-based prepaid matcher (shared with calculateNextPaymentDue)
   // =============================================
   const prepaidPeriodKeys = nextPaymentInfo.prepaidPeriods || [];
   const isMonthCoveredByPrepaid = (monthStart) => {
@@ -1008,7 +1069,11 @@ export const getPaymentSummary = (tenant) => {
     const check = new Date(monthStart);
     for (const prepaidKey of prepaidPeriodKeys) {
       const start = new Date(prepaidKey);
-      const end = new Date(start.getFullYear(), start.getMonth() + policyMonths, 1);
+      const end = utcMonthStart(
+        start.getUTCFullYear(),
+        start.getUTCMonth(),
+        policyMonths
+      );
       if (check >= start && check < end) return true;
     }
     return false;
@@ -1035,7 +1100,7 @@ export const getPaymentSummary = (tenant) => {
     totalExpectedFromInvoices += invoiceTotal;
     totalPaidFromInvoices += invoicePaid;
 
-    // ✅ FIX: use robust parser for prepaid check
+    // Use robust parser for prepaid check
     let isPrepaid = false;
     const monthKey = parsePeriodToMonthKey(invoice.paymentPeriod);
     if (monthKey) {

@@ -2,7 +2,7 @@ import prisma from "../lib/prisma.js";
 import permissionService from "../services/permissionService.js";
 import fs from 'fs';
 import path from 'path';
-import { deleteDocument, fileExists, getFilePath } from '../utils/uploadHelper.js';
+//import { deleteDocument, fileExists, getFilePath } from '../utils/uploadHelper.js';
 
 import { 
   calculateEscalatedRent,  
@@ -99,13 +99,88 @@ const checkUserWriteAccess = async (userId, userRole, tenantId = null, operation
       }
       return false;
     }
-    return false; // Will be validated at the property level in createTenant
+    return false;
   }
   
   return false;
 };
 
-// @desc    Get all tenants (active tenants only - excludes LEFT tenants)
+// Helper: compute tenure in days between two dates
+const daysBetween = (from, to) => {
+  if (!from || !to) return null;
+  const ms = new Date(to).getTime() - new Date(from).getTime();
+  return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
+};
+
+// Helper: build the lifecycle metadata block for a tenant
+const buildLifecycleMetadata = (tenant) => {
+  const leftTimestamp = tenant.leftAt || (tenant.status === 'LEFT' ? tenant.updatedAt : null);
+  return {
+    status: tenant.status,
+    isActive: tenant.status === 'ACTIVE',
+    leftAt: leftTimestamp,
+    leftReason: tenant.leftReason || null,
+    tenureDays: tenant.status === 'LEFT'
+      ? daysBetween(tenant.createdAt, leftTimestamp)
+      : daysBetween(tenant.createdAt, new Date())
+  };
+};
+
+
+// Valid values for TenantLeftReason enum
+const VALID_LEFT_REASONS = [
+  'LEASE_EXPIRED',
+  'VOLUNTARY',
+  'EVICTED',
+  'NON_PAYMENT',
+  'TRANSFERRED',
+  'DECEASED',
+  'OTHER'
+];
+
+/**
+ * Normalize an optional leftReason from a request body.
+ * - Returns null if not provided / null / empty string / whitespace-only.
+ * - Returns the trimmed, uppercased enum value if valid.
+ * - Throws an Error with `statusCode = 400` if invalid.
+ */
+const normalizeLeftReason = (raw) => {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'string' && raw.trim() === '') return null;
+
+  if (typeof raw !== 'string') {
+    const err = new Error('leftReason must be a string if provided');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const normalized = raw.trim().toUpperCase();
+  if (!VALID_LEFT_REASONS.includes(normalized)) {
+    const err = new Error(
+      `Invalid leftReason. Must be one of: ${VALID_LEFT_REASONS.join(', ')}`
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return normalized;
+};
+
+/**
+ * Central helper to flip a tenant to LEFT.
+ * ALWAYS sets leftAt — this is the single source of truth for churn tracking.
+ * Must be called inside a Prisma transaction (`tx`).
+ */
+const markTenantAsLeft = (tx, tenantId, leftReason = null, leftAt = new Date()) =>
+  tx.tenant.update({
+    where: { id: tenantId },
+    data: {
+      status: 'LEFT',
+      leftAt,
+      leftReason
+    }
+  });
+// @desc    Get all tenants (active tenants only - excludes LEFT tenants by default)
 // @route   GET /api/tenants
 // @access  Private
 export const getTenants = async (req, res) => {
@@ -113,17 +188,23 @@ export const getTenants = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Optional: Add query param to include left tenants
-    const { includeLeft } = req.query;
-    const showLeftTenants = includeLeft === 'true';
+    // Optional: query params to include left tenants or filter by status
+    const { includeLeft, status } = req.query;
+    const showLeftTenants = includeLeft === 'true' || status === 'LEFT' || status === 'ALL';
 
-    let tenants;
-
-    // Base where clause to exclude LEFT tenants by default
+    // Base where clause
     let baseWhere = {};
-    if (!showLeftTenants) {
+    if (status === 'LEFT') {
+      baseWhere.status = 'LEFT';
+    } else if (status === 'ALL') {
+      // no status filter
+    } else if (status === 'ACTIVE') {
+      baseWhere.status = 'ACTIVE';
+    } else if (!showLeftTenants) {
       baseWhere.status = 'ACTIVE';
     }
+
+    let tenants;
 
     if (userRole === 'ADMIN') {
       tenants = await prisma.tenant.findMany({
@@ -167,7 +248,16 @@ export const getTenants = async (req, res) => {
       const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
       
       if (accessiblePropertyIds.length === 0) {
-        return res.json([]);
+        return res.json({
+          tenants: [],
+          metadata: {
+            totalCount: 0,
+            activeTenantsCount: 0,
+            leftTenantsCount: 0,
+            showLeftTenants: false,
+            filter: 'active tenants only'
+          }
+        });
       }
       
       // Filter properties where user has VIEW_TENANTS permission
@@ -180,7 +270,16 @@ export const getTenants = async (req, res) => {
       }
       
       if (propertiesWithPermission.length === 0) {
-        return res.json([]);
+        return res.json({
+          tenants: [],
+          metadata: {
+            totalCount: 0,
+            activeTenantsCount: 0,
+            leftTenantsCount: 0,
+            showLeftTenants: false,
+            filter: 'active tenants only'
+          }
+        });
       }
       
       tenants = await prisma.tenant.findMany({
@@ -245,36 +344,45 @@ export const getTenants = async (req, res) => {
           totalPayment: totalPayment,
           paymentPolicy: tenant.paymentPolicy
         },
-        paymentSummary
+        paymentSummary,
+        lifecycle: buildLifecycleMetadata(tenant)
       };
     });
 
-    // Add metadata about the query
+    // Build count where-clause per role
+    let countWhere = {};
+    if (userRole === 'MANAGER') {
+      countWhere = { unit: { property: { managerId: userId } } };
+    } else if (userRole === 'USER') {
+      const accessiblePropertyIds = await permissionService.getAccessiblePropertyIds(userId, userRole);
+      const allowed = [];
+      for (const id of accessiblePropertyIds) {
+        if (await checkTenantPermission(userId, userRole, id, 'view')) {
+          allowed.push(id);
+        }
+      }
+      countWhere = { unit: { property: { id: { in: allowed } } } };
+    }
+
+    const [activeCount, leftCount] = await Promise.all([
+      prisma.tenant.count({ where: { ...countWhere, status: 'ACTIVE' } }),
+      prisma.tenant.count({ where: { ...countWhere, status: 'LEFT' } })
+    ]);
+
     const response = {
       tenants: enhancedTenants,
       metadata: {
         totalCount: enhancedTenants.length,
+        activeTenantsCount: activeCount,
+        leftTenantsCount: leftCount,
         showLeftTenants: showLeftTenants,
-        filter: showLeftTenants ? 'all tenants' : 'active tenants only'
+        filter: status === 'LEFT'
+          ? 'left tenants only'
+          : status === 'ALL'
+            ? 'all tenants'
+            : 'active tenants only'
       }
     };
-
-    // If showLeftTenants is true, also include a count of left tenants
-    if (showLeftTenants) {
-      const leftTenantsCount = await prisma.tenant.count({
-        where: {
-          status: 'LEFT',
-          ...(userRole !== 'ADMIN' ? {
-            unit: {
-              property: {
-                ...(userRole === 'MANAGER' ? { managerId: userId } : {})
-              }
-            }
-          } : {})
-        }
-      });
-      response.metadata.leftTenantsCount = leftTenantsCount;
-    }
 
     res.json(response);
   } catch (error) {
@@ -329,13 +437,16 @@ export const getTenant = async (req, res) => {
     const rentInfo = calculateEscalatedRent(fullTenant);
     const monthlyRent = rentInfo.currentRent;
     
-    // Calculate total payment breakdown using the new function
+    // Calculate total payment breakdown
     const paymentBreakdown = calculateTotalPayment(fullTenant, monthlyRent, fullTenant.paymentPolicy);
     
     const rentSchedule = getRentScheduleWithPayments(fullTenant, 3);
     
     // Calculate payment summary with due dates
     const paymentSummary = getPaymentSummary(fullTenant);
+
+    // Build lifecycle info
+    const lifecycle = buildLifecycleMetadata(fullTenant);
 
     // Add status information
     const response = {
@@ -350,8 +461,11 @@ export const getTenant = async (req, res) => {
       statusInfo: {
         currentStatus: fullTenant.status,
         isActive: fullTenant.status === 'ACTIVE',
-        leftDate: fullTenant.status === 'LEFT' ? fullTenant.updatedAt : null
-      }
+        leftAt: lifecycle.leftAt,
+        leftReason: lifecycle.leftReason,
+        tenureDays: lifecycle.tenureDays
+      },
+      lifecycle
     };
 
     // If tenant has left, show a warning
@@ -374,7 +488,7 @@ export const getTenantsByProperty = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
     const { propertyId } = req.params;
-    const { includeLeft } = req.query; // Add query param to include left tenants
+    const { includeLeft, status } = req.query;
 
     // Check if user has access to this property
     let hasAccess = false;
@@ -387,7 +501,6 @@ export const getTenantsByProperty = async (req, res) => {
       });
       hasAccess = !!property;
     } else if (userRole === 'USER') {
-      // Check if user has VIEW_TENANTS permission for this property
       hasAccess = await checkTenantPermission(userId, userRole, propertyId, 'view');
     }
 
@@ -398,15 +511,20 @@ export const getTenantsByProperty = async (req, res) => {
       });
     }
 
-    // Build where clause - only active tenants by default
+    // Build where clause
     const whereClause = {
       unit: {
         propertyId: propertyId
       }
     };
     
-    // Only filter by status if includeLeft is not explicitly true
-    if (includeLeft !== 'true') {
+    if (status === 'LEFT') {
+      whereClause.status = 'LEFT';
+    } else if (status === 'ALL') {
+      // no filter
+    } else if (status === 'ACTIVE') {
+      whereClause.status = 'ACTIVE';
+    } else if (includeLeft !== 'true') {
       whereClause.status = 'ACTIVE';
     }
 
@@ -446,7 +564,7 @@ export const getTenantsByProperty = async (req, res) => {
       // Calculate VAT on rent
       const vatOnRent = calculateVAT(paymentAmount, tenant.vatType, tenant.vatRate);
       
-      // Calculate VAT on service charge (using service charge's own VAT settings)
+      // Calculate VAT on service charge
       const vatOnServiceCharge = serviceChargeDetails.vatAmount * getPolicyMonths(tenant.paymentPolicy);
       
       const totalPayment = paymentAmount + vatOnRent + serviceChargeByPolicy + vatOnServiceCharge;
@@ -469,32 +587,31 @@ export const getTenantsByProperty = async (req, res) => {
           totalPayment: totalPayment,
           paymentPolicy: tenant.paymentPolicy
         },
-        paymentSummary
+        paymentSummary,
+        lifecycle: buildLifecycleMetadata(tenant)
       };
     });
 
-    // Add metadata about the query
+    // Compute counts for this property
+    const [activeCount, leftCount] = await Promise.all([
+      prisma.tenant.count({ where: { unit: { propertyId }, status: 'ACTIVE' } }),
+      prisma.tenant.count({ where: { unit: { propertyId }, status: 'LEFT' } })
+    ]);
+
     const response = {
       tenants: enhancedTenants,
       metadata: {
         totalCount: enhancedTenants.length,
-        showLeftTenants: includeLeft === 'true',
-        filter: includeLeft === 'true' ? 'all tenants' : 'active tenants only'
+        activeTenantsCount: activeCount,
+        leftTenantsCount: leftCount,
+        showLeftTenants: status === 'ALL' || includeLeft === 'true',
+        filter: status === 'LEFT'
+          ? 'left tenants only'
+          : status === 'ALL' || includeLeft === 'true'
+            ? 'all tenants'
+            : 'active tenants only'
       }
     };
-
-    // If includeLeft is true, also include a count of left tenants for this property
-    if (includeLeft === 'true') {
-      const leftTenantsCount = await prisma.tenant.count({
-        where: {
-          status: 'LEFT',
-          unit: {
-            propertyId: propertyId
-          }
-        }
-      });
-      response.metadata.leftTenantsCount = leftTenantsCount;
-    }
 
     res.json(response);
   } catch (error) {
@@ -510,10 +627,16 @@ export const getOverdueTenants = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
-    const { propertyId, daysOverdue, customDays } = req.query;
+    const { propertyId, daysOverdue, customDays, includeLeft } = req.query;
 
     let tenants;
     let baseWhere = {};
+
+    // Default: only ACTIVE tenants
+    const showLeftTenants = includeLeft === 'true';
+    if (!showLeftTenants) {
+      baseWhere.status = 'ACTIVE';
+    }
 
     // Handle property-specific access for USER role
     if (propertyId) {
@@ -579,6 +702,7 @@ export const getOverdueTenants = async (req, res) => {
               propertyId: propertyId || null,
               daysOverdue: daysOverdue || null,
               customDays: customDays ? parseInt(customDays) : null,
+              includeLeft: showLeftTenants,
               scope: propertyId ? 'specific_property' : 'accessible_properties'
             }
           });
@@ -608,6 +732,7 @@ export const getOverdueTenants = async (req, res) => {
               propertyId: propertyId || null,
               daysOverdue: daysOverdue || null,
               customDays: customDays ? parseInt(customDays) : null,
+              includeLeft: showLeftTenants,
               scope: 'no_permission'
             }
           });
@@ -623,9 +748,6 @@ export const getOverdueTenants = async (req, res) => {
 
     // Role-based access control
     if (userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'USER') {
-      // =============================================
-      // FIXED: Include invoices in the query to check actual status
-      // =============================================
       tenants = await prisma.tenant.findMany({
         where: baseWhere,
         include: {
@@ -658,24 +780,18 @@ export const getOverdueTenants = async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // =============================================
-    // FIXED: Helper function to calculate exact overdue days based on invoice data
-    // =============================================
+    // Helper: calculate exact overdue days based on invoice data
     const calculateOverdueDays = (tenant) => {
       const invoices = tenant.invoices || [];
       let maxOverdueDays = 0;
       
-      // Check each invoice for overdue status
       for (const invoice of invoices) {
-        // Calculate the actual balance
         const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
         
-        // Only consider invoices with balance > 0
         if (balance <= 0.01) {
           continue;
         }
         
-        // Check if invoice is overdue
         const dueDate = new Date(invoice.dueDate);
         const today = new Date();
         today.setHours(0, 0, 0, 0);
@@ -693,7 +809,7 @@ export const getOverdueTenants = async (req, res) => {
       return maxOverdueDays;
     };
     
-    // Helper function to get the total overdue amount for a tenant
+    // Helper: get total overdue amount for a tenant
     const calculateTotalOverdueAmount = (tenant) => {
       const invoices = tenant.invoices || [];
       let totalOverdue = 0;
@@ -701,12 +817,10 @@ export const getOverdueTenants = async (req, res) => {
       for (const invoice of invoices) {
         const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
         
-        // Only include invoices with balance > 0
         if (balance <= 0.01) {
           continue;
         }
         
-        // Check if invoice is overdue
         const dueDate = new Date(invoice.dueDate);
         const today = new Date();
         today.setHours(0, 0, 0, 0);
@@ -720,7 +834,7 @@ export const getOverdueTenants = async (req, res) => {
       return totalOverdue;
     };
     
-    // Helper function to get human-readable overdue period
+    // Helper: human-readable overdue period
     const getOverduePeriodText = (days) => {
       if (days <= 0) return 'Not overdue';
       if (days <= 7) return `${days} day${days !== 1 ? 's' : ''} (1 week)`;
@@ -732,8 +846,8 @@ export const getOverdueTenants = async (req, res) => {
       return `${days} days (Over 6 months)`;
     };
     
-    // Helper function to get overdue category
-    const getOverdueCategory = (days) => {
+    // Helper: overdue category
+    const getOverdueCategoryLocal = (days) => {
       if (days <= 0) return 'NOT_OVERDUE';
       if (days <= 7) return '1_WEEK';
       if (days <= 14) return '2_WEEKS';
@@ -743,9 +857,7 @@ export const getOverdueTenants = async (req, res) => {
       return 'OVER_3_MONTHS';
     };
 
-    // =============================================
-    // FIXED: Filter tenants with overdue payments based on invoice data
-    // =============================================
+    // Filter tenants with overdue payments based on invoice data
     let overdueTenants = tenants
       .map(tenant => {
         const rentInfo = calculateEscalatedRent(tenant);
@@ -755,19 +867,14 @@ export const getOverdueTenants = async (req, res) => {
         const overdueDays = calculateOverdueDays(tenant);
         const totalOverdueAmount = calculateTotalOverdueAmount(tenant);
         
-        // Calculate service charge based on rent ONLY
         const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
         const serviceChargeByPolicy = serviceChargeDetails.amount * getPolicyMonths(tenant.paymentPolicy);
         
-        // Calculate VAT on rent
         const vatOnRent = calculateVAT(paymentAmount, tenant.vatType, tenant.vatRate);
-        
-        // Calculate VAT on service charge (using service charge's own VAT settings)
         const vatOnServiceCharge = serviceChargeDetails.vatAmount * getPolicyMonths(tenant.paymentPolicy);
         
         const totalPayment = paymentAmount + vatOnRent + serviceChargeByPolicy + vatOnServiceCharge;
         
-        // Get invoice details for this tenant
         const invoices = tenant.invoices || [];
         const outstandingInvoices = invoices.filter(inv => {
           const balance = inv.balance || (inv.totalDue - inv.amountPaid);
@@ -793,6 +900,7 @@ export const getOverdueTenants = async (req, res) => {
             paymentPolicy: tenant.paymentPolicy
           },
           paymentSummary,
+          lifecycle: buildLifecycleMetadata(tenant),
           invoiceDetails: {
             totalInvoices: invoices.length,
             outstandingInvoices: outstandingInvoices.length,
@@ -815,18 +923,14 @@ export const getOverdueTenants = async (req, res) => {
           overdueDetails: {
             daysOverdue: overdueDays,
             periodText: getOverduePeriodText(overdueDays),
-            category: getOverdueCategory(overdueDays),
+            category: getOverdueCategoryLocal(overdueDays),
             totalOverdueAmount: totalOverdueAmount
           }
         };
       })
       .filter(tenant => {
-        // =============================================
-        // FIXED: Only include tenants that actually have overdue invoices with balance > 0
-        // =============================================
         const invoices = tenant.invoices || [];
         
-        // Check if there are any outstanding invoices with balance > 0
         const hasOutstandingInvoices = invoices.some(inv => {
           const balance = inv.balance || (inv.totalDue - inv.amountPaid);
           return balance > 0.01;
@@ -836,7 +940,6 @@ export const getOverdueTenants = async (req, res) => {
           return false;
         }
         
-        // Check if any outstanding invoice is overdue
         const hasOverdueInvoice = invoices.some(inv => {
           const balance = inv.balance || (inv.totalDue - inv.amountPaid);
           const dueDate = new Date(inv.dueDate);
@@ -851,7 +954,6 @@ export const getOverdueTenants = async (req, res) => {
           return false;
         }
         
-        // Apply days overdue filter if specified
         if (daysOverdue) {
           const overdueDays = tenant.overdueDetails.daysOverdue;
           
@@ -867,16 +969,13 @@ export const getOverdueTenants = async (req, res) => {
         return true;
       });
 
-    // =============================================
     // Calculate summary statistics
-    // =============================================
     const totalOverdueAmount = overdueTenants.reduce((sum, tenant) => {
       return sum + tenant.overdueDetails.totalOverdueAmount;
     }, 0);
 
     const totalOverdueTenants = overdueTenants.length;
     
-    // Calculate overdue days statistics
     const overdueDaysStats = {
       min: overdueTenants.length > 0 ? Math.min(...overdueTenants.map(t => t.overdueDetails.daysOverdue)) : 0,
       max: overdueTenants.length > 0 ? Math.max(...overdueTenants.map(t => t.overdueDetails.daysOverdue)) : 0,
@@ -885,7 +984,6 @@ export const getOverdueTenants = async (req, res) => {
         : 0
     };
     
-    // Group by overdue categories
     const overdueCategories = {
       week1: overdueTenants.filter(t => t.overdueDetails.daysOverdue <= 7).length,
       week2: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 7 && t.overdueDetails.daysOverdue <= 14).length,
@@ -895,7 +993,6 @@ export const getOverdueTenants = async (req, res) => {
       more: overdueTenants.filter(t => t.overdueDetails.daysOverdue > 90).length
     };
     
-    // Calculate total outstanding invoices count
     const totalOutstandingInvoices = overdueTenants.reduce((sum, tenant) => {
       return sum + tenant.invoiceDetails.outstandingInvoices;
     }, 0);
@@ -917,6 +1014,7 @@ export const getOverdueTenants = async (req, res) => {
         propertyId: propertyId || null,
         daysOverdue: daysOverdue || null,
         customDays: customDays ? parseInt(customDays) : null,
+        includeLeft: showLeftTenants,
         scope: propertyId ? 'specific_property' : (userRole === 'MANAGER' ? 'managed_properties' : (userRole === 'USER' ? 'accessible_properties' : 'all_properties'))
       }
     });
@@ -967,16 +1065,13 @@ export const getNextPaymentsByProperty = async (req, res) => {
             });
         }
 
-        // =============================================
-        // FIXED: Fetch ONLY ACTIVE tenants for the property
-        // Exclude tenants with status 'LEFT'
-        // =============================================
+        // Fetch ONLY ACTIVE tenants for the property
         const tenants = await prisma.tenant.findMany({
             where: {
                 unit: {
                     propertyId: propertyId
                 },
-                status: 'ACTIVE' // Only get active tenants
+                status: 'ACTIVE'
             },
             include: {
                 unit: {
@@ -1011,55 +1106,42 @@ export const getNextPaymentsByProperty = async (req, res) => {
         nairobiTodayStart.setHours(0, 0, 0, 0);
 
         for (const tenant of tenants) {
-            // Calculate rent info with escalation
             const rentInfo = calculateEscalatedRent(tenant);
             const monthlyRent = rentInfo.currentRent;
 
-            // Calculate total payment breakdown
             const paymentBreakdown = calculateTotalPayment(tenant, monthlyRent, tenant.paymentPolicy);
 
             // USE getPaymentSummary AS THE SOURCE OF TRUTH
             const paymentSummary = getPaymentSummary(tenant);
 
-            // EXTRACT DATA FROM PAYMENT SUMMARY
             const totalDuePerPeriod = paymentSummary.totalDuePerPeriod || paymentBreakdown.total.paymentByPolicy || 0;
             const totalDueWithoutWithholding = paymentSummary.totalDueWithoutWithholding || 0;
             const totalWithheld = paymentSummary.totalWithheld || 0;
 
-            // Get outstanding balance (total expected - total paid)
             const outstandingBalance = paymentSummary.paymentHistory?.outstandingBalance || 0;
             const totalPaid = paymentSummary.paymentHistory?.totalPaid || 0;
             const totalExpected = paymentSummary.paymentHistory?.expectedTotal || 0;
             const paymentsBehind = paymentSummary.nextPayment?.paymentsBehind || 0;
             const expectedPaymentsCount = paymentSummary.paymentHistory?.expectedPaymentsCount || 0;
 
-            // Get the payment period amount breakdown
             const periodRentAmount = paymentBreakdown.rent.paymentByPolicy || 0;
             const periodServiceCharge = paymentBreakdown.serviceCharge.paymentByPolicy || 0;
             const periodVatOnRent = paymentBreakdown.rent.vatAmount || 0;
             const periodVatOnServiceCharge = paymentBreakdown.serviceCharge.vatAmount || 0;
 
-            // GET NEXT DUE DATE FROM PAYMENT SUMMARY
             const nextDueDate = paymentSummary.nextPayment?.dueDate;
             const isOverdue = paymentSummary.nextPayment?.isOverdue || false;
             const isInGracePeriod = paymentSummary.nextPayment?.isInGracePeriod || false;
             const gracePeriodEnd = paymentSummary.nextPayment?.gracePeriodEnd || null;
 
-            // Get the actual status from payment summary
             const status = paymentSummary.status || 'UNPAID';
 
-            // =============================================
-            // FIXED: Determine if tenant is truly overdue
-            // Only mark as overdue if there's a PARTIAL or UNPAID invoice
-            // with a due date that has passed
-            // =============================================
             const hasOutstandingBalance = outstandingBalance > 0.01;
 
             let isTrulyOverdue = false;
             let overdueSinceDate = null;
             let daysOverdue = 0;
 
-            // Check if there are any unpaid/partial invoices with balance > 0
             if (hasOutstandingBalance) {
                 const hasUnpaidInvoices = tenant.invoices && tenant.invoices.some(inv => {
                     const balance = inv.balance || (inv.totalDue - inv.amountPaid);
@@ -1069,7 +1151,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 });
 
                 if (hasUnpaidInvoices) {
-                    // Get all invoices with balance > 0
                     const invoicesWithBalance = tenant.invoices.filter(inv => {
                         const balance = inv.balance || (inv.totalDue - inv.amountPaid);
                         const isUnpaid = inv.status === 'UNPAID' || inv.status === 'OVERDUE';
@@ -1078,25 +1159,18 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     });
 
                     if (invoicesWithBalance.length > 0) {
-                        // Sort by due date (ascending)
                         const sortedInvoices = invoicesWithBalance.sort((a, b) =>
                             new Date(a.dueDate) - new Date(b.dueDate)
                         );
 
-                        // =============================================
-                        // FIXED: Only mark as overdue if the due date has passed
-                        // =============================================
                         const earliestInvoice = sortedInvoices[0];
                         const dueDate = new Date(earliestInvoice.dueDate);
                         const today = new Date();
                         today.setHours(0, 0, 0, 0);
                         dueDate.setHours(0, 0, 0, 0);
 
-                        // Check if the due date is in the past (including grace period)
                         if (dueDate < today) {
-                            // Check if grace period has passed
                             let gracePeriodEndDate = new Date(dueDate);
-                            // Add 5 days for grace period
                             gracePeriodEndDate.setDate(gracePeriodEndDate.getDate() + 5);
                             gracePeriodEndDate.setHours(23, 59, 59, 999);
 
@@ -1109,7 +1183,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 }
             }
 
-            // Calculate days overdue
             if (overdueSinceDate) {
                 overdueSinceDate.setHours(23, 59, 59, 999);
                 const overdueStart = new Date(overdueSinceDate);
@@ -1118,7 +1191,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 daysOverdue = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
             }
 
-            // Calculate future due date
             let futureDueDate = null;
             let dueDateFormatted = null;
             let daysUntilDue = 0;
@@ -1129,7 +1201,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 const policyMonths = getPolicyMonths(tenant.paymentPolicy);
                 const nextDue = new Date(nextDueDate);
 
-                // If the due date is in the past, advance it to the next period
                 let futureDue = new Date(nextDue);
                 while (futureDue <= now) {
                     futureDue.setMonth(futureDue.getMonth() + policyMonths);
@@ -1137,7 +1208,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 futureDue.setHours(23, 59, 59, 999);
                 futureDueDate = futureDue;
 
-                // Format the due date
                 try {
                     const dueDateInNairobi = new Date(futureDue.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
                     dueDateFormatted = dueDateInNairobi.toLocaleDateString('en-US', {
@@ -1157,7 +1227,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     dueDateFormatted = futureDue.toLocaleDateString();
                 }
 
-                // Calculate grace period end and days until grace end
                 if (gracePeriodEnd && hasOutstandingBalance) {
                     try {
                         const graceEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
@@ -1173,7 +1242,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     }
                 }
             } else {
-                // No next due date - calculate from rent start
                 const rentStartDate = new Date(tenant.rentStart);
                 const policyMonths = getPolicyMonths(tenant.paymentPolicy);
                 let futureDue = new Date(rentStartDate);
@@ -1191,7 +1259,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 });
             }
 
-            // CALCULATE THE AMOUNT DUE
             let totalAmountDue = totalDuePerPeriod;
 
             if (outstandingBalance > 0) {
@@ -1205,7 +1272,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 }
             }
 
-            // Calculate the breakdown of the amount due
             let amountBreakdown = {
                 rent: periodRentAmount,
                 serviceCharge: periodServiceCharge,
@@ -1225,7 +1291,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 };
             }
 
-            // Format overdue since date if it exists
             let overdueSinceFormatted = null;
             if (overdueSinceDate) {
                 try {
@@ -1241,7 +1306,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 }
             }
 
-            // Format grace period end if it exists
             let gracePeriodEndFormatted = null;
             if (gracePeriodEnd && hasOutstandingBalance) {
                 try {
@@ -1257,7 +1321,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 }
             }
 
-            // Determine the final status display
             let statusDisplay = status;
 
             if (outstandingBalance > 0 && isTrulyOverdue) {
@@ -1270,7 +1333,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                 statusDisplay = 'PAID';
             }
 
-            // BUILD THE PAYMENT OBJECT
             tenantsWithNextPayment.push({
                 id: tenant.id,
                 name: tenant.fullName,
@@ -1289,7 +1351,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     dueDate: dueDateFormatted || 'Not set',
                     dueDateRaw: futureDueDate || null,
                     daysUntilDue: daysUntilDue,
-                    // FIXED: Only mark as overdue if the due date has passed
                     isOverdue: isTrulyOverdue,
                     isInGracePeriod: isInGracePeriod && hasOutstandingBalance,
                     daysUntilGraceEnd: hasOutstandingBalance ? daysUntilGraceEnd : null,
@@ -1312,7 +1373,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     totalWithheld: totalWithheld,
                     outstandingBalance: outstandingBalance,
                     regularPeriodAmount: totalDuePerPeriod,
-                    // FIXED: Only set overdue tracking if truly overdue (due date has passed)
                     overdueSince: isTrulyOverdue ? overdueSinceFormatted : null,
                     overdueSinceRaw: isTrulyOverdue && overdueSinceDate ? overdueSinceDate.toISOString() : null,
                     daysOverdue: isTrulyOverdue ? daysOverdue : 0
@@ -1333,14 +1393,13 @@ export const getNextPaymentsByProperty = async (req, res) => {
             });
         }
 
-        // Sort: Overdue first, then by days until due (most urgent first)
+        // Sort: Overdue first, then by days until due
         tenantsWithNextPayment.sort((a, b) => {
             if (a.payment.isOverdue && !b.payment.isOverdue) return -1;
             if (!a.payment.isOverdue && b.payment.isOverdue) return 1;
             return a.payment.daysUntilDue - b.payment.daysUntilDue;
         });
 
-        // Calculate summary statistics
         const summary = {
             total: tenantsWithNextPayment.length,
             overdue: tenantsWithNextPayment.filter(t => t.payment.isOverdue).length,
@@ -1360,7 +1419,6 @@ export const getNextPaymentsByProperty = async (req, res) => {
             }
         };
 
-        // Get property name safely
         let propertyName = 'Unknown';
         if (tenants.length > 0 && tenants[0]?.unit?.property?.name) {
             propertyName = tenants[0].unit.property.name;
@@ -1417,7 +1475,6 @@ export const createTenant = async (req, res) => {
         });
       }
     } else if (userRole === 'MANAGER') {
-      // Verify manager owns this property
       if (unit.property.managerId !== userId) {
         return res.status(403).json({ message: 'Access denied to this unit' });
       }
@@ -1440,7 +1497,6 @@ export const createTenant = async (req, res) => {
       vatRate,
       vatType,
       serviceCharge,
-      // Withholding tax fields
       withholdingTaxRate,
       withholdingVatRate,
       isWithholdingTaxExempt
@@ -1471,9 +1527,7 @@ export const createTenant = async (req, res) => {
     });
 
     if (existingEmail) {
-      return res.status(400).json({
-        message: "Email already exists",
-      });
+      return res.status(400).json({ message: "Email already exists" });
     }
 
     // Check if KRA Pin is unique
@@ -1489,7 +1543,18 @@ export const createTenant = async (req, res) => {
       return res.status(400).json({ message: "Unit is already occupied" });
     }
 
-    // Validate payment policy enum
+    // Also check for existing ACTIVE tenant on this unit
+    const existingActiveTenant = await prisma.tenant.findFirst({
+      where: { unitId, status: 'ACTIVE' }
+    });
+
+    if (existingActiveTenant) {
+      return res.status(400).json({
+        message: `Unit is already assigned to an active tenant: ${existingActiveTenant.fullName}`
+      });
+    }
+
+    // Validate payment policy
     const validPaymentPolicies = ["MONTHLY", "QUARTERLY", "ANNUAL"];
     const normalizedPaymentPolicy = paymentPolicy.toUpperCase();
     if (!validPaymentPolicies.includes(normalizedPaymentPolicy)) {
@@ -1533,15 +1598,10 @@ export const createTenant = async (req, res) => {
       }
     }
 
-    // If VAT type is NOT_APPLICABLE, force vatRate = 0
     if (normalizedVatType === "NOT_APPLICABLE") {
       parsedVatRate = 0;
     }
 
-    // =============================================
-    // WITHHOLDING TAX VALIDATION
-    // =============================================
-    
     // Validate withholding tax rate
     let parsedWithholdingTaxRate = 0;
     if (withholdingTaxRate !== undefined && withholdingTaxRate !== null) {
@@ -1564,9 +1624,7 @@ export const createTenant = async (req, res) => {
       }
     }
 
-    // Validate exemption flag
     const isExempt = isWithholdingTaxExempt === true;
-
     const parsedRent = parseFloat(rent);
 
     // Build tenant data
@@ -1587,10 +1645,13 @@ export const createTenant = async (req, res) => {
       paymentPolicy: normalizedPaymentPolicy,
       vatRate: parsedVatRate,
       vatType: normalizedVatType,
-      // Withholding tax fields
       withholdingTaxRate: parsedWithholdingTaxRate,
       withholdingVatRate: parsedWithholdingVatRate,
       isWithholdingTaxExempt: isExempt,
+      // Lifecycle: new tenants are ACTIVE
+      status: 'ACTIVE',
+      leftAt: null,
+      leftReason: null,
     };
 
     // Create tenant
@@ -1611,11 +1672,8 @@ export const createTenant = async (req, res) => {
       },
     });
 
-    // =============================================
-    // HANDLE SERVICE CHARGE - UPDATED WITH VAT SUPPORT
-    // =============================================
+    // Handle service charge
     if (serviceCharge) {
-      // Extract and validate type
       const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
       const normalizedType = serviceCharge.type?.toUpperCase();
 
@@ -1625,7 +1683,6 @@ export const createTenant = async (req, res) => {
         });
       }
 
-      // Validate service charge VAT type
       let normalizedServiceVatType = "NOT_APPLICABLE";
       if (serviceCharge.vatType) {
         const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
@@ -1637,7 +1694,6 @@ export const createTenant = async (req, res) => {
         }
       }
 
-      // Validate service charge VAT rate
       let parsedServiceVatRate = 0;
       if (serviceCharge.vatRate !== undefined && serviceCharge.vatRate !== null) {
         parsedServiceVatRate = parseFloat(serviceCharge.vatRate);
@@ -1648,12 +1704,10 @@ export const createTenant = async (req, res) => {
         }
       }
 
-      // If VAT type is NOT_APPLICABLE, force vatRate = 0
       if (normalizedServiceVatType === "NOT_APPLICABLE") {
         parsedServiceVatRate = 0;
       }
 
-      // Build data object with CORRECT Prisma field name: perSqFtRate (camelCase with capital F)
       const serviceChargeData = {
         tenantId: tenant.id,
         type: normalizedType,
@@ -1718,8 +1772,7 @@ export const updateTenant = async (req, res) => {
       vatRate,
       vatType,
       serviceCharge,
-      unitId, // Allow unit change
-      // Withholding tax fields
+      unitId,
       withholdingTaxRate,
       withholdingVatRate,
       isWithholdingTaxExempt
@@ -1742,19 +1795,15 @@ export const updateTenant = async (req, res) => {
       return res.status(404).json({ message: "Tenant not found" });
     }
 
-    // =============================================
-    // HANDLE UNIT TRANSFER
-    // =============================================
+    // Handle unit transfer
     let targetUnit = null;
     let unitPriceWarning = null;
 
     if (unitId && unitId !== existingTenant.unitId) {
-      // Fetch the target unit with ACTIVE tenants only
       targetUnit = await prisma.unit.findUnique({
         where: { id: unitId },
         include: {
           property: true,
-          // Only fetch ACTIVE tenants to check if unit is currently occupied
           tenants: {
             where: { status: 'ACTIVE' }
           }
@@ -1765,14 +1814,12 @@ export const updateTenant = async (req, res) => {
         return res.status(404).json({ message: "Target unit not found" });
       }
 
-      // Verify the target unit is in the same property
       if (targetUnit.propertyId !== existingTenant.unit.propertyId) {
         return res.status(400).json({
           message: "Cannot move tenant to a unit in a different property. Please update property separately."
         });
       }
 
-      // IMPORTANT: Check if the unit is occupied by an ACTIVE tenant
       const activeTenantInTarget = targetUnit.tenants?.[0] || null;
       const isUnitOccupied = targetUnit.status === 'OCCUPIED' || activeTenantInTarget !== null;
 
@@ -1799,7 +1846,7 @@ export const updateTenant = async (req, res) => {
         });
       }
 
-      // Double-check if target unit has any ACTIVE tenant (extra safety)
+      // Double-check for ACTIVE tenant in target
       const existingActiveTenantInTarget = await prisma.tenant.findFirst({
         where: {
           unitId: targetUnit.id,
@@ -1813,7 +1860,6 @@ export const updateTenant = async (req, res) => {
         });
       }
 
-      // Check for unit price difference
       const currentUnitRent = existingTenant.rent || existingTenant.unit.rentAmount;
       const newUnitRent = targetUnit.rentAmount;
 
@@ -1903,10 +1949,6 @@ export const updateTenant = async (req, res) => {
       parsedVatRate = 0;
     }
 
-    // =============================================
-    // WITHHOLDING TAX VALIDATION FOR UPDATE
-    // =============================================
-
     // Validate withholding tax rate
     let parsedWithholdingTaxRate = undefined;
     if (withholdingTaxRate !== undefined) {
@@ -1943,15 +1985,12 @@ export const updateTenant = async (req, res) => {
       isExempt = isWithholdingTaxExempt === true;
     }
 
-    // Determine the final rent value
+    // Determine final rent value
     let finalRent = undefined;
     let parsedRent = undefined;
 
-    // If unit is being changed, the rent should default to the target unit's rent
-    // UNLESS the user explicitly provides a new rent value in the request
     if (unitId && unitId !== existingTenant.unitId && targetUnit) {
       if (rent !== undefined) {
-        // User explicitly provided a rent value, use that
         parsedRent = parseFloat(rent);
         if (isNaN(parsedRent) || parsedRent < 0) {
           return res.status(400).json({
@@ -1960,7 +1999,6 @@ export const updateTenant = async (req, res) => {
         }
         finalRent = parsedRent;
 
-        // Also update the target unit's rent to match if different
         if (targetUnit.rentAmount !== parsedRent) {
           await prisma.unit.update({
             where: { id: targetUnit.id },
@@ -1968,11 +2006,9 @@ export const updateTenant = async (req, res) => {
           });
         }
       } else {
-        // Use the target unit's rent
         finalRent = targetUnit.rentAmount;
       }
     } else if (rent !== undefined) {
-      // No unit change, but rent is being updated
       parsedRent = parseFloat(rent);
       if (isNaN(parsedRent) || parsedRent < 0) {
         return res.status(400).json({
@@ -1981,7 +2017,6 @@ export const updateTenant = async (req, res) => {
       }
       finalRent = parsedRent;
     } else {
-      // No changes to rent
       finalRent = existingTenant.rent;
     }
 
@@ -2006,13 +2041,11 @@ export const updateTenant = async (req, res) => {
       paymentPolicy: normalizedPaymentPolicy,
       vatRate: parsedVatRate,
       vatType: normalizedVatType,
-      // Withholding tax fields
       withholdingTaxRate: parsedWithholdingTaxRate,
       withholdingVatRate: parsedWithholdingVatRate,
       isWithholdingTaxExempt: isExempt,
     };
 
-    // If unit is being changed, update the unitId in tenant data
     if (unitId && unitId !== existingTenant.unitId) {
       updateData.unitId = unitId;
     }
@@ -2022,9 +2055,7 @@ export const updateTenant = async (req, res) => {
       if (updateData[key] === undefined) delete updateData[key];
     });
 
-    // =============================================
-    // EXECUTE UNIT TRANSFER (with transaction)
-    // =============================================
+    // Execute unit transfer (with transaction) if applicable
     let updatedTenant;
     let oldUnitId = existingTenant.unitId;
 
@@ -2053,9 +2084,7 @@ export const updateTenant = async (req, res) => {
         }
       }
 
-      // Use a transaction to ensure data consistency
       updatedTenant = await prisma.$transaction(async (tx) => {
-        // 1. Free up the old unit (set to VACANT)
         await tx.unit.update({
           where: { id: oldUnitId },
           data: {
@@ -2063,7 +2092,6 @@ export const updateTenant = async (req, res) => {
           }
         });
 
-        // 2. Update the new unit to OCCUPIED
         await tx.unit.update({
           where: { id: targetUnit.id },
           data: {
@@ -2071,7 +2099,6 @@ export const updateTenant = async (req, res) => {
           }
         });
 
-        // 3. Update the tenant with the new unit and rent
         const updated = await tx.tenant.update({
           where: { id: req.params.id },
           data: updateData,
@@ -2081,7 +2108,6 @@ export const updateTenant = async (req, res) => {
           },
         });
 
-        // 4. If rent is being updated, also update the unit's rent amount
         if (updateData.rent !== undefined) {
           await tx.unit.update({
             where: { id: targetUnit.id },
@@ -2092,7 +2118,6 @@ export const updateTenant = async (req, res) => {
         return updated;
       });
     } else {
-      // Regular update (no unit change)
       updatedTenant = await prisma.tenant.update({
         where: { id: req.params.id },
         data: updateData,
@@ -2102,7 +2127,6 @@ export const updateTenant = async (req, res) => {
         },
       });
 
-      // Update unit rent if changed and no unit change
       if (rent !== undefined && parsedRent !== existingTenant.rent) {
         await prisma.unit.update({
           where: { id: existingTenant.unitId },
@@ -2111,22 +2135,15 @@ export const updateTenant = async (req, res) => {
       }
     }
 
-    // =============================================
-    // HANDLE SERVICE CHARGE UPDATE
-    // =============================================
+    // Handle service charge update
     if (serviceCharge !== undefined) {
-      // Case 1: serviceCharge is null or explicitly wants to remove it
       if (serviceCharge === null) {
-        // Delete the service charge if it exists
         if (existingTenant.serviceCharge) {
           await prisma.serviceCharge.delete({
             where: { tenantId: req.params.id },
           });
         }
-      }
-      // Case 2: serviceCharge is an object (update or create)
-      else if (serviceCharge && typeof serviceCharge === 'object') {
-        // Validate type if provided
+      } else if (serviceCharge && typeof serviceCharge === 'object') {
         let normalizedType = undefined;
         if (serviceCharge.type !== undefined) {
           const validTypes = ["FIXED", "PERCENTAGE", "PER_SQ_FT"];
@@ -2138,7 +2155,6 @@ export const updateTenant = async (req, res) => {
           }
         }
 
-        // Validate service charge VAT type
         let normalizedServiceVatType = undefined;
         if (serviceCharge.vatType !== undefined) {
           const validVatTypes = ["INCLUSIVE", "EXCLUSIVE", "NOT_APPLICABLE"];
@@ -2150,7 +2166,6 @@ export const updateTenant = async (req, res) => {
           }
         }
 
-        // Validate service charge VAT rate
         let parsedServiceVatRate = undefined;
         if (serviceCharge.vatRate !== undefined) {
           if (serviceCharge.vatRate === null) {
@@ -2165,7 +2180,6 @@ export const updateTenant = async (req, res) => {
           }
         }
 
-        // Build update data with CORRECT field names
         const serviceChargeUpdateData = {};
 
         if (normalizedType !== undefined) {
@@ -2190,7 +2204,6 @@ export const updateTenant = async (req, res) => {
             : null;
         }
 
-        // Add VAT fields
         if (normalizedServiceVatType !== undefined) {
           serviceChargeUpdateData.vatType = normalizedServiceVatType;
         }
@@ -2199,26 +2212,21 @@ export const updateTenant = async (req, res) => {
           serviceChargeUpdateData.vatRate = parsedServiceVatRate;
         }
 
-        // If VAT type is NOT_APPLICABLE, force vatRate = 0
         if (normalizedServiceVatType === "NOT_APPLICABLE") {
           serviceChargeUpdateData.vatRate = 0;
         }
 
-        // Update or create service charge
         if (Object.keys(serviceChargeUpdateData).length > 0) {
-          // Check if we need to create or update
           const existingServiceCharge = await prisma.serviceCharge.findUnique({
             where: { tenantId: req.params.id },
           });
 
           if (existingServiceCharge) {
-            // Update existing
             await prisma.serviceCharge.update({
               where: { tenantId: req.params.id },
               data: serviceChargeUpdateData,
             });
           } else {
-            // Create new - ensure we have required fields
             const createData = {
               tenantId: req.params.id,
               type: serviceChargeUpdateData.type || 'FIXED',
@@ -2245,9 +2253,9 @@ export const updateTenant = async (req, res) => {
       },
     });
 
-    // Prepare response with unit transfer information
     const response = {
       ...finalTenant,
+      lifecycle: buildLifecycleMetadata(finalTenant),
       unitTransfer: null
     };
 
@@ -2262,7 +2270,6 @@ export const updateTenant = async (req, res) => {
       };
     }
 
-    // If there's a price warning, include it prominently
     if (unitPriceWarning) {
       response.priceWarning = unitPriceWarning;
     }
@@ -2285,16 +2292,24 @@ export const deleteTenant = async (req, res) => {
     // Check if user has delete permission
     const hasWriteAccess = await checkUserWriteAccess(userId, userRole, req.params.id, 'delete');
     if (!hasWriteAccess) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         message: 'Access denied. You do not have permission to delete this tenant.',
         requiredPermission: 'DELETE_TENANT'
       });
     }
 
+    // Validate + normalize optional leftReason (empty string → null, lowercase → uppercase)
+    let normalizedLeftReason;
+    try {
+      normalizedLeftReason = normalizeLeftReason(req.body?.leftReason);
+    } catch (err) {
+      return res.status(err.statusCode || 400).json({ message: err.message });
+    }
+
     // Fetch tenant with all related data
     const tenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
-      include: { 
+      include: {
         unit: true,
         serviceCharge: true,
         paymentReports: true,
@@ -2311,19 +2326,18 @@ export const deleteTenant = async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    // Check if tenant is already inactive
     if (tenant.status === 'LEFT') {
-      return res.status(400).json({ 
+      return res.status(400).json({
         message: 'Tenant has already been marked as left.',
         tenant: {
           id: tenant.id,
           name: tenant.fullName,
-          leftDate: tenant.updatedAt
+          leftAt: tenant.leftAt || tenant.updatedAt,
+          leftReason: tenant.leftReason
         }
       });
     }
 
-    // Store tenant info for response
     const tenantInfo = {
       id: tenant.id,
       name: tenant.fullName,
@@ -2332,15 +2346,17 @@ export const deleteTenant = async (req, res) => {
       rentAmount: tenant.rent
     };
 
-    // Use transaction for data consistency
+    const leftAtTimestamp = new Date();
+
     const result = await prisma.$transaction(async (tx) => {
-      // 1. SOFT DELETE: Mark tenant as LEFT (NOT actually deleting)
-      const updatedTenant = await tx.tenant.update({
-        where: { id: tenant.id },
-        data: {
-          status: 'LEFT'
-        }
-      });
+      // 1. SOFT DELETE — mark tenant as LEFT via the central helper.
+      //    markTenantAsLeft guarantees leftAt is always populated.
+      const updatedTenant = await markTenantAsLeft(
+        tx,
+        tenant.id,
+        normalizedLeftReason,
+        leftAtTimestamp
+      );
 
       // 2. Delete service charge if exists
       if (tenant.serviceCharge) {
@@ -2349,25 +2365,32 @@ export const deleteTenant = async (req, res) => {
         });
       }
 
-      // 3. Update unit to VACANT (keep the rent amount for next tenant)
-      await tx.unit.update({
-        where: { id: tenant.unitId },
-        data: { 
-          status: 'VACANT'
-          // rentAmount: tenant.rent // KEEP the rent amount
+      // 3. Free up unit ONLY if no other ACTIVE tenant shares it
+      const otherActiveInUnit = await tx.tenant.count({
+        where: {
+          unitId: tenant.unitId,
+          status: 'ACTIVE',
+          id: { not: tenant.id }
         }
       });
+
+      if (otherActiveInUnit === 0) {
+        await tx.unit.update({
+          where: { id: tenant.unitId },
+          data: { status: 'VACANT' }
+        });
+      }
 
       // 4. Update any outstanding invoices to show tenant left
       if (tenant.invoices && tenant.invoices.length > 0) {
         await tx.invoice.updateMany({
-          where: { 
+          where: {
             tenantId: tenant.id,
             status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
           },
           data: {
             status: 'OVERDUE',
-            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+            notes: `Tenant left property on ${leftAtTimestamp.toISOString().split('T')[0]}`
           }
         });
       }
@@ -2375,13 +2398,13 @@ export const deleteTenant = async (req, res) => {
       // 5. Update bill invoices
       if (tenant.billInvoices && tenant.billInvoices.length > 0) {
         await tx.billInvoice.updateMany({
-          where: { 
+          where: {
             tenantId: tenant.id,
             status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
           },
           data: {
             status: 'OVERDUE',
-            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+            notes: `Tenant left property on ${leftAtTimestamp.toISOString().split('T')[0]}`
           }
         });
       }
@@ -2389,13 +2412,13 @@ export const deleteTenant = async (req, res) => {
       // 6. Update bills
       if (tenant.bills && tenant.bills.length > 0) {
         await tx.bill.updateMany({
-          where: { 
+          where: {
             tenantId: tenant.id,
             status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
           },
           data: {
             status: 'OVERDUE',
-            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+            notes: `Tenant left property on ${leftAtTimestamp.toISOString().split('T')[0]}`
           }
         });
       }
@@ -2405,7 +2428,7 @@ export const deleteTenant = async (req, res) => {
         await tx.paymentReport.updateMany({
           where: { tenantId: tenant.id },
           data: {
-            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+            notes: `Tenant left property on ${leftAtTimestamp.toISOString().split('T')[0]}`
           }
         });
       }
@@ -2414,9 +2437,9 @@ export const deleteTenant = async (req, res) => {
       if (tenant.demandLetters && tenant.demandLetters.length > 0) {
         await tx.demandLetter.updateMany({
           where: { tenantId: tenant.id },
-          data: { 
+          data: {
             status: 'ESCALATED',
-            notes: `Tenant left property on ${new Date().toISOString().split('T')[0]}`
+            notes: `Tenant left property on ${leftAtTimestamp.toISOString().split('T')[0]}`
           }
         });
       }
@@ -2437,7 +2460,7 @@ export const deleteTenant = async (req, res) => {
       timeout: 15000
     });
 
-    res.json({ 
+    res.json({
       success: true,
       message: `Tenant '${tenantInfo.name}' marked as left property successfully. All historical records preserved.`,
       data: {
@@ -2445,21 +2468,24 @@ export const deleteTenant = async (req, res) => {
         tenantName: tenantInfo.name,
         unitId: tenantInfo.unitId,
         status: 'LEFT',
-        leftDate: new Date().toISOString(),
+        leftAt: leftAtTimestamp.toISOString(),
+        leftReason: normalizedLeftReason,
+        tenureDays: daysBetween(tenant.createdAt, leftAtTimestamp),
         preservedRentAmount: tenantInfo.rentAmount,
         preservedRecords: result.preservedRecords,
         note: 'All payment history, invoices, bills, and other records have been preserved.'
       }
     });
-    
+
   } catch (error) {
     console.error('Delete tenant error:', error);
-    res.status(400).json({ 
+    res.status(400).json({
       message: error.message,
-      error: error.message 
+      error: error.message
     });
   }
 };
+
 // @desc    Update tenant service charge
 // @route   PATCH /api/tenants/:id/service-charge
 // @access  Private (ADMIN, MANAGER, and USER with EDIT_TENANT permission)
@@ -2547,13 +2573,11 @@ export const updateServiceCharge = async (req, res) => {
     let serviceCharge;
 
     if (existingTenant.serviceCharge) {
-      // Update existing service charge
       serviceCharge = await prisma.serviceCharge.update({
         where: { tenantId: req.params.id },
         data: updateData
       });
     } else {
-      // Create new service charge
       serviceCharge = await prisma.serviceCharge.create({
         data: {
           tenantId: req.params.id,
@@ -2657,7 +2681,9 @@ export const getTenantFinancials = async (req, res) => {
       tenant: {
         id: financials.id,
         fullName: financials.fullName,
-        email: financials.email
+        email: financials.email,
+        status: financials.status,
+        lifecycle: buildLifecycleMetadata(financials)
       },
       summary: {
         totalPaid,
@@ -2711,14 +2737,12 @@ export const getAttachments = async (req, res) => {
       orderBy: { uploadedAt: 'desc' },
     });
 
-    // Get base URL from request - use the actual request host
+    // Get base URL from request
     const protocol = req.protocol || 'http';
     const host = req.get('host') || 'localhost:5000';
     const baseUrl = `${protocol}://${host}`;
 
-    // Add permission flags and preview/download URLs to each attachment
     const attachmentsWithPermissions = attachments.map(attachment => {
-      // Get the filename
       let fileName = attachment.fileName || attachment.url;
       if (fileName.includes('/') || fileName.includes('\\')) {
         fileName = fileName.replace(/\\/g, '/').split('/').pop();
@@ -2726,10 +2750,8 @@ export const getAttachments = async (req, res) => {
       
       return {
         ...attachment,
-        // Use relative paths for API endpoints (will be resolved by the frontend)
         previewUrl: `/api/tenants/attachments/${attachment.id}/preview`,
         downloadUrl: `/api/tenants/attachments/${attachment.id}/download`,
-        // Use frontend URL for file display
         url: `/uploads/${fileName}`,
         canEdit: isAdmin(userRole),
         canDelete: isAdmin(userRole),
@@ -2762,7 +2784,6 @@ export const uploadAttachment = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Check if user has edit permission for this tenant
     const { hasAccess } = await checkUserTenantAccess(userId, userRole, tenantId, 'edit');
     if (!hasAccess) {
       return res.status(403).json({
@@ -2780,10 +2801,8 @@ export const uploadAttachment = async (req, res) => {
 
     const { originalname, filename, path: filePath, mimetype, size } = req.file;
 
-    // Store only the filename (not the full path)
     const storedFileName = filename;
 
-    // Create attachment record in database
     const attachment = await prisma.attachment.create({
       data: {
         name: originalname,
@@ -2796,7 +2815,6 @@ export const uploadAttachment = async (req, res) => {
       },
     });
 
-    // Use relative paths for the frontend
     res.status(201).json({
       success: true,
       message: 'Attachment uploaded successfully',
@@ -2841,7 +2859,6 @@ export const previewAttachment = async (req, res) => {
       });
     }
 
-    // Check if user has view permission for the tenant
     const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'view');
     if (!hasAccess) {
       return res.status(403).json({
@@ -2850,16 +2867,13 @@ export const previewAttachment = async (req, res) => {
       });
     }
 
-    // Get the filename from the URL or fileName field
     let fileName = attachment.fileName || attachment.url;
-    // If it contains path separators, extract just the filename
     if (fileName.includes('/') || fileName.includes('\\')) {
       fileName = fileName.replace(/\\/g, '/').split('/').pop();
     }
     
-    // Check if file exists in the uploads directory
     const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-    const fullPath = path.resolve(uploadDir, fileName); // Use path.resolve() for absolute path
+    const fullPath = path.resolve(uploadDir, fileName);
     
     console.log('Preview - Looking for file at:', fullPath);
     
@@ -2871,7 +2885,6 @@ export const previewAttachment = async (req, res) => {
       });
     }
 
-    // Set headers for preview
     const fileExtension = attachment.name.split('.').pop().toLowerCase();
     const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(fileExtension);
     const isPdf = fileExtension === 'pdf';
@@ -2879,9 +2892,8 @@ export const previewAttachment = async (req, res) => {
     if (isImage || isPdf) {
       res.setHeader('Content-Type', attachment.mimeType || 'application/octet-stream');
       res.setHeader('Content-Disposition', `inline; filename="${attachment.name}"`);
-      return res.sendFile(fullPath); // Now fullPath is absolute
+      return res.sendFile(fullPath);
     } else {
-      // For all other files, redirect to download
       return res.redirect(`${process.env.BASE_URL || 'http://localhost:5000'}/api/tenants/attachments/${attachmentId}/download`);
     }
   } catch (error) {
@@ -3002,13 +3014,11 @@ export const deleteAttachment = async (req, res) => {
       });
     }
 
-    // Get the filename from the URL or fileName field
     let fileName = attachment.fileName || attachment.url;
     if (fileName.includes('/') || fileName.includes('\\')) {
       fileName = fileName.replace(/\\/g, '/').split('/').pop();
     }
     
-    // Delete the file from storage
     try {
       const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
       const fullPath = path.resolve(uploadDir, fileName);
@@ -3023,7 +3033,6 @@ export const deleteAttachment = async (req, res) => {
       }
     } catch (fsError) {
       console.error('Error deleting file from filesystem:', fsError);
-      // Continue with database deletion even if file deletion fails
     }
 
     await prisma.attachment.delete({
@@ -3064,7 +3073,6 @@ export const downloadAttachment = async (req, res) => {
       });
     }
 
-    // Check if user has view permission for the tenant
     const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'view');
     if (!hasAccess) {
       return res.status(403).json({
@@ -3073,15 +3081,13 @@ export const downloadAttachment = async (req, res) => {
       });
     }
 
-    // Get the filename from the URL or fileName field
     let fileName = attachment.fileName || attachment.url;
     if (fileName.includes('/') || fileName.includes('\\')) {
       fileName = fileName.replace(/\\/g, '/').split('/').pop();
     }
     
-    // Check if file exists
     const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-    const fullPath = path.resolve(uploadDir, fileName); // Use path.resolve() for absolute path
+    const fullPath = path.resolve(uploadDir, fileName);
     
     console.log('Download - Looking for file at:', fullPath);
     
@@ -3104,7 +3110,7 @@ export const downloadAttachment = async (req, res) => {
   }
 };
 
-// @desc    Restore a tenant (reactivate)
+// @desc    Restore a tenant (reactivate), optionally to a different unit in the same property
 // @route   PATCH /api/tenants/:id/restore
 // @access  Private (ADMIN only)
 export const restoreTenant = async (req, res) => {
@@ -3112,15 +3118,20 @@ export const restoreTenant = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Only admins can restore tenants
     if (userRole !== 'ADMIN') {
-      return res.status(403).json({ 
+      return res.status(403).json({
         message: 'Access denied. Only admins can restore tenants.'
       });
     }
 
+    const { unitId: requestedUnitId, rent: requestedRent } = req.body || {};
+
+    // Load tenant with current unit
     const tenant = await prisma.tenant.findUnique({
-      where: { id: req.params.id }
+      where: { id: req.params.id },
+      include: {
+        unit: { include: { property: true } }
+      }
     });
 
     if (!tenant) {
@@ -3131,21 +3142,175 @@ export const restoreTenant = async (req, res) => {
       return res.status(400).json({ message: 'Tenant is already active.' });
     }
 
-    const restoredTenant = await prisma.tenant.update({
-      where: { id: req.params.id },
-      data: { status: 'ACTIVE' }
+    // Resolve target unit (default: original unit)
+    const targetUnitId = requestedUnitId || tenant.unitId;
+    const isUnitChange = targetUnitId !== tenant.unitId;
+
+    const targetUnit = await prisma.unit.findUnique({
+      where: { id: targetUnitId },
+      include: {
+        property: true,
+        tenants: { where: { status: 'ACTIVE' } }
+      }
     });
 
-    // Also update the unit status if needed
-    await prisma.unit.update({
-      where: { id: tenant.unitId },
-      data: { status: 'OCCUPIED' }
-    });
+    if (!targetUnit) {
+      return res.status(404).json({ message: 'Target unit not found' });
+    }
 
-    res.json({
-      message: 'Tenant restored successfully',
-      tenant: restoredTenant
+    // Same-property rule
+    if (targetUnit.propertyId !== tenant.unit.propertyId) {
+      return res.status(400).json({
+        message: 'Cannot restore tenant to a unit in a different property.'
+      });
+    }
+
+    // Vacancy check
+    const activeTenantInTarget = targetUnit.tenants?.[0] || null;
+    const isOccupied =
+      targetUnit.status === 'OCCUPIED' || activeTenantInTarget !== null;
+
+    if (isOccupied) {
+      const reasons = [];
+      if (targetUnit.status === 'OCCUPIED') reasons.push(`Unit status is 'OCCUPIED'`);
+      if (activeTenantInTarget) reasons.push(`Unit has active tenant: ${activeTenantInTarget.fullName}`);
+      return res.status(400).json({
+        message: `Target unit is not vacant. (${reasons.join(', ')})`,
+        unitStatus: targetUnit.status,
+        hasTenant: !!activeTenantInTarget,
+        tenantName: activeTenantInTarget?.fullName || null
+      });
+    }
+
+    // Reconcile rent
+    let finalRent = tenant.rent;
+    if (requestedRent !== undefined && requestedRent !== null) {
+      const parsed = parseFloat(requestedRent);
+      if (isNaN(parsed) || parsed < 0) {
+        return res.status(400).json({ message: 'Rent must be a positive number' });
+      }
+      finalRent = parsed;
+    } else if (isUnitChange && targetUnit.rentAmount != null) {
+      finalRent = targetUnit.rentAmount;
+    }
+
+    // Re-check KRA/email uniqueness against OTHER tenants
+    const conflict = await prisma.tenant.findFirst({
+      where: {
+        id: { not: tenant.id },
+        OR: [{ email: tenant.email }, { KRAPin: tenant.KRAPin }]
+      }
     });
+    if (conflict) {
+      return res.status(400).json({
+        message: `Cannot restore: another tenant already uses this email or KRA PIN (${conflict.fullName}).`
+      });
+    }
+
+    // Transaction + race-condition re-check
+    const result = await prisma.$transaction(async (tx) => {
+      const freshUnit = await tx.unit.findUnique({
+        where: { id: targetUnitId },
+        include: { tenants: { where: { status: 'ACTIVE' } } }
+      });
+
+      if (!freshUnit) throw new Error('Target unit disappeared during restore.');
+
+      const freshActive = freshUnit.tenants?.[0] || null;
+      if (freshUnit.status === 'OCCUPIED' || freshActive) {
+        throw new Error(
+          `Target unit became occupied during restore${
+            freshActive ? ` by ${freshActive.fullName}` : ''
+          }.`
+        );
+      }
+
+      // If unit changed, free the old unit (only if no other ACTIVE tenant uses it)
+      if (isUnitChange) {
+        const oldUnitActive = await tx.tenant.count({
+          where: { unitId: tenant.unitId, status: 'ACTIVE' }
+        });
+        if (oldUnitActive === 0) {
+          await tx.unit.update({
+            where: { id: tenant.unitId },
+            data: { status: 'VACANT' }
+          });
+        }
+      }
+
+      // ============================================================
+      // Reactivate the tenant.
+      //
+      // LIFECYCLE INVARIANT:
+      //   - status = 'ACTIVE'  ⟹  leftAt IS NULL AND leftReason IS NULL
+      //   - status = 'LEFT'    ⟹  leftAt IS NOT NULL
+      //
+      // We explicitly clear BOTH leftAt and leftReason here so that a
+      // restored tenant doesn't leak stale churn metadata into active
+      // reports. If they later leave again, markTenantAsLeft() will
+      // write fresh values.
+      // ============================================================
+      const restored = await tx.tenant.update({
+        where: { id: tenant.id },
+        data: {
+          status: 'ACTIVE',
+          leftAt: null,
+          leftReason: null,
+          unitId: targetUnitId,
+          rent: finalRent
+        },
+        include: {
+          unit: { include: { property: true } },
+          serviceCharge: true
+        }
+      });
+
+      // Occupy the target unit
+      await tx.unit.update({
+        where: { id: targetUnitId },
+        data: {
+          status: 'OCCUPIED',
+          rentAmount: finalRent
+        }
+      });
+
+      // Clean up "left property" notes on still-outstanding invoices/bills.
+      const leftNoteFragment = 'Tenant left property on';
+      await tx.invoice.updateMany({
+        where: { tenantId: tenant.id, notes: { contains: leftNoteFragment } },
+        data: { notes: null }
+      });
+      await tx.billInvoice.updateMany({
+        where: { tenantId: tenant.id, notes: { contains: leftNoteFragment } },
+        data: { notes: null }
+      });
+      await tx.bill.updateMany({
+        where: { tenantId: tenant.id, notes: { contains: leftNoteFragment } },
+        data: { notes: null }
+      });
+
+      return restored;
+    }, { timeout: 15000 });
+
+    const response = {
+      success: true,
+      message: isUnitChange
+        ? `Tenant '${tenant.fullName}' restored to unit ${targetUnit.unitNo}.`
+        : `Tenant '${tenant.fullName}' restored to their original unit.`,
+      tenant: result,
+      lifecycle: buildLifecycleMetadata(result),
+      unitTransfer: isUnitChange
+        ? {
+            oldUnitId: tenant.unitId,
+            newUnitId: targetUnitId,
+            oldUnitRent: tenant.rent,
+            newUnitRent: finalRent,
+            status: 'completed'
+          }
+        : null
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Restore tenant error:', error);
     res.status(400).json({ message: error.message });
@@ -3159,90 +3324,112 @@ export const getLeftTenants = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
+    const { propertyId, leftReason, sortBy } = req.query;
 
-    // Only admins and managers can view departed tenants
     if (userRole === 'USER') {
       return res.status(403).json({ 
         message: 'Access denied. Users cannot view departed tenants.'
       });
     }
 
-    let tenants;
+    const where = { status: 'LEFT' };
 
-    if (userRole === 'ADMIN') {
-      tenants = await prisma.tenant.findMany({
-        where: {
-          status: 'LEFT'
-        },
-        include: {
-          unit: {
-            include: {
-              property: true
-            }
-          },
-          paymentReports: {
-            orderBy: { datePaid: 'desc' },
-            take: 5
-          },
-          invoices: {
-            where: {
-              status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
-            }
-          },
-          serviceCharge: true,
-          incomes: true
-        },
-        orderBy: { updatedAt: 'desc' }
-      });
-    } else if (userRole === 'MANAGER') {
-      tenants = await prisma.tenant.findMany({
-        where: {
-          status: 'LEFT',
-          unit: {
-            property: {
-              managerId: userId
-            }
-          }
-        },
-        include: {
-          unit: {
-            include: {
-              property: true
-            }
-          },
-          paymentReports: {
-            orderBy: { datePaid: 'desc' },
-            take: 5
-          },
-          invoices: {
-            where: {
-              status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
-            }
-          },
-          serviceCharge: true,
-          incomes: true
-        },
-        orderBy: { updatedAt: 'desc' }
-      });
+    if (userRole === 'MANAGER') {
+      where.unit = { property: { managerId: userId } };
     }
 
-    // Calculate summary statistics for departed tenants
+    if (propertyId) {
+      where.unit = { ...(where.unit || {}), propertyId };
+    }
+
+    if (leftReason) {
+      where.leftReason = String(leftReason).toUpperCase();
+    }
+
+    const orderBy = sortBy === 'leftAt'
+      ? { leftAt: 'desc' }
+      : { updatedAt: 'desc' };
+
+    const tenants = await prisma.tenant.findMany({
+      where,
+      include: {
+        unit: {
+          include: {
+            property: true
+          }
+        },
+        paymentReports: {
+          orderBy: { datePaid: 'desc' },
+          take: 5
+        },
+        invoices: {
+          where: {
+            status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+          }
+        },
+        billInvoices: {
+          where: {
+            status: { in: ['UNPAID', 'PARTIAL', 'OVERDUE'] }
+          }
+        },
+        serviceCharge: true,
+        incomes: true
+      },
+      orderBy
+    });
+
+    const enhancedTenants = tenants.map(tenant => {
+      const rentOutstanding = (tenant.invoices || []).reduce(
+        (sum, inv) => sum + (inv.balance ?? (inv.totalDue - inv.amountPaid)),
+        0
+      );
+      const billOutstanding = (tenant.billInvoices || []).reduce(
+        (sum, inv) => sum + (inv.balance ?? (inv.grandTotal - inv.amountPaid)),
+        0
+      );
+      const totalOutstanding = rentOutstanding + billOutstanding;
+
+      return {
+        ...tenant,
+        lifecycle: buildLifecycleMetadata(tenant),
+        financials: {
+          rentOutstanding: parseFloat(rentOutstanding.toFixed(2)),
+          billOutstanding: parseFloat(billOutstanding.toFixed(2)),
+          totalOutstanding: parseFloat(totalOutstanding.toFixed(2))
+        }
+      };
+    });
+
     const summary = {
-      totalDeparted: tenants.length,
-      withOutstandingBalance: tenants.filter(t => {
-        const totalInvoices = t.invoices?.reduce((sum, inv) => sum + (inv.totalDue - inv.amountPaid), 0) || 0;
-        return totalInvoices > 0;
-      }).length,
-      totalOutstanding: tenants.reduce((sum, t) => {
-        const totalInvoices = t.invoices?.reduce((s, inv) => s + (inv.totalDue - inv.amountPaid), 0) || 0;
-        return sum + totalInvoices;
-      }, 0)
+      totalDeparted: enhancedTenants.length,
+      withOutstandingBalance: enhancedTenants.filter(t => t.financials.totalOutstanding > 0).length,
+      withoutOutstandingBalance: enhancedTenants.filter(t => t.financials.totalOutstanding === 0).length,
+      totalRentOutstanding: parseFloat(
+        enhancedTenants.reduce((sum, t) => sum + t.financials.rentOutstanding, 0).toFixed(2)
+      ),
+      totalBillOutstanding: parseFloat(
+        enhancedTenants.reduce((sum, t) => sum + t.financials.billOutstanding, 0).toFixed(2)
+      ),
+      totalOutstanding: parseFloat(
+        enhancedTenants.reduce((sum, t) => sum + t.financials.totalOutstanding, 0).toFixed(2)
+      ),
+      byReason: enhancedTenants.reduce((acc, t) => {
+        const reason = t.leftReason || 'UNSPECIFIED';
+        acc[reason] = (acc[reason] || 0) + 1;
+        return acc;
+      }, {}),
+      averageTenureDays: enhancedTenants.length > 0
+        ? Math.round(
+            enhancedTenants.reduce((sum, t) => sum + (t.lifecycle.tenureDays || 0), 0) /
+              enhancedTenants.length
+          )
+        : 0
     };
 
     res.json({
       success: true,
       summary,
-      tenants: tenants
+      tenants: enhancedTenants
     });
   } catch (error) {
     console.error('Get left tenants error:', error);
@@ -3274,7 +3461,8 @@ export const getTenantStats = async (req, res) => {
         return res.json({
           active: 0,
           left: 0,
-          total: 0
+          total: 0,
+          byReason: {}
         });
       }
       
@@ -3290,7 +3478,8 @@ export const getTenantStats = async (req, res) => {
         return res.json({
           active: 0,
           left: 0,
-          total: 0
+          total: 0,
+          byReason: {}
         });
       }
       
@@ -3303,25 +3492,30 @@ export const getTenantStats = async (req, res) => {
       };
     }
 
-    const [activeCount, leftCount] = await Promise.all([
+    const [activeCount, leftCount, leftByReasonRaw] = await Promise.all([
       prisma.tenant.count({
-        where: {
-          ...whereClause,
-          status: 'ACTIVE'
-        }
+        where: { ...whereClause, status: 'ACTIVE' }
       }),
       prisma.tenant.count({
-        where: {
-          ...whereClause,
-          status: 'LEFT'
-        }
+        where: { ...whereClause, status: 'LEFT' }
+      }),
+      prisma.tenant.groupBy({
+        by: ['leftReason'],
+        where: { ...whereClause, status: 'LEFT' },
+        _count: { _all: true }
       })
     ]);
+
+    const byReason = leftByReasonRaw.reduce((acc, row) => {
+      acc[row.leftReason || 'UNSPECIFIED'] = row._count._all;
+      return acc;
+    }, {});
 
     res.json({
       active: activeCount,
       left: leftCount,
-      total: activeCount + leftCount
+      total: activeCount + leftCount,
+      byReason
     });
   } catch (error) {
     console.error('Get tenant stats error:', error);

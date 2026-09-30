@@ -7,18 +7,14 @@ const letterhead = fs.readFileSync(
 
 const letterheadBase64 = `data:image/jpeg;base64,${letterhead.toString("base64")}`;
 
-// Returns just the formatted number (no "Ksh" prefix) -- used inside the
-// stacked currency cell markup below, and anywhere a raw amount is needed.
 const amountOnly = (value) =>
   Number(value ?? 0).toLocaleString("en-KE", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
 
-// Stacked "KSH" label above the amount, for consistent currency display
-// across every cell in both the history table and the summary cards.
 const currencyCell = (value, options = {}) => {
-  const { emphasis = "" } = options; // e.g. "positive" | "warning" for colored amounts
+  const { emphasis = "" } = options;
   return `
 <div class="currency-cell">
   <span class="currency-label">KSH</span>
@@ -35,18 +31,57 @@ const statusColor = (status) =>
     ? "#0d6efd"
     : "#ef4444";
 
-/**
- * Build a single combined, letterhead-branded PDF listing every payment
- * report for a tenant, including the linked invoice number/date per row
- * (reference number reuses the invoice number, per product decision).
- *
- * NOTE: this HTML intentionally has NO footer -- the footer is rendered by
- * Puppeteer's own footerTemplate mechanism (see buildAllPaymentReportsFooterTemplate
- * below) so it repeats correctly at the bottom of every printed page.
- * A CSS position:fixed footer inside the page content does NOT repeat
- * reliably across multi-page PDFs in Chromium's print engine -- tested,
- * and it overlaps table content on longer payment histories.
- */
+//  NEW: how many months a policy spans
+const policyMonthsFor = (policy) => {
+  switch ((policy || "").toUpperCase()) {
+    case "QUARTERLY": return 3;
+    case "ANNUAL": return 12;
+    case "MONTHLY":
+    default: return 1;
+  }
+};
+
+//  FIX: format a period using the tenant's payment policy.
+// Normalizes the start to the 1st of the month BEFORE doing arithmetic,
+// so a start date like "28 Sept 2026" can't leak into December.
+const formatPaymentPeriodLabel = (startDate, paymentPolicy) => {
+  if (!startDate) return "-";
+  let start = new Date(startDate);
+  if (isNaN(start.getTime())) return "-";
+
+  // Snap to 1st of the month
+  start = new Date(start.getFullYear(), start.getMonth(), 1);
+
+  const months = policyMonthsFor(paymentPolicy);
+
+  if (months <= 1) {
+    return start.toLocaleDateString("en-KE", { month: "short", year: "numeric" });
+  }
+
+  // Last covered month = start + months - 1
+  const lastCoveredMonthStart = new Date(
+    start.getFullYear(),
+    start.getMonth() + months - 1,
+    1
+  );
+  // End day = last day of last covered month
+  const end = new Date(
+    lastCoveredMonthStart.getFullYear(),
+    lastCoveredMonthStart.getMonth() + 1,
+    0
+  );
+
+  const startYear = start.getFullYear();
+  const endYear = end.getFullYear();
+  const startMonth = start.toLocaleDateString("en-KE", { month: "short" });
+  const endMonth = end.toLocaleDateString("en-KE", { month: "short" });
+
+  if (startYear === endYear) {
+    return `${startMonth} - ${endMonth} ${startYear}`;
+  }
+  return `${startMonth} ${startYear} - ${endMonth} ${endYear}`;
+};
+
 export function buildAllPaymentReportsHtml(tenant, paymentReports) {
   if (!tenant) {
     throw new Error("Tenant not found");
@@ -63,13 +98,21 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
     return db - da;
   });
 
+  //  "Total Paid" = value of periods the tenant has covered.
+  // PAID / PREPAID → count totalDue; PARTIAL → count amountPaid; others → 0.
   const totals = sorted.reduce(
     (acc, r) => {
       acc.rent += Number(r.rent ?? 0);
       acc.serviceCharge += Number(r.serviceCharge ?? 0);
       acc.vat += Number(r.vat ?? 0);
       acc.totalDue += Number(r.totalDue ?? 0);
-      acc.amountPaid += Number(r.amountPaid ?? 0);
+
+      if (r.status === "PAID" || r.status === "PREPAID") {
+        acc.amountPaid += Number(r.totalDue ?? 0);
+      } else if (r.status === "PARTIAL") {
+        acc.amountPaid += Number(r.amountPaid ?? 0);
+      }
+
       acc.arrears += Number(r.arrears ?? 0);
       return acc;
     },
@@ -183,8 +226,6 @@ table.history td {
 
 table.history tbody tr:nth-child(even) { background: #f9fafb; }
 
-/* Stacked currency cell: small "KSH" label above a bold amount,
-   used consistently in every money column and in the summary cards. */
 .currency-cell {
   display: flex;
   flex-direction: column;
@@ -293,16 +334,29 @@ table.history tbody tr:nth-child(even) { background: #f9fafb; }
 <tbody>
 ${sorted
   .map((r) => {
-    // A PaymentReport can have multiple linked Invoices; the combined
-    // report shows the most relevant one (first match) per row.
     const invoice = (r.invoices && r.invoices[0]) || null;
+
+    //  FIX: prefer the linked invoice's policy, then the tenant's, then MONTHLY
+    const reportPolicy =
+      (invoice && invoice.paymentPolicy) ||
+      tenant.paymentPolicy ||
+      "MONTHLY";
+
+    //  FIX: prefer the invoice's own period string (authoritative),
+    // then fall back to deriving from the report's Date + policy
+    const periodLabel =
+      (invoice && invoice.paymentPeriod) ||
+      formatPaymentPeriodLabel(r.paymentPeriod, reportPolicy);
+
+    //  Paid column mirrors the summary rule
+    const paidCellValue =
+      r.status === "PAID" || r.status === "PREPAID"
+        ? Number(r.totalDue ?? 0)
+        : Number(r.amountPaid ?? 0);
+
     return `
 <tr>
-  <td>${
-    r.paymentPeriod
-      ? new Date(r.paymentPeriod).toLocaleDateString("en-KE", { month: "short", year: "numeric" })
-      : "-"
-  }</td>
+  <td>${periodLabel}</td>
   <td>${r.datePaid ? new Date(r.datePaid).toLocaleDateString("en-KE") : "-"}</td>
   <td>${invoice?.invoiceNumber ?? "-"}</td>
   <td>${invoice?.issueDate ? new Date(invoice.issueDate).toLocaleDateString("en-KE") : "-"}</td>
@@ -310,7 +364,7 @@ ${sorted
   <td>${r.serviceCharge ? currencyCell(r.serviceCharge) : "-"}</td>
   <td>${r.vat ? currencyCell(r.vat) : "-"}</td>
   <td>${currencyCell(r.totalDue)}</td>
-  <td>${currencyCell(r.amountPaid, { emphasis: "positive" })}</td>
+  <td>${currencyCell(paidCellValue, { emphasis: "positive" })}</td>
   <td>${currencyCell(r.arrears, { emphasis: r.arrears > 0 ? "warning" : "" })}</td>
   <td><span class="status-pill" style="background:${statusColor(r.status)}">${r.status ?? "-"}</span></td>
 </tr>`;
@@ -338,12 +392,6 @@ ${sorted
 `;
 }
 
-/**
- * Puppeteer footerTemplate for the combined report -- renders on every
- * printed page via page.pdf({ displayHeaderFooter: true, footerTemplate }).
- * Must be self-contained inline CSS; external stylesheets are not applied
- * inside header/footer templates.
- */
 export function buildAllPaymentReportsFooterTemplate() {
   return `
 <div style="font-size:9px; color:#888; width:100%; text-align:center; padding:0 45px; font-family:Arial,Helvetica,sans-serif; border-top:1px solid #ccc; padding-top:6px;">

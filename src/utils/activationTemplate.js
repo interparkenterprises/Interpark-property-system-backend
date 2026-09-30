@@ -16,9 +16,9 @@ const __dirname = path.dirname(__filename);
 export async function generateActivationPDF(activation) {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ 
+      const doc = new PDFDocument({
         margin: 50,
-        size: 'A4'
+        size: 'A4',
       });
       const chunks = [];
 
@@ -41,7 +41,7 @@ export async function generateActivationPDF(activation) {
 
       let letterheadPath = null;
       let imageLoaded = false;
-      
+
       for (const possiblePath of possiblePaths) {
         try {
           if (fs.existsSync(possiblePath)) {
@@ -66,9 +66,10 @@ export async function generateActivationPDF(activation) {
           const scale = maxWidth / dimensions.width;
           const scaledHeight = dimensions.height * scale;
           const finalHeight = Math.min(scaledHeight, 70);
-          const finalWidth = finalHeight !== scaledHeight
-            ? (dimensions.width * finalHeight) / dimensions.height
-            : maxWidth;
+          const finalWidth =
+            finalHeight !== scaledHeight
+              ? (dimensions.width * finalHeight) / dimensions.height
+              : maxWidth;
 
           const xPosition = 50 + (maxWidth - finalWidth) / 2;
 
@@ -84,16 +85,17 @@ export async function generateActivationPDF(activation) {
           console.warn('✗ Letterhead failed to load:', err.message);
         }
       }
-      
+
       // Fallback if no image loaded
       if (!imageLoaded) {
         console.warn('Using fallback text header');
         doc.y = 40;
-        doc.fontSize(16)
+        doc
+          .fontSize(16)
           .fillColor('#000000')
           .font('Helvetica-Bold')
-          .text('INTERPARK ENTERPRISES LIMITED', { 
-            align: 'center'
+          .text('INTERPARK ENTERPRISES LIMITED', {
+            align: 'center',
           });
         doc.moveDown(0.5);
       }
@@ -101,12 +103,15 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // HELPER FUNCTIONS
       // ===========================================
-      
+
       const formatDate = (date) => {
         if (!date) return '…………………………';
         const d = new Date(date);
         const day = d.getDate().toString().padStart(2, '0');
-        const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const monthNames = [
+          'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+        ];
         const month = monthNames[d.getMonth()];
         const year = d.getFullYear();
         return `${day} ${month} ${year}`;
@@ -114,21 +119,20 @@ export async function generateActivationPDF(activation) {
 
       const formatTime = (time) => {
         if (!time) return '…………………………';
-        
+
         // Clean the time string
         let cleanedTime = time.trim().toUpperCase();
-        
+
         // Check if time already contains AM/PM
         const hasAMPM = cleanedTime.includes('AM') || cleanedTime.includes('PM');
-        
+
         if (hasAMPM) {
-          // Time already has AM/PM - just clean any duplicates
-          // Remove duplicate AM/PM at the end (e.g., "9:00 AM AM" -> "9:00 AM")
+          // Remove duplicate AM/PM at the end
           cleanedTime = cleanedTime.replace(/(AM|PM)\s+(AM|PM)$/i, '$1');
           return cleanedTime;
         }
-        
-        // If time is in HH:MM format without AM/PM, convert to 12-hour with AM/PM
+
+        // If time is in HH:MM format without AM/PM, convert to 12-hour
         if (cleanedTime.includes(':')) {
           const [hours, minutes] = cleanedTime.split(':');
           const hour = parseInt(hours);
@@ -136,7 +140,7 @@ export async function generateActivationPDF(activation) {
           const hour12 = hour % 12 || 12;
           return `${hour12}:${minutes} ${ampm}`;
         }
-        
+
         return cleanedTime;
       };
 
@@ -146,16 +150,15 @@ export async function generateActivationPDF(activation) {
         return value;
       };
 
-      const formatBoolean = (value) => {
-        return value ? 'Yes' : 'No';
-      };
-
       const formatCurrency = (value) => {
         if (!value) return 'KES 0.00';
-        return `KES ${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+        return `KES ${Number(value).toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}`;
       };
 
-      // Updated drawUnderline - only draws if value is null/empty
+      // drawUnderline - only draws if value is null/empty
       const drawUnderline = (x, y, width, hasValue) => {
         if (!hasValue) {
           doc.moveTo(x, y).lineTo(x + width, y).stroke();
@@ -167,48 +170,55 @@ export async function generateActivationPDF(activation) {
         const rowHeight = 20;
         const col1Width = width * 0.6;
         const col2Width = width * 0.4;
-        
+
         let currentY = y;
-        
-        rows.forEach((row, index) => {
+
+        rows.forEach((row) => {
           // Draw cell borders
           doc.rect(x, currentY, col1Width, rowHeight).stroke();
           doc.rect(x + col1Width, currentY, col2Width, rowHeight).stroke();
-          
+
           // Draw text in cells
-          doc.fontSize(9)
-             .font('Helvetica')
-             .fillColor('#000000')
-             .text(row.label, x + 5, currentY + 6, {
-               width: col1Width - 10,
-               align: 'left'
-             });
-          
+          doc
+            .fontSize(9)
+            .font('Helvetica')
+            .fillColor('#000000')
+            .text(row.label, x + 5, currentY + 6, {
+              width: col1Width - 10,
+              align: 'left',
+            });
+
           doc.text(row.value, x + col1Width + 5, currentY + 6, {
             width: col2Width - 10,
-            align: 'left'
+            align: 'left',
           });
-          
+
           currentY += rowHeight;
         });
-        
+
         return currentY;
       };
 
       // Helper function to wrap text into multiple lines with numbering
-      const wrapTextWithNumbering = (text, number, x, startY, maxWidth, lineSpacing = 13) => {
+      const wrapTextWithNumbering = (
+        text,
+        number,
+        x,
+        startY,
+        maxWidth,
+        lineSpacing = 13
+      ) => {
         const prefix = `${number}. `;
         const availableWidth = maxWidth - doc.widthOfString(prefix);
-        
-        // Split text into words
+
         const words = text.split(' ');
         const lines = [];
         let currentLine = '';
-        
+
         for (const word of words) {
           const testLine = currentLine ? `${currentLine} ${word}` : word;
           const testWidth = doc.widthOfString(testLine);
-          
+
           if (testWidth <= availableWidth) {
             currentLine = testLine;
           } else {
@@ -216,85 +226,97 @@ export async function generateActivationPDF(activation) {
             currentLine = word;
           }
         }
-        
+
         if (currentLine) {
           lines.push(currentLine);
         }
-        
-        // Draw lines with proper numbering
+
         let currentY = startY;
-        
+
         for (let i = 0; i < lines.length; i++) {
           if (i === 0) {
-            // First line includes the number
             doc.text(`${prefix}${lines[i]}`, x, currentY);
           } else {
-            // Subsequent lines are indented
             const indent = doc.widthOfString(prefix);
             doc.text(lines[i], x + indent, currentY);
           }
           currentY += lineSpacing;
         }
-        
+
         return currentY;
       };
 
       // ===========================================
       // VAT CALCULATION LOGIC
+      // (Matches activation.controller.js calculateTotalLicenseFee + calculateVATDetails)
       // ===========================================
-        
+
       const calculateCosts = () => {
-        const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
-        const numberOfDays = activation.numberOfDays || 0;
-        
-        // CRITICAL FIX: 0 days = same-day activation = 1 day billing (minimum billing day)
-        const actualBillingDays = numberOfDays === 0 ? 1 : numberOfDays;
-        
-        const vatType = activation.vatType || 'EXCLUSIVE'; // Default to EXCLUSIVE
-        const vatRate = 0.16;
-        
+        const licenseFeePerDay =
+          activation.licenseFeePerDay || activation.proposedBudget || 0;
+
+        // numberOfDays may be 0, null, or undefined
+        const rawNumberOfDays =
+          activation.numberOfDays === null || activation.numberOfDays === undefined
+            ? 0
+            : Number(activation.numberOfDays);
+
+        // BILLING DAYS: 0 days = same-day activation = 1 billing day
+        // otherwise numberOfDays + 1 (inclusive billing)
+        const actualBillingDays =
+          rawNumberOfDays === 0 ? 1 : rawNumberOfDays + 1;
+
+        const vatType = activation.vatType || 'NOT_APPLICABLE';
+        // Use actual VAT rate from DB (default 16)
+        const vatRatePercent =
+          activation.vat !== null && activation.vat !== undefined
+            ? Number(activation.vat)
+            : 16;
+
         let subTotal = 0;
         let vatAmount = 0;
         let totalAmount = 0;
-        let displayLicenseFee = licenseFeePerDay;
-        
+
         switch (vatType) {
-          case 'INCLUSIVE':
+          case 'INCLUSIVE': {
             // License fee already includes VAT
             totalAmount = licenseFeePerDay * actualBillingDays;
-            subTotal = totalAmount / (1 + vatRate);
+            subTotal = totalAmount / (1 + vatRatePercent / 100);
             vatAmount = totalAmount - subTotal;
             break;
-            
-          case 'EXCLUSIVE':
+          }
+
+          case 'EXCLUSIVE': {
             // VAT needs to be added
             subTotal = licenseFeePerDay * actualBillingDays;
-            vatAmount = subTotal * vatRate;
+            vatAmount = subTotal * (vatRatePercent / 100);
             totalAmount = subTotal + vatAmount;
             break;
-            
-          case 'NOT_APPLICABLE':
-            // No VAT
+          }
+
+          case 'NOT_APPLICABLE': {
             subTotal = licenseFeePerDay * actualBillingDays;
             vatAmount = 0;
             totalAmount = subTotal;
             break;
-            
-          default:
-            // Fallback to EXCLUSIVE
+          }
+
+          default: {
             subTotal = licenseFeePerDay * actualBillingDays;
-            vatAmount = subTotal * vatRate;
-            totalAmount = subTotal + vatAmount;
+            vatAmount = 0;
+            totalAmount = subTotal;
+          }
         }
-        
+
         return {
-          licenseFeePerDay: displayLicenseFee,
-          numberOfDays: actualBillingDays, // Return actual billing days (1 if 0)
-          originalDays: numberOfDays, // Keep original for reference if needed
+          licenseFeePerDay,
+          numberOfDays: actualBillingDays,
+          originalDays: rawNumberOfDays,
           subTotal,
           vatAmount,
           totalAmount,
-          vatType
+          vatType,
+          vatRatePercent,
         };
       };
 
@@ -303,24 +325,26 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // DOCUMENT TITLE
       // ===========================================
-      
-      doc.fontSize(12)
-         .fillColor('#000000')
-         .font('Helvetica-Bold')
-         .text('APPLICATION FOR ACTIVATION/EXHIBITION SPACE', { 
-           align: 'center'
-         });
-      
+
+      doc
+        .fontSize(12)
+        .fillColor('#000000')
+        .font('Helvetica-Bold')
+        .text('APPLICATION FOR ACTIVATION/EXHIBITION SPACE', {
+          align: 'center',
+        });
+
       doc.moveDown(1);
 
       // ===========================================
       // PART 1: CLIENT INFORMATION
       // ===========================================
-      
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .text('PART 1 – CLIENT INFORMATION:', 50, doc.y);
-      
+
+      doc
+        .fontSize(10)
+        .font('Helvetica-Bold')
+        .text('PART 1 – CLIENT INFORMATION:', 50, doc.y);
+
       doc.moveDown(0.5);
 
       let currentY = doc.y;
@@ -336,7 +360,7 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // Postal address - SIMPLIFIED: Show as "P.O Box [number]" if numeric
+      // Postal address
       let postalAddress = formatValue(activation.postalAddress);
       if (postalAddress && /^\d+$/.test(postalAddress.trim())) {
         postalAddress = `P.O Box ${postalAddress}`;
@@ -396,48 +420,45 @@ export async function generateActivationPDF(activation) {
       doc.y = currentY;
 
       // ===========================================
-      // PART 2: DESCRIPTION OF ACTIVATION/EXHIBITION (WITH TABLE)
+      // PART 2: DESCRIPTION OF ACTIVATION/EXHIBITION
       // ===========================================
-      
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .text('PART 2 – DESCRIPTION OF THE ACTIVATION/EXHIBITION:', leftMargin, doc.y);
-      
+
+      doc
+        .fontSize(10)
+        .font('Helvetica-Bold')
+        .text('PART 2 – DESCRIPTION OF THE ACTIVATION/EXHIBITION:', leftMargin, doc.y);
+
       doc.moveDown(0.5);
       currentY = doc.y;
 
-      // Table for dates and times
-      doc.fontSize(9)
-         .font('Helvetica-Bold')
-         .text('Intended dates and time of the activation', leftMargin, currentY);
+      doc
+        .fontSize(9)
+        .font('Helvetica-Bold')
+        .text('Intended dates and time of the activation', leftMargin, currentY);
       currentY += 15;
 
       const dateRows = [
         { label: 'Activation/Exhibition Start Date:', value: formatDate(activation.startDate) },
         { label: 'Set Up Time', value: formatTime(activation.setupTime) },
         { label: 'Activation/Exhibition End Date:', value: formatDate(activation.endDate) },
-        { label: 'Tear Down Time:', value: formatTime(activation.tearDownTime) }
+        { label: 'Tear Down Time:', value: formatTime(activation.tearDownTime) },
       ];
 
       currentY = drawTable(leftMargin, currentY, 495, dateRows);
       currentY += 12;
 
-      // Nature of activation - FIXED to handle multiline text
       doc.font('Helvetica-Bold').text('Nature of the activation:', leftMargin, currentY);
       currentY += 15;
 
       doc.font('Helvetica');
-      
-      // Point 1: Activation Type
+
       const activationType = formatValue(activation.activationType) || '…………………………';
       doc.text(`1. ${activationType}`, leftMargin, currentY);
       currentY += 13;
-      
-      // Point 2: Description - Use the new wrap function
+
       const description = formatValue(activation.description) || 'Distribution details';
       currentY = wrapTextWithNumbering(description, 2, leftMargin, currentY, 495, 13);
-      
-      // Point 3: PA System
+
       const paSystemText = activation.soundSystem ? 'With PA system' : 'No PA system';
       doc.text(`3. ${paSystemText}`, leftMargin, currentY);
       currentY += 20;
@@ -445,34 +466,35 @@ export async function generateActivationPDF(activation) {
       doc.y = currentY;
 
       // ===========================================
-      // PART 3: COST OF ACTIVATION/EXHIBITION (WITH TABLE)
+      // PART 3: COST OF ACTIVATION/EXHIBITION
       // ===========================================
-      
-      // Check if we need a new page
+
       if (doc.y > doc.page.height - 250) {
         doc.addPage();
         doc.y = 50;
       }
-      
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .text('PART 3 – COST OF ACTIVATION/EXHIBITION:', leftMargin, doc.y);
-      
+
+      doc
+        .fontSize(10)
+        .font('Helvetica-Bold')
+        .text('PART 3 – COST OF ACTIVATION/EXHIBITION:', leftMargin, doc.y);
+
       doc.moveDown(0.5);
       currentY = doc.y;
 
-      // Cost table with VAT handling
       const costRows = [
         { label: 'License Fee per day:', value: formatCurrency(costs.licenseFeePerDay) },
         { label: 'No. of days:', value: costs.numberOfDays.toString() },
-        { label: 'Sub Total:', value: formatCurrency(costs.subTotal) }
+        { label: 'Sub Total:', value: formatCurrency(costs.subTotal) },
       ];
 
-      // Add VAT row based on vatType
       if (costs.vatType === 'NOT_APPLICABLE') {
         costRows.push({ label: 'VAT:', value: 'Not Applicable' });
       } else {
-        const vatLabel = costs.vatType === 'INCLUSIVE' ? 'VAT (16%) - Inclusive:' : 'VAT (16%):';
+        const vatLabel =
+          costs.vatType === 'INCLUSIVE'
+            ? `VAT (${costs.vatRatePercent}%) - Inclusive:`
+            : `VAT (${costs.vatRatePercent}%):`;
         costRows.push({ label: vatLabel, value: formatCurrency(costs.vatAmount) });
       }
 
@@ -481,13 +503,11 @@ export async function generateActivationPDF(activation) {
       currentY = drawTable(leftMargin, currentY, 495, costRows);
       currentY += 12;
 
-      // Payment Details
       doc.font('Helvetica-Bold').text('Payment Details:', leftMargin, currentY);
       currentY += 15;
 
       doc.font('Helvetica');
-      
-      // Bank name
+
       const bankName = formatValue(activation.bankName);
       doc.text('Bank name:', leftMargin, currentY);
       drawUnderline(leftMargin + 70, currentY + 10, 200, bankName);
@@ -496,7 +516,6 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // Branch
       const bankBranch = formatValue(activation.bankBranch);
       doc.text('Branch:', leftMargin, currentY);
       drawUnderline(leftMargin + 50, currentY + 10, 200, bankBranch);
@@ -505,7 +524,6 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // A/c name
       const accountName = formatValue(activation.accountName);
       doc.text('A/c name:', leftMargin, currentY);
       drawUnderline(leftMargin + 65, currentY + 10, 200, accountName);
@@ -514,7 +532,6 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // A/c no
       const accountNumber = formatValue(activation.accountNumber);
       doc.text('A/c no.', leftMargin, currentY);
       drawUnderline(leftMargin + 50, currentY + 10, 200, accountNumber);
@@ -523,7 +540,6 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // Swift Code
       const swiftCode = formatValue(activation.swiftCode);
       doc.text('Swift Code:', leftMargin, currentY);
       drawUnderline(leftMargin + 70, currentY + 10, 200, swiftCode);
@@ -532,21 +548,18 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing + 5;
 
-      // Mpesa Payment
       doc.font('Helvetica-Bold').text('Mpesa Payment:', leftMargin, currentY);
       currentY += 15;
 
       doc.font('Helvetica');
-      
-      // Paybill Number
+
       const paybillNumber = formatValue(activation.paybillNumber);
       doc.text('Paybill Number:', leftMargin, currentY);
       drawUnderline(leftMargin + 90, currentY + 10, 100, paybillNumber);
       if (paybillNumber) {
         doc.text(paybillNumber, leftMargin + 95, currentY);
       }
-      
-      // Account
+
       const mpesaAccount = formatValue(activation.mpesaAccount);
       doc.text('Account:', leftMargin + 230, currentY);
       drawUnderline(leftMargin + 275, currentY + 10, 160, mpesaAccount);
@@ -555,11 +568,15 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing + 8;
 
-      // Payment Note
-      doc.fontSize(8)
-         .font('Helvetica-Bold')
-         .fillColor('#000000')
-         .text('NB: FULL PAYMENT should be made prior to the activation/exhibition space being', leftMargin, currentY);
+      doc
+        .fontSize(8)
+        .font('Helvetica-Bold')
+        .fillColor('#000000')
+        .text(
+          'NB: FULL PAYMENT should be made prior to the activation/exhibition space being',
+          leftMargin,
+          currentY
+        );
       currentY += 10;
       doc.text('reserved. Payments once made are NOT refundable.', leftMargin, currentY);
       currentY += 25;
@@ -569,8 +586,7 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // CHECK IF WE NEED NEW PAGE FOR RULES
       // ===========================================
-      
-      // Check if we have enough space for rules (estimate)
+
       const rulesHeight = 11 * 40;
       if (doc.y + rulesHeight > doc.page.height - 50) {
         doc.addPage();
@@ -580,12 +596,13 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // PART 4: RULES & REGULATIONS
       // ===========================================
-      
-      doc.fontSize(10)
-         .font('Helvetica-Bold')
-         .fillColor('#000000')
-         .text('PART 4- EXHIBITION / ACTIVATION RULES & REGULATIONS', leftMargin, doc.y);
-      
+
+      doc
+        .fontSize(10)
+        .font('Helvetica-Bold')
+        .fillColor('#000000')
+        .text('PART 4- EXHIBITION / ACTIVATION RULES & REGULATIONS', leftMargin, doc.y);
+
       doc.moveDown(0.8);
 
       const rules = [
@@ -599,13 +616,12 @@ export async function generateActivationPDF(activation) {
         'You shall not use any sound system in the exhibition without prior approval of the Management of the Mall.',
         'You shall be required to assemble your exhibition area not earlier than 9pm and disassemble it by 6pm on the last day of the exhibition.',
         'You shall not undertake any political activities during the exhibition in default of which the Licensor may withdraw the License and no License Fee paid but not accrued shall be refundable.',
-        'You shall assume full responsibility for any loss or damage to the property of the Licensor or any third party or injury of any person howsoever caused during the exhibition, and shall on a full and unqualified basis indemnify the Licensor for any loss, damage, claim, suit judgement, decree or order howsoever arising from such loss, damage or injury.'
+        'You shall assume full responsibility for any loss or damage to the property of the Licensor or any third party or injury of any person howsoever caused during the exhibition, and shall on a full and unqualified basis indemnify the Licensor for any loss, damage, claim, suit judgement, decree or order howsoever arising from such loss, damage or injury.',
       ];
 
       doc.fontSize(8).font('Helvetica').fillColor('#000000');
 
       rules.forEach((rule, index) => {
-        // Check if we need a new page
         if (doc.y > doc.page.height - 60) {
           doc.addPage();
           doc.y = 50;
@@ -615,7 +631,7 @@ export async function generateActivationPDF(activation) {
         doc.text(ruleText, leftMargin, doc.y, {
           width: 500,
           align: 'justify',
-          lineGap: 2
+          lineGap: 2,
         });
         doc.moveDown(0.5);
       });
@@ -625,24 +641,23 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // ACCEPTANCE SECTION
       // ===========================================
-      
-      // Check if we need a new page for acceptance section
+
       if (doc.y > doc.page.height - 150) {
         doc.addPage();
         doc.y = 50;
       }
-      
-      doc.fontSize(9)
-         .font('Helvetica-Bold')
-         .fillColor('#000000')
-         .text('We/I accept and undertake to fully comply with the above terms.', leftMargin, doc.y);
-      
+
+      doc
+        .fontSize(9)
+        .font('Helvetica-Bold')
+        .fillColor('#000000')
+        .text('We/I accept and undertake to fully comply with the above terms.', leftMargin, doc.y);
+
       doc.moveDown(0.8);
 
       currentY = doc.y;
       doc.fontSize(9).font('Helvetica');
 
-      // Acceptance fields - Name
       const acceptanceName = formatValue(activation.contactPerson);
       doc.text('Name:', leftMargin, currentY);
       drawUnderline(leftMargin + 40, currentY + 10, 445, acceptanceName);
@@ -651,14 +666,13 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // Two columns for title and company
       const acceptanceDesignation = formatValue(activation.designation);
       doc.text('Your Title / Post:', leftMargin, currentY);
       drawUnderline(leftMargin + 85, currentY + 10, 140, acceptanceDesignation);
       if (acceptanceDesignation) {
         doc.text(acceptanceDesignation, leftMargin + 90, currentY);
       }
-      
+
       const acceptanceCompany = formatValue(activation.companyName);
       doc.text('Company Name:', leftMargin + 240, currentY);
       drawUnderline(leftMargin + 325, currentY + 10, 140, acceptanceCompany);
@@ -667,14 +681,13 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // Two columns for email and mobile
       const acceptanceEmail = formatValue(activation.email);
       doc.text('E-Mail Address:', leftMargin, currentY);
       drawUnderline(leftMargin + 85, currentY + 10, 140, acceptanceEmail);
       if (acceptanceEmail) {
         doc.text(acceptanceEmail, leftMargin + 90, currentY);
       }
-      
+
       const acceptanceMobile = formatValue(activation.mobileNo);
       doc.text('Mobile No:', leftMargin + 240, currentY);
       drawUnderline(leftMargin + 290, currentY + 10, 175, acceptanceMobile);
@@ -683,9 +696,12 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing + 8;
 
-      // Signature and Date
       doc.text('Signature: …..………………………………', leftMargin, currentY);
-      doc.text(`Date: ${formatDate(activation.signatureDate || activation.createdAt)}`, leftMargin + 230, currentY);
+      doc.text(
+        `Date: ${formatDate(activation.signatureDate || activation.createdAt)}`,
+        leftMargin + 230,
+        currentY
+      );
       currentY += fieldSpacing + 12;
 
       doc.y = currentY;
@@ -693,24 +709,23 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // FOR MANAGEMENT USE ONLY
       // ===========================================
-      
-      // Check if we need a new page
+
       if (doc.y > doc.page.height - 100) {
         doc.addPage();
         doc.y = 50;
       }
-      
-      doc.fontSize(9)
-         .font('Helvetica-Bold')
-         .fillColor('#000000')
-         .text('FOR MANAGEMENT USE ONLY:-', leftMargin, doc.y);
-      
+
+      doc
+        .fontSize(9)
+        .font('Helvetica-Bold')
+        .fillColor('#000000')
+        .text('FOR MANAGEMENT USE ONLY:-', leftMargin, doc.y);
+
       doc.moveDown(0.5);
       currentY = doc.y;
 
       doc.fontSize(9).font('Helvetica');
 
-      // Management fields - Name
       const managerName = formatValue(activation.manager?.name);
       doc.text('Name:', leftMargin, currentY);
       drawUnderline(leftMargin + 40, currentY + 10, 445, managerName);
@@ -719,32 +734,32 @@ export async function generateActivationPDF(activation) {
       }
       currentY += fieldSpacing;
 
-      // Designation and Signature
-      const managerDesignation = formatValue(activation.managerDesignation || activation.manager?.role);
+      const managerDesignation = formatValue(
+        activation.managerDesignation || activation.manager?.role
+      );
       doc.text('Designation/Title:', leftMargin, currentY);
       drawUnderline(leftMargin + 95, currentY + 10, 160, managerDesignation);
       if (managerDesignation) {
         doc.text(managerDesignation, leftMargin + 100, currentY);
       }
-      
+
       doc.text('Signature:', leftMargin + 270, currentY);
-      drawUnderline(leftMargin + 320, currentY + 10, 145, false); // Always show signature line
+      drawUnderline(leftMargin + 320, currentY + 10, 145, false);
       currentY += fieldSpacing;
 
-      // Date and Paid status
       const approvalDate = activation.approvedAt || activation.updatedAt;
       doc.text('Date:', leftMargin, currentY);
       drawUnderline(leftMargin + 30, currentY + 10, 150, approvalDate);
       if (approvalDate) {
         doc.text(formatDate(approvalDate), leftMargin + 35, currentY);
       }
-      
-      // Paid status
-      const paidStatus = activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
+
+      const paidStatus =
+        activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
       doc.text('Paid: Yes:', leftMargin + 220, currentY);
       drawUnderline(leftMargin + 270, currentY + 10, 50, false);
       if (paidStatus) doc.text('✓', leftMargin + 285, currentY);
-      
+
       doc.text('No:', leftMargin + 340, currentY);
       drawUnderline(leftMargin + 365, currentY + 10, 50, false);
       if (!paidStatus) doc.text('✓', leftMargin + 380, currentY);
@@ -755,7 +770,7 @@ export async function generateActivationPDF(activation) {
       // ===========================================
       // END DOCUMENT
       // ===========================================
-      
+
       doc.end();
     } catch (error) {
       console.error('Activation PDF Generation Error:', error);
@@ -774,7 +789,10 @@ export const generateActivationHTML = (activation) => {
     if (!date) return '…………………………';
     const d = new Date(date);
     const day = d.getDate().toString().padStart(2, '0');
-    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const monthNames = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
     const month = monthNames[d.getMonth()];
     const year = d.getFullYear();
     return `${day} ${month} ${year}`;
@@ -792,69 +810,80 @@ export const generateActivationHTML = (activation) => {
     return value !== null && value !== undefined && value !== '';
   };
 
-  const formatBoolean = (value) => {
-    return value ? 'Yes' : 'No';
-  };
-
   const formatCurrency = (value) => {
     if (!value) return 'KES 0.00';
-    return `KES ${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return `KES ${Number(value).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
   };
 
   // VAT Calculation Logic for HTML
+  // (matches activation.controller.js calculateTotalLicenseFee + calculateVATDetails)
   const calculateCosts = () => {
-    const licenseFeePerDay = activation.licenseFeePerDay || activation.proposedBudget || 0;
-    const numberOfDays = activation.numberOfDays || 0;
-    
-    // CRITICAL FIX: 0 days = same-day activation = 1 day billing
-    const actualBillingDays = numberOfDays === 0 ? 1 : numberOfDays;
-    
-    const vatType = activation.vatType || 'EXCLUSIVE';
-    const vatRate = 0.16;
-    
+    const licenseFeePerDay =
+      activation.licenseFeePerDay || activation.proposedBudget || 0;
+
+    const rawNumberOfDays =
+      activation.numberOfDays === null || activation.numberOfDays === undefined
+        ? 0
+        : Number(activation.numberOfDays);
+
+    // BILLING DAYS: 0 days = 1 billing day, otherwise numberOfDays + 1
+    const actualBillingDays =
+      rawNumberOfDays === 0 ? 1 : rawNumberOfDays + 1;
+
+    const vatType = activation.vatType || 'NOT_APPLICABLE';
+    const vatRatePercent =
+      activation.vat !== null && activation.vat !== undefined
+        ? Number(activation.vat)
+        : 16;
+
     let subTotal = 0;
     let vatAmount = 0;
     let totalAmount = 0;
-    
+
     switch (vatType) {
       case 'INCLUSIVE':
         totalAmount = licenseFeePerDay * actualBillingDays;
-        subTotal = totalAmount / (1 + vatRate);
+        subTotal = totalAmount / (1 + vatRatePercent / 100);
         vatAmount = totalAmount - subTotal;
         break;
-        
+
       case 'EXCLUSIVE':
         subTotal = licenseFeePerDay * actualBillingDays;
-        vatAmount = subTotal * vatRate;
+        vatAmount = subTotal * (vatRatePercent / 100);
         totalAmount = subTotal + vatAmount;
         break;
-        
+
       case 'NOT_APPLICABLE':
         subTotal = licenseFeePerDay * actualBillingDays;
         vatAmount = 0;
         totalAmount = subTotal;
         break;
-        
+
       default:
         subTotal = licenseFeePerDay * actualBillingDays;
-        vatAmount = subTotal * vatRate;
-        totalAmount = subTotal + vatAmount;
+        vatAmount = 0;
+        totalAmount = subTotal;
     }
-    
+
     return {
       licenseFeePerDay,
-      numberOfDays: actualBillingDays, // Show 1 instead of 0
+      numberOfDays: actualBillingDays,
+      originalDays: rawNumberOfDays,
       subTotal,
       vatAmount,
       totalAmount,
-      vatType
+      vatType,
+      vatRatePercent,
     };
   };
 
   const costs = calculateCosts();
-  const paidStatus = activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
+  const paidStatus =
+    activation.paymentStatus === 'PAID' || activation.status === 'APPROVED';
 
-  // Helper to format postal address
   const getFormattedPostalAddress = () => {
     const postal = formatValue(activation.postalAddress);
     if (postal && /^\d+$/.test(postal.trim())) {
@@ -863,14 +892,13 @@ export const generateActivationHTML = (activation) => {
     return postal;
   };
 
-  // Generate VAT row label
   const getVATLabel = () => {
     if (costs.vatType === 'NOT_APPLICABLE') {
       return 'VAT:';
     } else if (costs.vatType === 'INCLUSIVE') {
-      return 'VAT (16%) - Inclusive:';
+      return `VAT (${costs.vatRatePercent}%) - Inclusive:`;
     } else {
-      return 'VAT (16%):';
+      return `VAT (${costs.vatRatePercent}%):`;
     }
   };
 
@@ -890,11 +918,7 @@ export const generateActivationHTML = (activation) => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Activation Request - ${activation.requestNumber}</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
 
     body {
       font-family: Arial, sans-serif;
@@ -952,22 +976,11 @@ export const generateActivationHTML = (activation) => {
       min-height: 16px;
     }
 
-    .field-value.has-value {
-      border-bottom: none;
-    }
+    .field-value.has-value { border-bottom: none; }
+    .field-value.no-value { border-bottom: 1px solid #000; }
 
-    .field-value.no-value {
-      border-bottom: 1px solid #000;
-    }
-
-    .two-col {
-      display: flex;
-      gap: 15px;
-    }
-
-    .two-col .field-row {
-      flex: 1;
-    }
+    .two-col { display: flex; gap: 15px; }
+    .two-col .field-row { flex: 1; }
 
     table {
       width: 100%;
@@ -981,13 +994,8 @@ export const generateActivationHTML = (activation) => {
       padding: 6px;
     }
 
-    table td:first-child {
-      width: 60%;
-    }
-
-    table td:last-child {
-      width: 40%;
-    }
+    table td:first-child { width: 60%; }
+    table td:last-child { width: 40%; }
 
     .nature-list {
       margin-left: 15px;
@@ -1000,9 +1008,7 @@ export const generateActivationHTML = (activation) => {
       line-height: 1.3;
     }
 
-    .nature-list div.multi-line {
-      margin-bottom: 12px;
-    }
+    .nature-list div.multi-line { margin-bottom: 12px; }
 
     .payment-note {
       font-size: 8px;
@@ -1040,11 +1046,7 @@ export const generateActivationHTML = (activation) => {
       font-size: 9pt;
     }
 
-    @media print {
-      body {
-        padding: 15px;
-      }
-    }
+    @media print { body { padding: 15px; } }
   </style>
 </head>
 <body>
@@ -1058,7 +1060,7 @@ export const generateActivationHTML = (activation) => {
 
   <!-- PART 1: CLIENT INFORMATION -->
   <div class="section-title">PART 1 – CLIENT INFORMATION:</div>
-  
+
   <div class="field-row">
     <span class="field-label">Company Name</span>
     <span class="field-value ${hasValue(activation.companyName) ? 'has-value' : 'no-value'}">
@@ -1108,9 +1110,9 @@ export const generateActivationHTML = (activation) => {
     </span>
   </div>
 
-  <!-- PART 2: DESCRIPTION WITH TABLE -->
+  <!-- PART 2: DESCRIPTION -->
   <div class="section-title">PART 2 – DESCRIPTION OF THE ACTIVATION/EXHIBITION:</div>
-  
+
   <div style="font-weight: bold; margin-bottom: 8px; font-size: 9pt;">Intended dates and time of the activation</div>
 
   <table>
@@ -1139,9 +1141,9 @@ export const generateActivationHTML = (activation) => {
     <div>3. ${activation.soundSystem ? 'With PA system' : 'No PA system'}</div>
   </div>
 
-  <!-- PART 3: COST WITH TABLE -->
+  <!-- PART 3: COST -->
   <div class="section-title">PART 3 – COST OF ACTIVATION/EXHIBITION:</div>
-  
+
   <table>
     <tr>
       <td>License Fee per day:</td>
@@ -1166,7 +1168,7 @@ export const generateActivationHTML = (activation) => {
   </table>
 
   <div style="font-weight: bold; margin-top: 10px; font-size: 9pt;">Payment Details:</div>
-  
+
   <div class="field-row">
     <span class="field-label">Bank name:</span>
     <span class="field-value ${hasValue(activation.bankName) ? 'has-value' : 'no-value'}">
@@ -1203,7 +1205,7 @@ export const generateActivationHTML = (activation) => {
   </div>
 
   <div style="font-weight: bold; margin-top: 10px; font-size: 9pt;">Mpesa Payment:</div>
-  
+
   <div class="two-col">
     <div class="field-row">
       <span class="field-label">Paybill Number:</span>
@@ -1225,7 +1227,7 @@ export const generateActivationHTML = (activation) => {
 
   <!-- PART 4: RULES -->
   <div class="section-title">PART 4- EXHIBITION / ACTIVATION RULES & REGULATIONS</div>
-  
+
   <ol class="rules-list">
     <li>You shall be required to obtain the requisite permits, licenses or approvals from the competent authorities.</li>
     <li>You shall be required to declare any third parties and / or co-sponsors participating in a promotion at the time of the application hereof and or prior to the date of the scheduled activation.</li>
@@ -1243,7 +1245,7 @@ export const generateActivationHTML = (activation) => {
   <!-- ACCEPTANCE -->
   <div class="acceptance-section">
     <div style="font-weight: bold; margin-bottom: 10px;">We/I accept and undertake to fully comply with the above terms.</div>
-    
+
     <div class="field-row">
       <span class="field-label">Name:</span>
       <span class="field-value ${hasValue(activation.contactPerson) ? 'has-value' : 'no-value'}">
@@ -1290,7 +1292,7 @@ export const generateActivationHTML = (activation) => {
   <!-- MANAGEMENT -->
   <div class="management-section">
     <div style="font-weight: bold; margin-bottom: 10px;">FOR MANAGEMENT USE ONLY:-</div>
-    
+
     <div class="field-row">
       <span class="field-label">Name:</span>
       <span class="field-value ${hasValue(activation.manager?.name) ? 'has-value' : 'no-value'}">

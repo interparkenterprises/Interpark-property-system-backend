@@ -75,27 +75,25 @@ export const calculateBillInvoiceAnalytics = (billInvoices) => {
   const totalAmount = billInvoices.reduce((sum, b) => sum + positive(b.grandTotal), 0);
   const totalPaid = billInvoices.reduce((sum, b) => sum + positive(b.amountPaid), 0);
   const totalOutstanding = billInvoices.reduce((sum, b) => sum + positive(b.balance), 0);
-  
+
   const overdue = billInvoices.filter(b => b.status === 'OVERDUE' && positive(b.balance) > 0);
   const totalOverdue = overdue.reduce((sum, b) => sum + positive(b.balance), 0);
-  
+
   const byType = {};
   const byStatus = {};
-  
+
   for (const invoice of billInvoices) {
-    // By bill type
     const type = invoice.billType || 'UNKNOWN';
     if (!byType[type]) byType[type] = { label: type, count: 0, amount: 0 };
     byType[type].count += 1;
     byType[type].amount += positive(invoice.grandTotal);
-    
-    // By status
+
     const status = invoice.status || 'UNKNOWN';
     if (!byStatus[status]) byStatus[status] = { label: status, count: 0, amount: 0 };
     byStatus[status].count += 1;
     byStatus[status].amount += positive(invoice.grandTotal);
   }
-  
+
   return {
     summary: {
       totalBillInvoices: total,
@@ -112,28 +110,25 @@ export const calculateBillInvoiceAnalytics = (billInvoices) => {
 };
 
 // ========== COMPREHENSIVE INVOICE ANALYTICS ==========
-export const calculateComprehensiveInvoiceAnalytics = (rentInvoices, billInvoices) => {
-  // Rent Invoice Summary
+export const calculateComprehensiveInvoiceAnalytics = (rentInvoices, billInvoices, asOfExclusive) => {
   const rentTotal = rentInvoices.reduce((sum, i) => sum + positive(i.totalDue), 0);
   const rentPaid = rentInvoices.reduce((sum, i) => sum + positive(i.amountPaid), 0);
   const rentOutstanding = rentInvoices.reduce((sum, i) => sum + positive(i.balance), 0);
   const rentOverdue = rentInvoices.filter(i => i.status === 'OVERDUE' && positive(i.balance) > 0);
   const rentOverdueAmount = rentOverdue.reduce((sum, i) => sum + positive(i.balance), 0);
-  
-  // Bill Invoice Summary
+
   const billTotal = billInvoices.reduce((sum, i) => sum + positive(i.grandTotal), 0);
   const billPaid = billInvoices.reduce((sum, i) => sum + positive(i.amountPaid), 0);
   const billOutstanding = billInvoices.reduce((sum, i) => sum + positive(i.balance), 0);
   const billOverdue = billInvoices.filter(i => i.status === 'OVERDUE' && positive(i.balance) > 0);
   const billOverdueAmount = billOverdue.reduce((sum, i) => sum + positive(i.balance), 0);
-  
-  // Combined
+
   const totalInvoices = rentInvoices.length + billInvoices.length;
   const totalAmount = rentTotal + billTotal;
   const totalPaid = rentPaid + billPaid;
   const totalOutstanding = rentOutstanding + billOutstanding;
   const totalOverdue = rentOverdueAmount + billOverdueAmount;
-  
+
   return {
     summary: {
       totalInvoices,
@@ -161,17 +156,23 @@ export const calculateComprehensiveInvoiceAnalytics = (rentInvoices, billInvoice
         collectionRate: collectionRate(billPaid, billTotal)
       }
     },
-    aging: calculateAgingBuckets([...rentInvoices, ...billInvoices.map(b => ({
-      ...b,
-      totalDue: b.grandTotal,
-      amountPaid: b.amountPaid
-    }))])
+    aging: calculateAgingBuckets(
+      [
+        ...rentInvoices,
+        ...billInvoices.map(b => ({ ...b, totalDue: b.grandTotal, amountPaid: b.amountPaid }))
+      ],
+      asOfExclusive
+    )
   };
 };
 
-// ========== AGING BUCKETS ==========
-export const calculateAgingBuckets = (invoices) => {
-  const now = new Date();
+// ========== AGING BUCKETS (asOf-aware) ==========
+/**
+ * Aging is relative to `asOf`. Pass filters.asOfExclusive so that
+ * "as of last month" actually ages against the end of last month.
+ */
+export const calculateAgingBuckets = (invoices, asOf = new Date()) => {
+  const asOfDate = asOf instanceof Date ? asOf : new Date(asOf);
   const buckets = {
     current: { count: 0, amount: 0 },
     '1-30': { count: 0, amount: 0 },
@@ -179,25 +180,28 @@ export const calculateAgingBuckets = (invoices) => {
     '61-90': { count: 0, amount: 0 },
     '90+': { count: 0, amount: 0 }
   };
-  
+
   for (const invoice of invoices) {
     if (invoice.status === 'PAID' || invoice.status === 'CANCELLED') continue;
     if (positive(invoice.balance) <= 0) continue;
-    
+
     const dueDate = new Date(invoice.dueDate);
-    const daysOverdue = Math.max(0, Math.floor((now - dueDate) / (1000 * 60 * 60 * 24)));
-    
+    const daysOverdue = Math.max(
+      0,
+      Math.floor((asOfDate - dueDate) / (1000 * 60 * 60 * 24))
+    );
+
     let bucket;
     if (daysOverdue === 0) bucket = 'current';
     else if (daysOverdue <= 30) bucket = '1-30';
     else if (daysOverdue <= 60) bucket = '31-60';
     else if (daysOverdue <= 90) bucket = '61-90';
     else bucket = '90+';
-    
+
     buckets[bucket].count += 1;
     buckets[bucket].amount += positive(invoice.balance);
   }
-  
+
   return Object.entries(buckets).map(([label, data]) => ({
     label,
     ...data,
@@ -207,10 +211,9 @@ export const calculateAgingBuckets = (invoices) => {
 
 // ========== INVOICE PERFORMANCE METRICS ==========
 export const calculateInvoicePerformanceMetrics = (rentInvoices, billInvoices) => {
-  // Payment velocity (average days to pay)
   const paidRentInvoices = rentInvoices.filter(i => i.status === 'PAID' && i.amountPaid > 0);
   const paidBillInvoices = billInvoices.filter(i => i.status === 'PAID' && i.amountPaid > 0);
-  
+
   const calculateAvgDaysToPay = (invoices) => {
     if (invoices.length === 0) return null;
     const totalDays = invoices.reduce((sum, inv) => {
@@ -221,20 +224,19 @@ export const calculateInvoicePerformanceMetrics = (rentInvoices, billInvoices) =
     }, 0);
     return money(totalDays / invoices.length);
   };
-  
-  // On-time payment rate
+
   const rentPaidOnTime = paidRentInvoices.filter(inv => {
     const dueDate = new Date(inv.dueDate);
     const paymentDate = new Date(inv.updatedAt || inv.createdAt);
     return paymentDate <= dueDate;
   });
-  
+
   const billPaidOnTime = paidBillInvoices.filter(inv => {
     const dueDate = new Date(inv.dueDate);
     const paymentDate = new Date(inv.updatedAt || inv.createdAt);
     return paymentDate <= dueDate;
   });
-  
+
   return {
     paymentVelocity: {
       rentInvoices: calculateAvgDaysToPay(paidRentInvoices),
@@ -242,7 +244,7 @@ export const calculateInvoicePerformanceMetrics = (rentInvoices, billInvoices) =
       overall: calculateAvgDaysToPay([...paidRentInvoices, ...paidBillInvoices])
     },
     onTimePaymentRate: {
-      rentInvoices: paidRentInvoices.length > 0 ? 
+      rentInvoices: paidRentInvoices.length > 0 ?
         money((rentPaidOnTime.length / paidRentInvoices.length) * 100) : null,
       billInvoices: paidBillInvoices.length > 0 ?
         money((billPaidOnTime.length / paidBillInvoices.length) * 100) : null
@@ -330,16 +332,6 @@ export const calculateCollectionsTrend = (reports, grain) => {
 };
 
 // ========== OCCUPANCY ==========
-/**
- * Occupancy calculation.
- *
- * IMPORTANT: `units` here must already be selected with the array relation:
- *   select: { id: true, status: true, tenants: { where: { status: 'ACTIVE' }, select: { id: true } } }
- *
- * A unit is "occupied with tenant" when its status is OCCUPIED AND it has
- * at least one ACTIVE tenant in `unit.tenants`. The two flags below expose
- * data inconsistencies that used to be silently ignored.
- */
 export const calculateOccupancy = units => {
   const totalUnits = units.length;
   const occupiedUnits = units.filter(unit => unit.status === 'OCCUPIED').length;
@@ -368,15 +360,19 @@ export const calculateOccupancy = units => {
   };
 };
 
-// ========== REVENUE BY PROPERTY ==========
+// ========== REVENUE BY PROPERTY (with Unassigned bucket) ==========
+const UNASSIGNED_PROPERTY_ID = '__unassigned__';
+
 export const calculateRevenueByProperty = invoices => {
   const properties = new Map();
   for (const invoice of invoices) {
     const property = invoice.tenant?.unit?.property;
-    if (!property) continue;
-    const bucket = properties.get(property.id) || {
-      propertyId: property.id,
-      propertyName: property.name,
+    const id = property?.id || UNASSIGNED_PROPERTY_ID;
+    const name = property?.name || 'Unassigned';
+
+    const bucket = properties.get(id) || {
+      propertyId: id,
+      propertyName: name,
       billed: 0,
       paid: 0,
       outstanding: 0,
@@ -386,7 +382,7 @@ export const calculateRevenueByProperty = invoices => {
     bucket.paid += positive(invoice.amountPaid);
     bucket.outstanding += positive(invoice.balance);
     bucket.invoiceCount += 1;
-    properties.set(property.id, bucket);
+    properties.set(id, bucket);
   }
   return [...properties.values()].map(bucket => ({
     ...bucket,
@@ -394,7 +390,12 @@ export const calculateRevenueByProperty = invoices => {
     paid: money(bucket.paid),
     outstanding: money(bucket.outstanding),
     collectionRate: collectionRate(bucket.paid, bucket.billed)
-  })).sort((a, b) => b.paid - a.paid || a.propertyName.localeCompare(b.propertyName));
+  })).sort((a, b) => {
+    // Keep Unassigned at the bottom regardless of amount
+    if (a.propertyId === UNASSIGNED_PROPERTY_ID) return 1;
+    if (b.propertyId === UNASSIGNED_PROPERTY_ID) return -1;
+    return b.paid - a.paid || a.propertyName.localeCompare(b.propertyName);
+  });
 };
 
 // ========== BILL ANALYTICS ==========
@@ -402,7 +403,6 @@ export const calculateBillAnalytics = (bills) => {
   const totalBills = bills.length;
   const totalAmount = bills.reduce((sum, b) => sum + positive(b.totalAmount), 0);
   const totalPaid = bills.reduce((sum, b) => sum + positive(b.amountPaid), 0);
-  // Calculate balance from totalAmount - amountPaid since balance doesn't exist on Bill
   const totalOutstanding = bills.reduce((sum, b) => sum + positive(b.totalAmount - b.amountPaid), 0);
   const overdueBills = bills.filter(b => b.status === 'OVERDUE' && positive(b.totalAmount - b.amountPaid) > 0);
   const totalOverdue = overdueBills.reduce((sum, b) => sum + positive(b.totalAmount - b.amountPaid), 0);
@@ -424,30 +424,50 @@ export const calculateBillAnalytics = (bills) => {
 
 // ========== TENANT LIFECYCLE ==========
 /**
- * Tenant lifecycle calculation.
+ * Tenant lifecycle calculation with leftAt support.
  *
- * Uses the new `Tenant.status` field (`ACTIVE` / `LEFT`) instead of inferring
- * lifecycle from `unit.status`. A unit may now have multiple tenants (past
- * and present), so we can no longer use the unit as a proxy for the tenant's
- * lifecycle state.
- *
- * `units` (when supplied) is expected to include `tenants` (array), but this
- * function primarily relies on the `tenants` array passed in as the first arg.
+ * - `activeTenants` = tenants with status ACTIVE
+ * - `churnedTenants` = tenants with status LEFT (uses `leftAt` if available, else `updatedAt`)
+ * - `cumulativeRetentionRate` = all-time retention
+ * - `periodRetentionRate` = retention for tenants that existed at start of filter period
+ * - `averageTenureDays` = average for LEFT tenants
  */
-export const calculateTenantLifecycle = (tenants, units = []) => {
+export const calculateTenantLifecycle = (tenants, units = [], filters = {}) => {
   const totalTenants = tenants.length;
   const activeTenants = tenants.filter(t => t.status === 'ACTIVE');
   const churnedTenants = tenants.filter(t => t.status === 'LEFT');
-  const terminatedTenants = churnedTenants.length;
 
   const averageRent = activeTenants.reduce((sum, t) => sum + positive(t.rent), 0) / (activeTenants.length || 1);
   const totalDeposits = activeTenants.reduce((sum, t) => sum + positive(t.deposit), 0);
 
-  const retentionRate = totalTenants > 0
+  const cumulativeRetentionRate = totalTenants > 0
     ? money(((totalTenants - churnedTenants.length) / totalTenants) * 100)
     : null;
 
-  // Optional cross-check using units (useful for data-quality reporting downstream).
+  // Period retention: tenants that existed at start of period and are still active
+  let periodRetentionRate = null;
+  if (filters.start) {
+    const existedAtStart = tenants.filter(t => new Date(t.createdAt) < filters.start);
+    const stillActive = existedAtStart.filter(t => t.status === 'ACTIVE');
+    periodRetentionRate = existedAtStart.length > 0
+      ? money((stillActive.length / existedAtStart.length) * 100)
+      : null;
+  }
+
+  // Average tenure for churned tenants (uses leftAt, falls back to updatedAt)
+  const churnedWithDuration = churnedTenants
+    .map(t => {
+      const end = t.leftAt || t.updatedAt;
+      if (!t.createdAt || !end) return null;
+      const days = Math.max(0, Math.floor((new Date(end) - new Date(t.createdAt)) / 86400000));
+      return days;
+    })
+    .filter(d => d !== null);
+
+  const averageTenureDays = churnedWithDuration.length > 0
+    ? Math.round(churnedWithDuration.reduce((a, b) => a + b, 0) / churnedWithDuration.length)
+    : null;
+
   const unitsOccupiedWithoutActiveTenant = units.filter(
     u => u.status === 'OCCUPIED' && (u.tenants?.length ?? 0) === 0
   ).length;
@@ -456,10 +476,12 @@ export const calculateTenantLifecycle = (tenants, units = []) => {
     summary: {
       totalTenants,
       activeTenants: activeTenants.length,
-      churnedTenants: terminatedTenants,
-      retentionRate,
+      churnedTenants: churnedTenants.length,
+      cumulativeRetentionRate,
+      periodRetentionRate,
       averageRent: money(averageRent),
-      totalDeposits: money(totalDeposits)
+      totalDeposits: money(totalDeposits),
+      averageTenureDays
     },
     dataQuality: {
       unitsOccupiedWithoutActiveTenant
@@ -467,16 +489,26 @@ export const calculateTenantLifecycle = (tenants, units = []) => {
   };
 };
 
-// ========== LEAD ANALYTICS ==========
+// ========== LEAD ANALYTICS (deterministic byStatus) ==========
+const OFFER_PRIORITY = ['CONVERTED', 'ACCEPTED', 'SENT', 'DRAFT', 'REJECTED', 'EXPIRED'];
+
+const pickLeadStatus = (lead) => {
+  if (!lead.offerLetters?.length) return 'NEW';
+  for (const status of OFFER_PRIORITY) {
+    if (lead.offerLetters.some(o => o.status === status)) return status;
+  }
+  return 'NEW';
+};
+
 export const calculateLeadAnalytics = (leads) => {
   const totalLeads = leads.length;
-  const converted = leads.filter(l => 
+  const converted = leads.filter(l =>
     l.offerLetters?.some(o => ['ACCEPTED', 'CONVERTED'].includes(o.status))
   );
-  const activeLeads = leads.filter(l => 
+  const activeLeads = leads.filter(l =>
     !l.offerLetters?.some(o => ['ACCEPTED', 'CONVERTED', 'REJECTED', 'EXPIRED'].includes(o.status))
   );
-  
+
   return {
     summary: {
       totalLeads,
@@ -486,7 +518,7 @@ export const calculateLeadAnalytics = (leads) => {
       averageConversionDays: calculateAverageConversionTime(leads)
     },
     bySource: groupBy(leads, 'natureOfLead', () => 1),
-    byStatus: groupBy(leads, l => l.offerLetters?.[0]?.status || 'NEW', () => 1)
+    byStatus: groupBy(leads, pickLeadStatus, () => 1)
   };
 };
 
@@ -494,10 +526,9 @@ export const calculateLeadAnalytics = (leads) => {
 /**
  * Data quality calculation.
  *
- * `units` MUST be selected with the array relation:
- *   select: { id: true, status: true, tenants: { where: { status: 'ACTIVE' }, select: { id: true } } }
- *
- * `tenants` MUST be selected with at least `{ id, status, unit: { select: { status: true } } }`.
+ * - Only ACTIVE tenants can be "inconsistent" with a vacant unit.
+ * - Former tenants still on occupied units are informational (not errors).
+ * - `leftTenantsMissingLeftAt` flags records that need backfill.
  */
 export const calculateDataQuality = (data) => {
   const {
@@ -507,24 +538,28 @@ export const calculateDataQuality = (data) => {
     units = [],
     paymentReports = []
   } = data;
-  
+
+  const activeTenants = tenants.filter(t => t.status === 'ACTIVE');
+  const leftTenants = tenants.filter(t => t.status === 'LEFT');
+
   return {
     orphanedInvoices: invoices.filter(i => i.status === 'PAID' && positive(i.balance) > 0).length,
-    // A tenant whose own status is ACTIVE but whose unit is not OCCUPIED (or vice versa) is inconsistent.
-    inconsistentTenants: tenants.filter(t => {
-      if (!t.unit) return true; // tenant without a unit is always inconsistent
-      const tenantActive = t.status === 'ACTIVE';
-      const unitOccupied = t.unit.status === 'OCCUPIED';
-      return tenantActive !== unitOccupied;
+    inconsistentTenants: activeTenants.filter(t => {
+      if (!t.unit) return true;
+      return t.unit.status !== 'OCCUPIED';
     }).length,
-    // Unit marked OCCUPIED with no ACTIVE tenant attached — orphaned occupancy record.
     orphanedUnits: units.filter(
       u => u.status === 'OCCUPIED' && (u.tenants?.length ?? 0) === 0
     ).length,
     missingPaymentAllocations: paymentReports.filter(p => p.invoices?.length === 0 && p.billInvoices?.length === 0).length,
+    formerTenantsOnOccupiedUnits: leftTenants.filter(
+      t => t.unit?.status === 'OCCUPIED'
+    ).length,
+    leftTenantsMissingLeftAt: leftTenants.filter(t => !t.leftAt).length,
     duplicateRecords: {
       invoices: findDuplicates(invoices, 'invoiceNumber'),
-      bills: [] // Bill doesn't have a unique reference number field
+      // Now actually checks Bill.billReferenceNumber
+      bills: findDuplicates(bills, 'billReferenceNumber')
     }
   };
 };
@@ -535,7 +570,7 @@ export const calculatePerformanceAnalytics = (dailyReports, todos) => {
   const completedTodos = todos.filter(t => t.status === 'COMPLETED');
   const overdueTodos = todos.filter(t => t.status === 'OVERDUE');
   const highPriorityTodos = todos.filter(t => t.priority === 'URGENT' || t.priority === 'HIGH');
-  
+
   return {
     summary: {
       reportSubmissionRate: dailyReports.length > 0 ?
@@ -556,10 +591,10 @@ export const calculateVATAnalytics = (invoices, billInvoices, tenants) => {
   const vatInvoices = invoices.filter(i => i.vat > 0);
   const vatBillInvoices = billInvoices.filter(b => b.vatAmount > 0);
   const vatTenants = tenants.filter(t => t.vatType !== 'NOT_APPLICABLE');
-  
+
   const totalVATCollected = vatInvoices.reduce((sum, i) => sum + positive(i.vat), 0);
   const totalVATOnBills = vatBillInvoices.reduce((sum, b) => sum + positive(b.vatAmount), 0);
-  
+
   return {
     summary: {
       vatCollected: money(totalVATCollected),
@@ -573,18 +608,16 @@ export const calculateVATAnalytics = (invoices, billInvoices, tenants) => {
 
 // ========== HELPER FUNCTIONS ==========
 const groupBy = (items, keyFn, valueFn = () => 1) => {
-  // Handle string keyFn
   if (typeof keyFn === 'string') {
     const field = keyFn;
     keyFn = item => item[field];
   }
-  
-  // Handle string valueFn
+
   if (typeof valueFn === 'string') {
     const field = valueFn;
     valueFn = item => item[field];
   }
-  
+
   const grouped = items.reduce((acc, item) => {
     const key = keyFn(item) || 'UNKNOWN';
     if (!acc[key]) acc[key] = { label: key, count: 0, amount: 0 };
@@ -592,7 +625,7 @@ const groupBy = (items, keyFn, valueFn = () => 1) => {
     acc[key].amount += positive(valueFn(item));
     return acc;
   }, {});
-  
+
   return Object.values(grouped).map(item => ({
     ...item,
     amount: money(item.amount)
@@ -600,40 +633,40 @@ const groupBy = (items, keyFn, valueFn = () => 1) => {
 };
 
 const calculateAverageConversionTime = (leads) => {
-  const converted = leads.filter(l => 
+  const converted = leads.filter(l =>
     l.offerLetters?.some(o => ['ACCEPTED', 'CONVERTED'].includes(o.status))
   );
-  
+
   if (converted.length === 0) return null;
-  
+
   const times = converted.map(l => {
     const created = new Date(l.createdAt);
-    const convertedDate = l.offerLetters.find(o => ['ACCEPTED', 'CONVERTED'].includes(o.status));
-    if (!convertedDate) return null;
-    const convertedAt = new Date(convertedDate.createdAt);
+    const convertedOffer = l.offerLetters.find(o => ['ACCEPTED', 'CONVERTED'].includes(o.status));
+    if (!convertedOffer) return null;
+    const convertedAt = new Date(convertedOffer.createdAt);
     return Math.floor((convertedAt - created) / (1000 * 60 * 60 * 24));
   }).filter(t => t !== null);
-  
+
   return times.length > 0 ? money(times.reduce((a, b) => a + b, 0) / times.length) : null;
 };
 
 const calculateAverageTaskCompletionTime = (tasks) => {
   const completed = tasks.filter(t => t.completedAt);
   if (completed.length === 0) return null;
-  
+
   const times = completed.map(t => {
     const created = new Date(t.createdAt);
-    const completed = new Date(t.completedAt);
-    return Math.floor((completed - created) / (1000 * 60 * 60 * 24));
+    const completedAt = new Date(t.completedAt);
+    return Math.floor((completedAt - created) / (1000 * 60 * 60 * 24));
   });
-  
+
   return times.length > 0 ? money(times.reduce((a, b) => a + b, 0) / times.length) : null;
 };
 
 const findDuplicates = (items, field) => {
   const seen = new Set();
   const duplicates = [];
-  
+
   for (const item of items) {
     const value = item[field];
     if (value && seen.has(value)) {
@@ -641,6 +674,6 @@ const findDuplicates = (items, field) => {
     }
     if (value) seen.add(value);
   }
-  
+
   return duplicates;
 };

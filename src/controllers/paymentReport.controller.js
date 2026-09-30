@@ -1147,7 +1147,7 @@ export const getPaymentReports = async (req, res) => {
             }
           }
         },
-        invoices: {
+          invoices: {
           select: {
             id: true,
             invoiceNumber: true,
@@ -1155,7 +1155,9 @@ export const getPaymentReports = async (req, res) => {
             amountPaid: true,
             status: true,
             issueDate: true,
-            dueDate: true
+            dueDate: true,
+            paymentPeriod: true,     // ✅ NEW: authoritative period label
+            paymentPolicy: true      // ✅ NEW: authoritative policy for the period
           }
         }
       },
@@ -1240,16 +1242,18 @@ export const getPaymentsByTenant = async (req, res) => {
             }
           }
         },
-        invoices: {
-          select: {
-            id: true,
-            invoiceNumber: true,
-            totalDue: true,
-            amountPaid: true,
-            status: true,
-            issueDate: true,
-            dueDate: true
-          }
+          invoices: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              totalDue: true,
+              amountPaid: true,
+              status: true,
+              issueDate: true,
+              dueDate: true,
+              paymentPeriod: true,     // ✅ NEW: authoritative period label
+              paymentPolicy: true      // ✅ NEW: authoritative policy for the period
+            }
         }
       },
       orderBy: { paymentPeriod: 'desc' },
@@ -2613,6 +2617,29 @@ export const createPaymentReport = async (req, res) => {
       }
     }
 
+    //  NEW: determine the anchor period the MAIN payment report represents.
+    // Fall back priority:
+    //   1. paymentPeriod from request
+    //   2. earliest invoice we're processing (authoritative ledger anchor)
+    //   3. transaction date (last-resort fallback)
+    const anchorInvoice = invoicesToProcess[0];
+    const parsedAnchorFromInvoice =
+      anchorInvoice && anchorInvoice.paymentPeriod
+        ? parsePaymentPeriodToDate(anchorInvoice.paymentPeriod)
+        : null;
+
+    const mainReportAnchor =
+      paymentPeriodDate
+        ? normalizeToMonthStart(paymentPeriodDate)
+        : parsedAnchorFromInvoice
+            ? normalizeToMonthStart(parsedAnchorFromInvoice)
+            : normalizeToMonthStart(new Date());
+
+    console.log(
+      `Main payment report anchor: ${mainReportAnchor.toISOString()} ` +
+      `(source=${paymentPeriodDate ? 'request' : parsedAnchorFromInvoice ? 'invoice' : 'fallback'})`
+    );
+
     const totalAvailable = parsedAmountPaid + existingCredit;
 
     let overpaymentAmount = 0;
@@ -2671,6 +2698,19 @@ export const createPaymentReport = async (req, res) => {
       const totalVat = invoicesToProcess.reduce((sum, inv) => sum + (typeof inv.vat === 'number' ? inv.vat : 0), 0);
       const totalDue = invoicesToProcess.reduce((sum, inv) => sum + (typeof inv.totalDue === 'number' ? inv.totalDue : 0), 0);
 
+      // ✅ NEW: derive the anchor period label for the main report's notes
+      const anchorPeriodEnd = new Date(
+        mainReportAnchor.getFullYear(),
+        mainReportAnchor.getMonth() + getPolicyMonths(paymentPolicy),
+        0
+      );
+      const anchorPeriodLabel = formatPaymentPeriodLabel(
+        mainReportAnchor,
+        anchorPeriodEnd,
+        paymentPolicy
+      );
+
+      //  FIX: main report's paymentPeriod is the ANCHOR PERIOD, not the transaction date
       const report = await tx.paymentReport.create({
         data: {
           tenantId,
@@ -2681,9 +2721,12 @@ export const createPaymentReport = async (req, res) => {
           amountPaid: totalAvailable,
           arrears: Math.max(0, totalInvoiceBalance - totalAvailable),
           status: totalAvailable >= totalInvoiceBalance ? 'PAID' : totalAvailable > 0 ? 'PARTIAL' : 'UNPAID',
-          paymentPeriod: paymentPeriodDate || new Date(),
+          paymentPeriod: mainReportAnchor,                   // FIX
           datePaid: new Date(),
-          notes: paymentNotes.join('. ') || null,
+          notes: [
+            `Anchor period: ${anchorPeriodLabel}`,
+            ...paymentNotes
+          ].filter(Boolean).join('. ') || null,
           receiptUrl: null
         }
       });
@@ -3540,7 +3583,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
 
     const propertyId = existingReport.tenant?.unit?.propertyId;
 
+    // ─────────────────────────────────────────────
     // Permission checks
+    // ─────────────────────────────────────────────
     if (userRole !== 'ADMIN') {
       const canManage = await canManagePaymentForProperty(userId, userRole, propertyId);
       if (!canManage) {
@@ -3564,6 +3609,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       }
     }
 
+    // ─────────────────────────────────────────────
+    // Validate amountPaid
+    // ─────────────────────────────────────────────
     let parsedAmountPaid = existingReport.amountPaid;
     if (amountPaid !== undefined && amountPaid !== null) {
       if (isNaN(amountPaid)) {
@@ -3575,66 +3623,114 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       }
     }
 
-    const existingPolicyMonths = existingReport.invoices?.length > 0
-      ? Math.max(...existingReport.invoices.map(inv => getInvoicePeriodMonths(inv, existingReport.tenant.paymentPolicy || 'MONTHLY')))
-      : getPolicyMonths(existingReport.tenant.paymentPolicy || 'MONTHLY');
+    // ─────────────────────────────────────────────
+    // Resolve the billing anchor for the update
+    //
+    // Priority:
+    //   1. Explicit paymentPeriod from request (can be Date, ISO, or "Month YYYY")
+    //   2. Existing report's paymentPeriod
+    //   3. Existing first linked invoice's paymentPeriod
+    //   4. Today
+    //
+    // NOTE: parsePaymentPeriodToDate() handles "September 2026 - November 2026"
+    //       and "May 2026" labels that the old code would choke on.
+    // ─────────────────────────────────────────────
+    let anchorDate = null;
+    let anchorSource = 'fallback';
 
-    let expected = {
-      rent: existingReport.rent,
-      serviceCharge: existingReport.serviceCharge,
-      vat: existingReport.vat,
-      vatType: existingReport.tenant.vatType,
-      vatRate: existingReport.tenant.vatRate,
-      totalDue: existingReport.totalDue,
-      periodStart: existingReport.paymentPeriod,
-      periodEnd: new Date(
-        new Date(existingReport.paymentPeriod).getFullYear(),
-        new Date(existingReport.paymentPeriod).getMonth() + existingPolicyMonths,
-        0
-      ),
-      paymentPeriodLabel: existingReport.paymentPeriod
-    };
-
-    // If paymentPeriod is provided, recalculate everything
-    let periodDate = null;
-    if (paymentPeriod) {
-      periodDate = new Date(paymentPeriod);
-      if (isNaN(periodDate.getTime())) {
+    if (paymentPeriod !== undefined && paymentPeriod !== null && paymentPeriod !== '') {
+      const parsed = parsePaymentPeriodToDate(paymentPeriod);
+      if (!parsed || isNaN(parsed.getTime())) {
         return res.status(400).json({
           success: false,
-          message: 'Invalid paymentPeriod date format'
+          message: 'Invalid paymentPeriod format. Use ISO date or "Month YYYY" / "Month YYYY - Month YYYY".'
         });
       }
-
-      expected = await computeExpectedChargesForPolicy(
-        existingReport.tenantId,
-        periodDate,
-        existingReport.tenant.paymentPolicy || 'MONTHLY'
-      );
+      anchorDate = normalizeToMonthStart(parsed);
+      anchorSource = 'request';
+    } else if (existingReport.paymentPeriod) {
+      const parsed = parsePaymentPeriodToDate(existingReport.paymentPeriod);
+      if (parsed && !isNaN(parsed.getTime())) {
+        anchorDate = normalizeToMonthStart(parsed);
+        anchorSource = 'existingReport';
+      }
     }
 
-    const arrears = parseFloat((toScalarNumber(expected.totalDue) - parsedAmountPaid).toFixed(2));
-    const status = parsedAmountPaid >= toScalarNumber(expected.totalDue)
-      ? 'PAID'
-      : parsedAmountPaid > 0
-        ? 'PARTIAL'
-        : 'UNPAID';
+    if (!anchorDate && existingReport.invoices?.length > 0) {
+      const firstInvoice = existingReport.invoices
+        .slice()
+        .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate))[0];
+      const parsed = parsePaymentPeriodToDate(firstInvoice.paymentPeriod);
+      if (parsed && !isNaN(parsed.getTime())) {
+        anchorDate = normalizeToMonthStart(parsed);
+        anchorSource = 'linkedInvoice';
+      }
+    }
 
+    if (!anchorDate) {
+      anchorDate = normalizeToMonthStart(new Date());
+      anchorSource = 'fallback';
+    }
+
+    console.log(
+      `[updatePaymentReportWithIncome] Resolved anchor: ${anchorDate.toISOString()} ` +
+      `(source=${anchorSource})`
+    );
+
+    const paymentPolicy = existingReport.tenant.paymentPolicy || 'MONTHLY';
+
+    // ─────────────────────────────────────────────
+    // Recompute expected charges from the resolved anchor.
+    // ALWAYS use computeExpectedChargesForPolicy — never trust
+    // the stored flat values on the report, because they may
+    // pre-date a VAT/WHT/policy change.
+    // ─────────────────────────────────────────────
+    const expected = await computeExpectedChargesForPolicy(
+      existingReport.tenantId,
+      anchorDate,
+      paymentPolicy
+    );
+
+    // ─────────────────────────────────────────────
+    // SAFE SCALAR EXTRACTION
+    // expected.rent / .serviceCharge / .vat are objects here,
+    // but Prisma Float? columns require numbers.
+    // ─────────────────────────────────────────────
+    const safeRent           = toScalarNumber(expected.rent, 'amount');
+    const safeServiceCharge  = toScalarNumber(expected.serviceCharge, 'amount');
+    const safeVat            = toScalarNumber(expected.vat, 'total');
+    const safeTotalDue       = toScalarNumber(expected.totalDue);
+
+    const safeTotalDueWithoutWithholding =
+      toScalarNumber(expected.totalDueWithoutWithholding) || safeTotalDue;
+    const safeTotalWithheld = toScalarNumber(expected.withholdingTax?.totalWithheld);
+
+    // Normalized period boundaries
+    const periodStart = expected.periodStart
+      ? normalizeToMonthStart(expected.periodStart)
+      : anchorDate;
+    const periodEnd = expected.periodEnd
+      ? new Date(expected.periodEnd)
+      : new Date(
+          periodStart.getFullYear(),
+          periodStart.getMonth() + getPolicyMonths(paymentPolicy),
+          0
+        );
+
+    // Recompute arrears / status against the recomputed total
+    const arrears = parseFloat((safeTotalDue - parsedAmountPaid).toFixed(2));
+    const status =
+      parsedAmountPaid >= safeTotalDue
+        ? 'PAID'
+        : parsedAmountPaid > 0
+          ? 'PARTIAL'
+          : 'UNPAID';
+
+    // ─────────────────────────────────────────────
+    // Transaction
+    // ─────────────────────────────────────────────
     const result = await prisma.$transaction(async (tx) => {
-      // =============================================
-      //  SAFE SCALAR EXTRACTION — THIS IS THE FIX
-      // =============================================
-      // `expected.rent`, `expected.serviceCharge`, and `expected.vat`
-      // may be OBJECTS (from computeExpectedChargesForPolicy) or
-      // SCALARS (from existingReport fallback above).
-      // `toScalarNumber` handles both shapes.
-      // =============================================
-      const safeRent = toScalarNumber(expected.rent, 'amount');
-      const safeServiceCharge = toScalarNumber(expected.serviceCharge, 'amount');
-      const safeVat = toScalarNumber(expected.vat, 'total');
-      const safeTotalDue = toScalarNumber(expected.totalDue);
-
-      // Update the payment report
+      // 1. Update the payment report
       const updatedReport = await tx.paymentReport.update({
         where: { id },
         data: {
@@ -3645,7 +3741,7 @@ export const updatePaymentReportWithIncome = async (req, res) => {
           amountPaid: parsedAmountPaid,
           arrears,
           status,
-          paymentPeriod: expected.periodStart || periodDate || existingReport.paymentPeriod,
+          paymentPeriod: periodStart,           //  normalized Date
           notes: notes !== undefined ? notes : existingReport.notes,
           updatedAt: new Date()
         },
@@ -3678,6 +3774,7 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               invoiceNumber: true,
               totalDue: true,
               amountPaid: true,
+              balance: true,
               status: true,
               issueDate: true,
               dueDate: true,
@@ -3705,11 +3802,11 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         }
       });
 
-      // Update linked invoices if they exist
+      // 2. Re-anchor linked rent invoices to the recomputed period & amounts
       if (existingReport.invoices && existingReport.invoices.length > 0) {
-        for (const invoice of existingReport.invoices) {
-          const rentBalance = arrears > 0 ? arrears : 0;
+        const balanceForInvoice = arrears > 0 ? arrears : 0;
 
+        for (const invoice of existingReport.invoices) {
           await tx.invoice.update({
             where: { id: invoice.id },
             data: {
@@ -3718,9 +3815,16 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               vat: safeVat,
               totalDue: safeTotalDue,
               amountPaid: parsedAmountPaid,
-              balance: rentBalance,
-              status: status === 'PAID' ? 'PAID' : status === 'PARTIAL' ? 'PARTIAL' : 'UNPAID',
-              paymentPeriod: expected.paymentPeriodLabel || periodDate?.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) || invoice.paymentPeriod,
+              balance: balanceForInvoice,
+              status:
+                status === 'PAID'
+                  ? 'PAID'
+                  : status === 'PARTIAL'
+                    ? 'PARTIAL'
+                    : 'UNPAID',
+              paymentPeriod: expected.paymentPeriodLabel || invoice.paymentPeriod,
+              paymentPolicy,                       //  keep policy in sync
+              dueDate: periodEnd,                  //  re-anchor due date
               notes: notes !== undefined ? notes : invoice.notes,
               updatedAt: new Date()
             }
@@ -3728,27 +3832,33 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         }
       }
 
-      // Update linked bill invoices if they exist
-      if (existingReport.billInvoices && existingReport.billInvoices.length > 0) {
+      // 3. Re-anchor linked bill invoices
+      //    Bills don't use billing periods the same way, so we only
+      //    touch issueDate if a new period was explicitly supplied.
+      if (
+        existingReport.billInvoices &&
+        existingReport.billInvoices.length > 0 &&
+        paymentPeriod !== undefined
+      ) {
         for (const billInvoice of existingReport.billInvoices) {
           await tx.billInvoice.update({
             where: { id: billInvoice.id },
             data: {
-              issueDate: periodDate || billInvoice.issueDate,
+              issueDate: periodStart,
               updatedAt: new Date()
             }
           });
         }
       }
 
-      // Update income record if it exists
+      // 4. Update the linked income record (best-effort, time-window match)
       const income = await tx.income.findFirst({
         where: {
           tenantId: existingReport.tenantId,
           propertyId: existingReport.tenant.unit.propertyId,
           createdAt: {
-            gte: new Date(existingReport.paymentPeriod.getTime() - 60000),
-            lt: new Date(existingReport.paymentPeriod.getTime() + 60000)
+            gte: new Date(existingReport.datePaid.getTime() - 60000),
+            lt: new Date(existingReport.datePaid.getTime() + 60000)
           }
         }
       });
@@ -3767,9 +3877,18 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       return { updatedReport, updatedIncome };
     });
 
-    // Regenerate receipt if requested or if payment period changed
+    // ─────────────────────────────────────────────
+    // Receipt regeneration
+    // Always regenerate when the period changed, because the
+    // receipt embeds the period label, due date, and amounts.
+    // ─────────────────────────────────────────────
     let receiptResult = null;
-    if (regenerateReceipt || paymentPeriod) {
+    const periodChanged =
+      paymentPeriod !== undefined &&
+      periodStart.getTime() !==
+        normalizeToMonthStart(existingReport.paymentPeriod).getTime();
+
+    if (regenerateReceipt || periodChanged) {
       try {
         const freshInvoices = await prisma.invoice.findMany({
           where: { paymentReportId: result.updatedReport.id }
@@ -3781,17 +3900,15 @@ export const updatePaymentReportWithIncome = async (req, res) => {
 
         const allInvoices = [...freshInvoices, ...freshBillInvoices];
 
+        // Preserve overpayment/credit context from notes
         let overpaymentAmount = 0;
         let creditUsed = 0;
         if (result.updatedReport.notes) {
           const overpaymentMatch = result.updatedReport.notes.match(/Overpayment: Ksh ([\d.]+)/);
-          if (overpaymentMatch) {
-            overpaymentAmount = parseFloat(overpaymentMatch[1]);
-          }
+          if (overpaymentMatch) overpaymentAmount = parseFloat(overpaymentMatch[1]);
+
           const creditMatch = result.updatedReport.notes.match(/Applied Ksh ([\d.]+) from credit balance/);
-          if (creditMatch) {
-            creditUsed = parseFloat(creditMatch[1]);
-          }
+          if (creditMatch) creditUsed = parseFloat(creditMatch[1]);
         }
 
         receiptResult = await generateAndUploadReceipt(
@@ -3810,8 +3927,8 @@ export const updatePaymentReportWithIncome = async (req, res) => {
               updatedAt: new Date()
             }
           });
-          console.log(`Receipt regenerated successfully: ${receiptResult.receiptNumber}`);
-        } else if (receiptResult && receiptResult.error) {
+          console.log(`Receipt regenerated: ${receiptResult.receiptNumber}`);
+        } else if (receiptResult?.error) {
           console.error('Receipt generation error:', receiptResult.error);
         }
       } catch (receiptError) {
@@ -3819,6 +3936,9 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       }
     }
 
+    // ─────────────────────────────────────────────
+    // Response
+    // ─────────────────────────────────────────────
     const responseData = {
       paymentReport: {
         ...result.updatedReport,
@@ -3838,19 +3958,17 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     }
 
     let message = 'Payment report updated successfully';
-    if (paymentPeriod) {
+    if (periodChanged) {
       message = 'Payment report updated with new payment period';
-      if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
-        message += ' and receipt regenerated';
-      }
-    } else if (regenerateReceipt && receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
-      message = 'Payment report updated and receipt regenerated successfully';
+    }
+    if (receiptResult && !receiptResult.error && receiptResult.receiptUrl) {
+      message += ' and receipt regenerated';
     }
 
     res.json({
       success: true,
       data: responseData,
-      message: message
+      message
     });
 
   } catch (error) {

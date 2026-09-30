@@ -1299,7 +1299,7 @@ function buildOtherIncomeInvoiceHtml(income) {
     letter-spacing: 0.5px;
   }
   .bill-to {
-    text-align: center;
+    text-align: left;
     margin: 25px 0;
     padding: 18px 20px;
     background: #f8fafc;

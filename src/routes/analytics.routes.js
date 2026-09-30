@@ -24,9 +24,11 @@ import {
   getBillInvoiceAnalyticsDetailed,
   getInvoiceAgingReport,
   getInvoiceReconciliationReport,
+  getCohortVsCash, 
   // Other New Analytics
   getBillAnalytics,
   getTenantLifecycleAnalytics,
+  getTenantChurnAnalytics,       // ← NEW
   getLeadAnalytics,
   getDataQualityAnalytics,
   getPerformanceAnalytics,
@@ -167,11 +169,18 @@ router.get(
   getBillAnalytics
 );
 
-// ========== NEW TENANT LIFECYCLE ANALYTICS ROUTES ==========
+// ========== TENANT LIFECYCLE & CHURN ANALYTICS ROUTES ==========
 router.get(
   '/tenants/lifecycle',
   requireAnalyticsPermissions('VIEW_TENANTS', 'VIEW_PAYMENT_REPORTS'),
   getTenantLifecycleAnalytics
+);
+
+// NEW: Departed tenants detail — returns full churn list with reasons and tenure
+router.get(
+  '/tenants/churn',
+  requireAnalyticsPermissions('VIEW_TENANTS'),
+  getTenantChurnAnalytics
 );
 
 // ========== NEW LEAD ANALYTICS ROUTES ==========
@@ -201,5 +210,9 @@ router.get(
   requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_BILL_INVOICES'),
   getVATAnalytics
 );
-
+router.get(
+  '/receivables/cohort-vs-cash',
+  requireAnalyticsPermissions('VIEW_PAYMENT_REPORTS', 'VIEW_ARREARS'),
+  getCohortVsCash
+);
 export default router;

@@ -392,7 +392,7 @@ model Unit {
 
 model Tenant {
   id                  String               @id @default(uuid())
-  unitId              String              //no longer unique
+  unitId              String              // no longer unique (multiple tenants per unit historically)
   leaseTerm           String
   rent                Float
   termStart           DateTime
@@ -410,17 +410,19 @@ model Tenant {
   vatRate             Float?               @default(0)
   vatType             VATType              @default(NOT_APPLICABLE)
   email               String?              @unique
-  
-  // ========== NEW FIELD ==========
+
+  // ========== LIFECYCLE FIELDS ==========
   status              TenantStatus         @default(ACTIVE) // ACTIVE or LEFT
-  // ==============================
-  
+  leftAt              DateTime?            // When tenant was marked LEFT (null if ACTIVE)
+  leftReason          TenantLeftReason?    // Why the tenant left (optional)
+  // ======================================
+
   // ========== WITHHOLDING TAX FIELDS ==========
   withholdingTaxRate     Float?   @default(0)
   withholdingVatRate     Float?   @default(0)
   isWithholdingTaxExempt Boolean  @default(false)
   // ============================================
-  
+
   bills               Bill[]
   billInvoices        BillInvoice[]
   demandLetters       DemandLetter[]
@@ -430,7 +432,11 @@ model Tenant {
   paymentReports      PaymentReport[]
   serviceCharge       ServiceCharge?
   unit                Unit                 @relation(fields: [unitId], references: [id])
-  whatsappLogs  WhatsAppLog[]
+  whatsappLogs        WhatsAppLog[]
+
+  @@index([status])
+  @@index([unitId, status])
+  @@index([leftAt])
 }
 
 model ServiceCharge {
@@ -1113,6 +1119,15 @@ enum TenantStatus {
   LEFT
 }
 
+enum TenantLeftReason {
+  LEASE_EXPIRED
+  VOLUNTARY
+  EVICTED
+  NON_PAYMENT
+  TRANSFERRED
+  DECEASED
+  OTHER
+}
 enum RentType {
   PER_SQFT
   FIXED
