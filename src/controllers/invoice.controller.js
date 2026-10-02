@@ -156,6 +156,36 @@ function buildPaymentPeriodLabel(startDate, paymentPolicy = 'MONTHLY') {
   }
 }
 
+/**
+ * Aligns a billing date to the tenant's policy cycle.
+ * E.g. for a QUARTERLY tenant with rentStart = Jul 1, feeding any date
+ * between Jul 1 and Sep 30 returns Jul 1; between Oct 1 and Dec 31 → Oct 1.
+ */
+function alignBillingDateToCycle(billingDate, tenant) {
+  const policy = normalizePaymentPolicy(tenant.paymentPolicy);
+  const policyMonths = policy === 'QUARTERLY' ? 3 : policy === 'ANNUAL' ? 12 : 1;
+
+  const anchor = toValidDate(tenant.rentStart, new Date());
+  const anchorMonthStart = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1));
+
+  const probe = toValidDate(billingDate, new Date());
+  const probeMonthStart = new Date(Date.UTC(probe.getUTCFullYear(), probe.getUTCMonth(), 1));
+
+  // How many whole policy-blocks have elapsed between anchor and probe?
+  const monthsDiff =
+    (probeMonthStart.getUTCFullYear() - anchorMonthStart.getUTCFullYear()) * 12 +
+    (probeMonthStart.getUTCMonth() - anchorMonthStart.getUTCMonth());
+
+  const blocks = Math.floor(monthsDiff / policyMonths);
+  const aligned = new Date(Date.UTC(
+    anchorMonthStart.getUTCFullYear(),
+    anchorMonthStart.getUTCMonth() + blocks * policyMonths,
+    1
+  ));
+
+  return aligned;
+}
+
 function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
   const paymentPolicy = normalizePaymentPolicy(tenant.paymentPolicy);
   const { currentRent } = calculateEscalatedRent(tenant, billingDate);
@@ -273,11 +303,15 @@ export const generateInvoice = async (req, res) => {
 
     const paymentPolicy = normalizePaymentPolicy(tenant.paymentPolicy);
 
-    const billingDate = billingStartDate
+    const requestedBillingDate = billingStartDate
       ? toValidDate(billingStartDate)
       : paymentReport?.paymentPeriod
         ? toValidDate(paymentReport.paymentPeriod, new Date())
         : new Date();
+
+    //  Anchor the billing date to the tenant's quarterly/annual cycle,
+    // so an invoice generated mid-cycle still points at the correct period.
+    const billingDate = alignBillingDateToCycle(requestedBillingDate, tenant);
 
     const calculated = calculateInvoiceAmountsFromTenant(tenant, billingDate);
     const amountPaid = roundMoney(paymentReport?.amountPaid || 0);
