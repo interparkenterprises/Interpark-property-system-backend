@@ -31,7 +31,7 @@ const statusColor = (status) =>
     ? "#0d6efd"
     : "#ef4444";
 
-//  NEW: how many months a policy spans
+//  How many months a policy spans
 const policyMonthsFor = (policy) => {
   switch ((policy || "").toUpperCase()) {
     case "QUARTERLY": return 3;
@@ -41,7 +41,51 @@ const policyMonthsFor = (policy) => {
   }
 };
 
-//  FIX: format a period using the tenant's payment policy.
+//  Parse a period string like "September 2026 - November 2026",
+// "May 2026", or an ISO date into a Date (start of that month).
+// Returns null if it can't be parsed.
+const parsePaymentPeriodToDate = (paymentPeriod) => {
+  if (!paymentPeriod) return null;
+  if (paymentPeriod instanceof Date) return paymentPeriod;
+
+  // ISO date string?
+  const iso = new Date(paymentPeriod);
+  if (!isNaN(iso.getTime())) return iso;
+
+  // "Month YYYY - Month YYYY" or "Month YYYY"
+  const match = String(paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
+  if (match) {
+    const monthNames = [
+      'january','february','march','april','may','june',
+      'july','august','september','october','november','december'
+    ];
+    const mIdx = monthNames.indexOf(match[1].toLowerCase());
+    if (mIdx >= 0) {
+      return new Date(parseInt(match[2], 10), mIdx, 1);
+    }
+  }
+  return null;
+};
+
+/**
+ * Build a stable grouping key for a report. We group by the
+ * normalized billing period (YYYY-MM) because:
+ *   - Multiple partial reports can point at the same period.
+ *   - An orphaned report may have NO linked invoice, while its
+ *     sibling DOES — so grouping by invoice id splits them apart.
+ *   - The tenant is already fixed (single-tenant PDF), so we don't
+ *     need tenantId in the key here.
+ */
+const reportGroupKey = (report) => {
+  const parsed = parsePaymentPeriodToDate(report.paymentPeriod);
+  if (parsed && !isNaN(parsed.getTime())) {
+    return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}`;
+  }
+  // Fallback: stringify whatever we have
+  return `unknown:${String(report.paymentPeriod ?? "null")}`;
+};
+
+//  Format a period using the tenant's payment policy.
 // Normalizes the start to the 1st of the month BEFORE doing arithmetic,
 // so a start date like "28 Sept 2026" can't leak into December.
 const formatPaymentPeriodLabel = (startDate, paymentPolicy) => {
@@ -98,26 +142,102 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
     return db - da;
   });
 
-  //  "Total Paid" = value of periods the tenant has covered.
-  // PAID / PREPAID → count totalDue; PARTIAL → count amountPaid; others → 0.
-  const totals = sorted.reduce(
-    (acc, r) => {
-      acc.rent += Number(r.rent ?? 0);
-      acc.serviceCharge += Number(r.serviceCharge ?? 0);
-      acc.vat += Number(r.vat ?? 0);
-      acc.totalDue += Number(r.totalDue ?? 0);
+  // =============================================
+  // GROUPING — dedupe by NORMALIZED BILLING PERIOD.
+  // ---------------------------------------------------------------
+  // Multiple reports can point at the same billing period:
+  //   - orphaned earlier partials (no linked invoice)
+  //   - a final linked report
+  //   - a split payment that spans multiple invoices
+  // We group them into one billing-period bucket so summary totals
+  // don't double-count the same cash.
+  // =============================================
+  const groups = new Map();
+  for (const r of sorted) {
+    const key = reportGroupKey(r);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
 
-      if (r.status === "PAID" || r.status === "PREPAID") {
-        acc.amountPaid += Number(r.totalDue ?? 0);
-      } else if (r.status === "PARTIAL") {
-        acc.amountPaid += Number(r.amountPaid ?? 0);
-      }
+  // =============================================
+  // TOTALS — the invariant is:
+  //     Total Paid = Total Billed − Total Arrears
+  //
+  // This is algebraically correct by definition (cash received =
+  // amount billed − amount still outstanding), and it's resilient
+  // to how any individual report stored `amountPaid`.
+  //
+  // It correctly handles:
+  //   - split payments across multiple invoices
+  //   - orphaned partial reports
+  //   - overpayments that created PREPAID periods
+  //   - multi-period settlements
+  // =============================================
+  let totalBilled = 0;
+  let totalArrears = 0;
 
-      acc.arrears += Number(r.arrears ?? 0);
-      return acc;
-    },
-    { rent: 0, serviceCharge: 0, vat: 0, totalDue: 0, amountPaid: 0, arrears: 0 }
+  for (const [, groupReports] of groups) {
+    const latest = [...groupReports].sort(
+      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
+    )[groupReports.length - 1];
+
+    // Billed = the constant amount due for this period
+    const billedTotal = Number(latest.totalDue ?? 0);
+    totalBilled += billedTotal;
+
+    // Arrears = the live outstanding balance for this period.
+    // PREPAID / CREDIT periods have no outstanding balance.
+    if (latest.status === "PREPAID" || latest.status === "CREDIT") {
+      totalArrears += 0;
+    } else {
+      totalArrears += Math.max(0, Number(latest.arrears ?? 0));
+    }
+  }
+
+  // Round to 2dp to avoid float drift
+  totalBilled = parseFloat(totalBilled.toFixed(2));
+  totalArrears = parseFloat(totalArrears.toFixed(2));
+
+  // Paid is DERIVED, never summed from report.amountPaid
+  const totalPaid = parseFloat(
+    Math.max(0, totalBilled - totalArrears).toFixed(2)
   );
+
+  const totalRent = sorted.reduce((sum, r) => {
+    const key = reportGroupKey(r);
+    const group = groups.get(key);
+    const latest = [...group].sort(
+      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
+    )[group.length - 1];
+    return sum + (latest.id === r.id ? Number(r.rent ?? 0) : 0);
+  }, 0);
+
+  const totalServiceCharge = sorted.reduce((sum, r) => {
+    const key = reportGroupKey(r);
+    const group = groups.get(key);
+    const latest = [...group].sort(
+      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
+    )[group.length - 1];
+    return sum + (latest.id === r.id ? Number(r.serviceCharge ?? 0) : 0);
+  }, 0);
+
+  const totalVat = sorted.reduce((sum, r) => {
+    const key = reportGroupKey(r);
+    const group = groups.get(key);
+    const latest = [...group].sort(
+      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
+    )[group.length - 1];
+    return sum + (latest.id === r.id ? Number(r.vat ?? 0) : 0);
+  }, 0);
+
+  const totals = {
+    rent: parseFloat(totalRent.toFixed(2)),
+    serviceCharge: parseFloat(totalServiceCharge.toFixed(2)),
+    vat: parseFloat(totalVat.toFixed(2)),
+    totalDue: totalBilled,
+    amountPaid: totalPaid,
+    arrears: totalArrears,
+  };
 
   const generatedOn = new Date().toLocaleDateString("en-KE", {
     day: "2-digit",
@@ -336,23 +456,56 @@ ${sorted
   .map((r) => {
     const invoice = (r.invoices && r.invoices[0]) || null;
 
-    //  FIX: prefer the linked invoice's policy, then the tenant's, then MONTHLY
+    // Prefer the linked invoice's policy, then the tenant's, then MONTHLY
     const reportPolicy =
       (invoice && invoice.paymentPolicy) ||
       tenant.paymentPolicy ||
       "MONTHLY";
 
-    //  FIX: prefer the invoice's own period string (authoritative),
+    // Prefer the invoice's own period string (authoritative),
     // then fall back to deriving from the report's Date + policy
     const periodLabel =
       (invoice && invoice.paymentPeriod) ||
       formatPaymentPeriodLabel(r.paymentPeriod, reportPolicy);
 
-    //  Paid column mirrors the summary rule
-    const paidCellValue =
-      r.status === "PAID" || r.status === "PREPAID"
-        ? Number(r.totalDue ?? 0)
-        : Number(r.amountPaid ?? 0);
+    // ---------------------------------------------------------------
+    // Determine the Paid / Arrears for THIS row.
+    //
+    // Rule:
+    //   - PREPAID reports are fully covered. Show totalDue as Paid,
+    //     and 0 as Arrears (they don't owe anything for this period).
+    //   - PAID reports with no siblings (single report for the period)
+    //     are fully settled. Show totalDue as Paid, 0 Arrears.
+    //   - PAID reports with siblings (multiple reports in the same
+    //     period) show transactional amountPaid and their stored
+    //     arrears snapshot, so the payment trail is visible.
+    //   - PARTIAL / UNPAID reports show transactional amountPaid
+    //     and the stored arrears / live balance.
+    // ---------------------------------------------------------------
+    const groupKey = reportGroupKey(r);
+    const groupReports = groups.get(groupKey) || [r];
+    const hasSiblings = groupReports.length > 1;
+
+    let paidCellValue;
+    let arrearsCellValue;
+
+    if (r.status === "PREPAID" || r.status === "CREDIT") {
+      // Fully covered period — no cash trail to display per row.
+      paidCellValue = Number(r.totalDue ?? 0);
+      arrearsCellValue = 0;
+    } else if (r.status === "PAID" && !hasSiblings) {
+      // Single report, fully settled.
+      paidCellValue = Number(r.totalDue ?? 0);
+      arrearsCellValue = 0;
+    } else if (r.status === "PAID" && hasSiblings) {
+      // Part of a split-payment trail — show transactional amount.
+      paidCellValue = Number(r.amountPaid ?? 0);
+      arrearsCellValue = Number(r.arrears ?? 0);
+    } else {
+      // PARTIAL / UNPAID — show transactional amount and arrears.
+      paidCellValue = Number(r.amountPaid ?? 0);
+      arrearsCellValue = Number(r.arrears ?? 0);
+    }
 
     return `
 <tr>
@@ -365,7 +518,7 @@ ${sorted
   <td>${r.vat ? currencyCell(r.vat) : "-"}</td>
   <td>${currencyCell(r.totalDue)}</td>
   <td>${currencyCell(paidCellValue, { emphasis: "positive" })}</td>
-  <td>${currencyCell(r.arrears, { emphasis: r.arrears > 0 ? "warning" : "" })}</td>
+  <td>${currencyCell(arrearsCellValue, { emphasis: arrearsCellValue > 0 ? "warning" : "" })}</td>
   <td><span class="status-pill" style="background:${statusColor(r.status)}">${r.status ?? "-"}</span></td>
 </tr>`;
   })

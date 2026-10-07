@@ -706,32 +706,32 @@ export const updateInvoiceStatus = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to update this invoice' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to update this invoice'
         });
       }
-      
+
       const hasEditPermission = await permissionService.hasPermission(
-        userId, 
-        'EDIT_INVOICES', 
+        userId,
+        'EDIT_INVOICES',
         propertyId
       );
-      
+
       if (!hasEditPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to edit invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to edit invoices'
         });
       }
     }
 
     const updateData = { status };
-    
+
     if (amountPaid !== undefined) {
       updateData.amountPaid = amountPaid;
       updateData.balance = invoice.totalDue - amountPaid;
-      
+
       if (amountPaid >= invoice.totalDue) {
         updateData.status = 'PAID';
       } else if (amountPaid > 0) {
@@ -745,61 +745,195 @@ export const updateInvoiceStatus = async (req, res) => {
     });
 
     // =============================================
-    // FIXED: Update linked payment reports when invoice status changes
+    // SIBLING RECONCILIATION (HYBRID MODEL)
+    // ---------------------------------------------------------------
+    // CRITICAL RULES:
+    //   - amountPaid is IMMUTABLE (actual money received).
+    //   - arrears is IMMUTABLE (historical snapshot right after payment).
+    //   - Only STATUS is updated to reflect the live invoice state.
+    //
+    // IMPORTANT: We reconcile by TENANT + PAYMENT PERIOD, not just by
+    // linked invoices, because an invoice can only point to ONE report
+    // via paymentReportId. Earlier partial reports for the same period
+    // would otherwise be orphaned and stuck at PARTIAL forever.
     // =============================================
-    if (updatedInvoice.paymentReportId) {
-      console.log(`Reconciling payment report for invoice ${updatedInvoice.invoiceNumber}`);
-      
-      // Get all invoices linked to this payment report
-      const reportInvoices = await prisma.invoice.findMany({
+    const affectedInvoice = await prisma.invoice.findUnique({
+      where: { id: updatedInvoice.id },
+      select: { id: true, tenantId: true, paymentPeriod: true }
+    });
+
+    if (affectedInvoice) {
+      // Collect all invoice IDs linked to the same tenant + period
+      // (so we catch siblings that share a ledger with this invoice),
+      // PLUS any invoices directly linked to the same payment report.
+      const periodLabelCandidates = new Set();
+      if (affectedInvoice.paymentPeriod) {
+        periodLabelCandidates.add(affectedInvoice.paymentPeriod);
+        const parsed = new Date(affectedInvoice.paymentPeriod);
+        if (!isNaN(parsed.getTime())) {
+          periodLabelCandidates.add(
+            parsed.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+          );
+        }
+        // Also try "Month YYYY" parse via invoice.controller's own helper
+        const m = String(affectedInvoice.paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
+        if (m) {
+          periodLabelCandidates.add(
+            `${m[1].charAt(0).toUpperCase()}${m[1].slice(1).toLowerCase()} ${m[2]}`
+          );
+        }
+      }
+
+      const siblingInvoices = await prisma.invoice.findMany({
         where: {
-          paymentReportId: updatedInvoice.paymentReportId
+          OR: [
+            { tenantId: affectedInvoice.tenantId, id: affectedInvoice.id },
+            ...(periodLabelCandidates.size > 0
+              ? [{
+                  tenantId: affectedInvoice.tenantId,
+                  paymentPeriod: { in: Array.from(periodLabelCandidates) }
+                }]
+              : []),
+            ...(updatedInvoice.paymentReportId
+              ? [{ paymentReportId: updatedInvoice.paymentReportId }]
+              : [])
+          ]
+        },
+        select: {
+          id: true,
+          tenantId: true,
+          paymentPeriod: true,
+          totalDue: true,
+          amountPaid: true,
+          balance: true,
+          status: true,
+          paymentReportId: true
         }
       });
-      
-      // Check if all invoices are fully paid
-      const allFullyPaid = reportInvoices.every(inv => inv.status === 'PAID');
-      
-      // Calculate actual totals
-      const totalDue = reportInvoices.reduce((sum, inv) => sum + inv.totalDue, 0);
-      const totalPaid = reportInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
-      const actualArrears = Math.max(0, totalDue - totalPaid);
-      
-      // Determine correct status
-      let correctStatus = 'UNPAID';
-      if (allFullyPaid || actualArrears === 0) {
-        correctStatus = 'PAID';
-      } else if (actualArrears > 0 && totalPaid > 0) {
-        correctStatus = 'PARTIAL';
-      } else if (actualArrears > 0 && totalPaid === 0) {
-        correctStatus = 'UNPAID';
-      }
-      
-      // Get the payment report to check if it needs updating
-      const paymentReport = await prisma.paymentReport.findUnique({
-        where: { id: updatedInvoice.paymentReportId }
+
+      const siblingInvoiceIds = siblingInvoices.map(i => i.id);
+
+      // Find every report that references any of those invoices
+      // OR shares the same tenant + period.
+      const linkedReports = await prisma.paymentReport.findMany({
+        where: {
+          tenantId: affectedInvoice.tenantId,
+          status: { notIn: ['PREPAID', 'CREDIT'] },
+          OR: [
+            { invoices: { some: { id: { in: siblingInvoiceIds } } } },
+            ...(periodLabelCandidates.size > 0
+              ? [{ paymentPeriod: { in: Array.from(periodLabelCandidates) } }]
+              : [])
+          ]
+        },
+        include: {
+          invoices: {
+            select: {
+              id: true,
+              totalDue: true,
+              amountPaid: true,
+              balance: true,
+              status: true,
+              paymentPeriod: true
+            }
+          }
+        }
       });
-      
-      if (paymentReport) {
-        // Update if status changed or arrears changed significantly
-        if (correctStatus !== paymentReport.status || 
-            Math.abs(paymentReport.arrears - actualArrears) > 0.01) {
-          
+
+      // Build a per-period live invoice state map so orphaned reports
+      // (those with no linked invoices) can be reconciled too.
+      const liveInvoiceState = new Map();
+      for (const inv of siblingInvoices) {
+        const key = inv.paymentPeriod || '__no_period__';
+        if (!liveInvoiceState.has(key)) {
+          liveInvoiceState.set(key, []);
+        }
+        liveInvoiceState.get(key).push(inv);
+      }
+
+      for (const linkedReport of linkedReports) {
+        // Never touch PREPAID / CREDIT reports
+        if (linkedReport.status === 'PREPAID' || linkedReport.status === 'CREDIT') {
+          continue;
+        }
+
+        let liveArrears = 0;
+        let totalPaid = 0;
+
+        if (linkedReport.invoices.length > 0) {
+          liveArrears = linkedReport.invoices.reduce(
+            (sum, inv) => sum + Math.max(0, Number(inv.balance) || 0), 0
+          );
+          totalPaid = linkedReport.invoices.reduce(
+            (sum, inv) => sum + Math.min(
+              Number(inv.amountPaid) || 0,
+              Number(inv.totalDue) || 0
+            ), 0
+          );
+        } else {
+          // Orphaned: reconcile by tenant + period
+          const candidates = new Set();
+          if (linkedReport.paymentPeriod) {
+            candidates.add(linkedReport.paymentPeriod);
+            const parsed = new Date(linkedReport.paymentPeriod);
+            if (!isNaN(parsed.getTime())) {
+              candidates.add(
+                parsed.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+              );
+            }
+          }
+          // Add the affected invoice's period variants
+          for (const p of periodLabelCandidates) candidates.add(p);
+
+          for (const periodKey of candidates) {
+            const invs = liveInvoiceState.get(periodKey) || [];
+            for (const inv of invs) {
+              liveArrears += Math.max(0, Number(inv.balance) || 0);
+              totalPaid += Math.min(
+                Number(inv.amountPaid) || 0,
+                Number(inv.totalDue) || 0
+              );
+            }
+          }
+
+          // Final fallback: use the affected invoice itself
+          if (liveArrears === 0 && totalPaid === 0) {
+            const inv = siblingInvoices.find(i => i.id === affectedInvoice.id);
+            if (inv) {
+              liveArrears = Math.max(0, Number(inv.balance) || 0);
+              totalPaid = Math.min(
+                Number(inv.amountPaid) || 0,
+                Number(inv.totalDue) || 0
+              );
+            }
+          }
+        }
+
+        let correctStatus = linkedReport.status;
+        if (liveArrears <= 0.01) {
+          correctStatus = 'PAID';
+        } else if (totalPaid > 0) {
+          correctStatus = 'PARTIAL';
+        } else {
+          correctStatus = 'UNPAID';
+        }
+
+        // ONLY update status. amountPaid and arrears are IMMUTABLE.
+        if (correctStatus !== linkedReport.status) {
           await prisma.paymentReport.update({
-            where: { id: updatedInvoice.paymentReportId },
+            where: { id: linkedReport.id },
             data: {
               status: correctStatus,
-              arrears: actualArrears,
-              amountPaid: totalPaid,
-              rent: reportInvoices.reduce((sum, inv) => sum + (inv.rent || 0), 0),
-              serviceCharge: reportInvoices.reduce((sum, inv) => sum + (inv.serviceCharge || 0), 0),
-              vat: reportInvoices.reduce((sum, inv) => sum + (inv.vat || 0), 0),
-              totalDue: totalDue,
               updatedAt: new Date()
             }
           });
-          
-          console.log(`Reconciled payment report ${paymentReport.id}: ${paymentReport.status} -> ${correctStatus}`);
+
+          console.log(
+            `Reconciled report ${linkedReport.id}: ` +
+            `status ${linkedReport.status} -> ${correctStatus} ` +
+            `(amountPaid preserved: ${linkedReport.amountPaid}, ` +
+            `arrears snapshot preserved: ${linkedReport.arrears})`
+          );
         }
       }
     }
@@ -814,15 +948,14 @@ export const updateInvoiceStatus = async (req, res) => {
           status: updatedInvoice.status
         } : null
       },
-      message: 'Invoice updated successfully' + 
-        (updatedInvoice.paymentReportId ? ' (Linked payment report reconciled)' : '')
+      message: 'Invoice updated successfully' +
+        (updatedInvoice.paymentReportId ? ' (Linked payment reports reconciled)' : '')
     });
   } catch (error) {
     console.error('Error updating invoice:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
-
 // @desc    Download invoice PDF
 // @route   GET /api/invoices/:id/download
 // @access  Private (requires VIEW_INVOICES permission)
