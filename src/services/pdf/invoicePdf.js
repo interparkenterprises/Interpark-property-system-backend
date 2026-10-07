@@ -26,6 +26,89 @@ function isBalanceInvoice(invoice) {
 }
 
 /**
+ * Compute the VAT breakdown for the invoice display.
+ *
+ * Rent VAT and service-charge VAT are INDEPENDENT — the tenant has its
+ * own vatType/vatRate, and the service charge has its own vatType/vatRate.
+ * We derive both components so the footer can reconcile:
+ *     subtotal + total VAT = grand total.
+ *
+ * Returns:
+ *   {
+ *     vatOnRent,              // VAT portion attributable to rent
+ *     vatOnServiceCharge,     // VAT portion attributable to service charge
+ *     serviceChargeExclusive, // SC amount net of its own VAT
+ *     subtotalForDisplay,     // the row labelled "Subtotal"
+ *     totalVat,               // vatOnRent + vatOnServiceCharge
+ *   }
+ */
+function computeVatBreakdown(invoice) {
+  const tenant = invoice.tenant || {};
+  const sc = tenant.serviceCharge || null;
+
+  const rent = Number(invoice.rent ?? 0);
+  const serviceCharge = Number(invoice.serviceCharge ?? 0);
+
+  const rentVatType = tenant.vatType || "NOT_APPLICABLE";
+  const rentVatRate = Number(tenant.vatRate ?? 0);
+
+  const scVatType = sc?.vatType || "NOT_APPLICABLE";
+  const scVatRate = Number(sc?.vatRate ?? 0);
+
+  // Rent VAT
+  let vatOnRent = 0;
+  if (rentVatType === "EXCLUSIVE" && rentVatRate > 0) {
+    vatOnRent = (rent * rentVatRate) / 100;
+  } else if (rentVatType === "INCLUSIVE" && rentVatRate > 0) {
+    vatOnRent = rent - rent / (1 + rentVatRate / 100);
+  }
+
+  // Service charge VAT
+  let vatOnServiceCharge = 0;
+  if (scVatType === "INCLUSIVE" && scVatRate > 0) {
+    vatOnServiceCharge = serviceCharge - serviceCharge / (1 + scVatRate / 100);
+  } else if (scVatType === "EXCLUSIVE" && scVatRate > 0) {
+    vatOnServiceCharge = (serviceCharge * scVatRate) / 100;
+  }
+
+  vatOnRent = parseFloat(vatOnRent.toFixed(2));
+  vatOnServiceCharge = parseFloat(vatOnServiceCharge.toFixed(2));
+
+  // SC net of its own VAT. If SC is VAT-inclusive, this is what remains.
+  // If SC is VAT-exclusive or not applicable, it's the full amount.
+  const serviceChargeExclusive = parseFloat(
+    (serviceCharge - (scVatType === "INCLUSIVE" ? vatOnServiceCharge : 0)).toFixed(2)
+  );
+
+  // For a "Subtotal" line that reconciles to Grand Total:
+  //   - If rent is INCLUSIVE, the SC subtotal is rent-net-of-VAT + SC-net-of-VAT.
+  //   - If rent is EXCLUSIVE, subtotal = rent (base) + SC-net-of-VAT.
+  // Either way, subtotal + totalVat == invoice.totalDue (modulo withholding).
+  const rentBase =
+    rentVatType === "INCLUSIVE" && rentVatRate > 0
+      ? rent - vatOnRent
+      : rent;
+
+  const subtotalForDisplay = parseFloat(
+    (rentBase + serviceChargeExclusive).toFixed(2)
+  );
+
+  const totalVat = parseFloat((vatOnRent + vatOnServiceCharge).toFixed(2));
+
+  return {
+    vatOnRent,
+    vatOnServiceCharge,
+    serviceChargeExclusive,
+    subtotalForDisplay,
+    totalVat,
+    rentVatType,
+    rentVatRate,
+    scVatType,
+    scVatRate,
+  };
+}
+
+/**
  * NOTE ON THE FOOTER: this HTML intentionally has NO footer element.
  * The footer is rendered by Puppeteer's own footerTemplate mechanism
  * (see buildInvoiceFooterTemplate below), called via
@@ -56,7 +139,14 @@ export function buildInvoiceHtml(invoice) {
   const rent = Number(invoice.rent ?? 0);
   const serviceCharge = Number(invoice.serviceCharge ?? 0);
   const vat = Number(invoice.vat ?? 0);
-  const subtotal = rent + serviceCharge;
+
+  const {
+    vatOnRent,
+    vatOnServiceCharge,
+    subtotalForDisplay,
+    totalVat,
+    rentVatType,
+  } = computeVatBreakdown(invoice);
 
   const items = [
     { description: `Rent - ${invoice.paymentPeriod ?? "-"}`, qty: 1, amount: rent },
@@ -70,6 +160,12 @@ export function buildInvoiceHtml(invoice) {
   const titleText = balanceVariant ? "Balance Invoice" : "Pro Forma Invoice";
   const titleColor = balanceVariant ? "#004f79" : "#004f79";
   const headerBarColor = balanceVariant ? "#004f79" : "#004f79";
+
+  // Show VAT on Rent line only when rent VAT is EXCLUSIVE (i.e., it is
+  // ADDED on top). When rent VAT is INCLUSIVE, the VAT is already inside
+  // the rent figure and we show it as a memo-only line.
+  const showVatOnRentLine = vatOnRent > 0;
+  const showVatOnServiceChargeLine = vatOnServiceCharge > 0;
 
   return `
 <!DOCTYPE html>
@@ -244,6 +340,12 @@ border-left:4px solid #0d6efd;
 margin-top:0;
 }
 
+.vat-note{
+font-size:10.5px;
+color:#666;
+margin-top:4px;
+}
+
 </style>
 
 </head>
@@ -349,12 +451,27 @@ ${items.map(item => `
 
 <tr>
 <td colspan="2" align="right"><strong>Subtotal</strong></td>
-<td style="text-align:right">${currency(subtotal)}</td>
+<td style="text-align:right">${currency(subtotalForDisplay)}</td>
 </tr>
 
+${showVatOnRentLine ? `
 <tr>
-<td colspan="2" align="right"><strong>VAT</strong></td>
-<td style="text-align:right">${currency(vat)}</td>
+<td colspan="2" align="right">
+  <strong>VAT on Rent</strong>
+  ${rentVatType === "INCLUSIVE" ? `<div class="vat-note">(already included in rent)</div>` : ""}
+</td>
+<td style="text-align:right">${currency(vatOnRent)}</td>
+</tr>` : ""}
+
+${showVatOnServiceChargeLine ? `
+<tr>
+<td colspan="2" align="right"><strong>VAT on Service Charge</strong></td>
+<td style="text-align:right">${currency(vatOnServiceCharge)}</td>
+</tr>` : ""}
+
+<tr>
+<td colspan="2" align="right"><strong>Total VAT</strong></td>
+<td style="text-align:right">${currency(totalVat)}</td>
 </tr>
 
 <tr>

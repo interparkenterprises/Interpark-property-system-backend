@@ -6,7 +6,13 @@ import path from 'path';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import sizeOf from 'image-size';
-import { addBillingPeriod, calculateChargeByPolicy, calculateEscalatedRent } from '../services/rentCalculation.js';
+import {
+  addBillingPeriod,
+  calculateChargeByPolicy,
+  calculateEscalatedRent,
+  calculateTotalPaymentWithWithholding,
+  getPolicyMonths
+} from '../services/rentCalculation.js';
 import permissionService from "../services/permissionService.js";
 import { buildInvoiceHtml, buildInvoiceFooterTemplate } from '../services/pdf/invoicePdf.js';
 import { generatePDF } from '../utils/pdfGenerator.js';
@@ -23,7 +29,7 @@ const __dirname = path.dirname(__filename);
 async function canAccessInvoice(userId, userRole, invoiceId) {
   // ADMIN can access everything
   if (userRole === 'ADMIN') return true;
-  
+
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
@@ -38,13 +44,13 @@ async function canAccessInvoice(userId, userRole, invoiceId) {
       }
     }
   });
-  
+
   if (!invoice) return false;
-  
+
   const propertyId = invoice.tenant?.unit?.propertyId;
-  
+
   if (!propertyId) return false;
-  
+
   // MANAGER can access properties they own
   if (userRole === 'MANAGER') {
     const property = await prisma.property.findUnique({
@@ -53,7 +59,7 @@ async function canAccessInvoice(userId, userRole, invoiceId) {
     });
     return property?.managerId === userId;
   }
-  
+
   // USER role needs explicit permission
   return permissionService.checkPropertyAccess(userId, propertyId, 'canView');
 }
@@ -61,7 +67,7 @@ async function canAccessInvoice(userId, userRole, invoiceId) {
 // Helper to check if user can manage invoices for a property
 async function canManageInvoiceForProperty(userId, userRole, propertyId) {
   if (userRole === 'ADMIN') return true;
-  
+
   if (userRole === 'MANAGER') {
     const property = await prisma.property.findUnique({
       where: { id: propertyId },
@@ -69,14 +75,14 @@ async function canManageInvoiceForProperty(userId, userRole, propertyId) {
     });
     return property?.managerId === userId;
   }
-  
+
   return permissionService.checkPermission(userId, 'invoice', 'create', propertyId);
 }
 
 // Helper to check if user can view invoices for a property
 async function canViewInvoicesForProperty(userId, userRole, propertyId) {
   if (userRole === 'ADMIN') return true;
-  
+
   if (userRole === 'MANAGER') {
     const property = await prisma.property.findUnique({
       where: { id: propertyId },
@@ -84,7 +90,7 @@ async function canViewInvoicesForProperty(userId, userRole, propertyId) {
     });
     return property?.managerId === userId;
   }
-  
+
   return permissionService.checkPermission(userId, 'invoice', 'view', propertyId);
 }
 
@@ -110,48 +116,45 @@ function toValidDate(dateLike, fallback = new Date()) {
   return Number.isNaN(date.getTime()) ? new Date(fallback) : date;
 }
 
-function calculateMonthlyServiceCharge(tenant, monthlyRent) {
-  if (!tenant?.serviceCharge) return 0;
-
-  switch (tenant.serviceCharge.type) {
-    case 'FIXED':
-      return roundMoney(tenant.serviceCharge.fixedAmount || 0);
-
-    case 'PERCENTAGE':
-      return roundMoney((monthlyRent * (tenant.serviceCharge.percentage || 0)) / 100);
-
-    case 'PER_SQ_FT':
-      return roundMoney((tenant.serviceCharge.perSqFtRate || 0) * (tenant.unit?.sizeSqFt || 0));
-
-    default:
-      return 0;
-  }
-}
-
+/**
+ * Build a payment-period label using UTC arithmetic so that the label
+ * is identical regardless of the server's timezone.
+ */
 function buildPaymentPeriodLabel(startDate, paymentPolicy = 'MONTHLY') {
   const policy = normalizePaymentPolicy(paymentPolicy);
   const start = toValidDate(startDate);
-  const endExclusive = addBillingPeriod(start, policy);
+
+  // Snap to UTC 1st of month
+  const startUtc = new Date(Date.UTC(
+    start.getUTCFullYear(),
+    start.getUTCMonth(),
+    1
+  ));
+
+  // Compute end-of-period via UTC arithmetic
+  const endExclusive = addBillingPeriod(startUtc, policy);
   const end = new Date(endExclusive);
-  end.setDate(end.getDate() - 1);
+  end.setUTCDate(end.getUTCDate() - 1);
 
   const shortDate = (date) =>
     date.toLocaleDateString('en-US', {
       day: 'numeric',
       month: 'short',
-      year: 'numeric'
+      year: 'numeric',
+      timeZone: 'UTC'
     });
 
   switch (policy) {
     case 'QUARTERLY':
     case 'ANNUAL':
-      return `${shortDate(start)} - ${shortDate(end)}`;
+      return `${shortDate(startUtc)} - ${shortDate(end)}`;
 
     case 'MONTHLY':
     default:
-      return start.toLocaleDateString('en-US', {
+      return startUtc.toLocaleDateString('en-US', {
         month: 'long',
-        year: 'numeric'
+        year: 'numeric',
+        timeZone: 'UTC'
       });
   }
 }
@@ -160,6 +163,7 @@ function buildPaymentPeriodLabel(startDate, paymentPolicy = 'MONTHLY') {
  * Aligns a billing date to the tenant's policy cycle.
  * E.g. for a QUARTERLY tenant with rentStart = Jul 1, feeding any date
  * between Jul 1 and Sep 30 returns Jul 1; between Oct 1 and Dec 31 → Oct 1.
+ * Operates entirely in UTC to avoid timezone drift.
  */
 function alignBillingDateToCycle(billingDate, tenant) {
   const policy = normalizePaymentPolicy(tenant.paymentPolicy);
@@ -186,57 +190,107 @@ function alignBillingDateToCycle(billingDate, tenant) {
   return aligned;
 }
 
+/**
+ * Compute invoice line items and totals for a tenant, using the same
+ * calculation pipeline the payment-report flow uses. This guarantees:
+ *
+ *   - Rent VAT is applied with the TENANT's vatType/vatRate.
+ *   - Service charge VAT is applied with the SERVICE CHARGE's own
+ *     vatType/vatRate (independent of the tenant's).
+ *   - Withholding tax (if configured on the tenant) is deducted so
+ *     invoice.totalDue matches what payment reports record.
+ *
+ * Returns the breakdown the PDF builder needs:
+ *   { paymentPolicy, monthlyRent, monthlyServiceCharge,
+ *     rent, serviceCharge, vat, subtotal, totalDue,
+ *     totalDueWithoutWithholding, totalWithheld }
+ */
 function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
   const paymentPolicy = normalizePaymentPolicy(tenant.paymentPolicy);
+
+  // Escalated monthly rent (base, before policy multiplication)
   const { currentRent } = calculateEscalatedRent(tenant, billingDate);
   const monthlyRent = roundMoney(currentRent || tenant.rent || 0);
-  const monthlyServiceCharge = calculateMonthlyServiceCharge(tenant, monthlyRent);
 
-  const rent = roundMoney(calculateChargeByPolicy(monthlyRent, paymentPolicy));
-  const serviceCharge = roundMoney(calculateChargeByPolicy(monthlyServiceCharge, paymentPolicy));
-  const subtotal = roundMoney(rent + serviceCharge);
+  // Use the canonical payment pipeline. This handles:
+  //   - rent × policy months
+  //   - service charge × policy months (with its own VAT)
+  //   - VAT on rent per the tenant's vatType/vatRate
+  //   - withholding tax deductions
+  const breakdown = calculateTotalPaymentWithWithholding(
+    tenant,
+    monthlyRent,
+    paymentPolicy
+  );
 
-  const vatRate = Number(tenant.vatRate ?? 16);
-  let vat = 0;
+  // Rent component
+  const rent = roundMoney(breakdown.rent?.paymentByPolicy || 0);
 
-  if (tenant.vatType === 'INCLUSIVE') {
-    vat = subtotal - subtotal / (1 + vatRate / 100);
-  } else if (tenant.vatType === 'EXCLUSIVE') {
-    vat = (subtotal * vatRate) / 100;
-  }
+  // Service charge component (inclusive of its own VAT)
+  const serviceCharge = roundMoney(
+    breakdown.serviceCharge?.totalByPolicy ??
+    breakdown.serviceCharge?.paymentByPolicy ??
+    0
+  );
 
-  vat = roundMoney(vat);
+  // Monthly service charge (base, pre-policy, pre-VAT)
+  const monthlyServiceCharge = roundMoney(
+    breakdown.serviceCharge?.monthly ?? 0
+  );
 
-  const totalDue = tenant.vatType === 'INCLUSIVE'
-    ? subtotal
-    : roundMoney(subtotal + vat);
+  // VAT total on the invoice = VAT on rent + VAT on service charge.
+  const vatOnRent = roundMoney(breakdown.rent?.vatAmount || 0);
+  const vatOnServiceCharge = roundMoney(breakdown.serviceCharge?.vatAmount || 0);
+  const vat = roundMoney(vatOnRent + vatOnServiceCharge);
+
+  // Subtotal = everything before VAT. Because service charge already
+  // includes its own VAT, we back that out for a clean "subtotal".
+  const serviceChargeExclusiveOfVat = roundMoney(
+    serviceCharge - vatOnServiceCharge
+  );
+  const subtotal = roundMoney(rent + serviceChargeExclusiveOfVat);
+
+  // Withholding tax (if the tenant has any configured)
+  const totalWithheld = roundMoney(
+    breakdown.withholdingTax?.totalWithheld || 0
+  );
+  const totalDueWithoutWithholding = roundMoney(
+    breakdown.total?.paymentByPolicy || (subtotal + vat)
+  );
+
+  // Net payable = what actually goes on the invoice as `totalDue`.
+  const totalDue = roundMoney(
+    breakdown.withholdingTax?.netPayable || totalDueWithoutWithholding
+  );
 
   return {
     paymentPolicy,
     monthlyRent,
     monthlyServiceCharge,
     rent,
-    serviceCharge,
+    serviceCharge,          // inclusive of its own VAT
     vat,
-    subtotal,
-    totalDue
+    subtotal,               // rent + serviceChargeExclusiveOfVat
+    totalDue,
+    totalDueWithoutWithholding,
+    totalWithheld
   };
 }
 
 // Helper function to delete file from storage
 async function deleteFromStorage(fileUrl) {
   if (!fileUrl) return;
-  
+
   try {
     const filename = fileUrl.split('/').pop();
     const filePath = path.join(process.cwd(), 'uploads', filename);
-    
+
     // Use the imported existsSync
     if (existsSync(filePath)) {
       await fs.unlink(filePath);
       console.log(`Deleted file: ${filename}`);
     }
-    
+
   } catch (error) {
     console.error('Error deleting file from storage:', error);
     throw error;
@@ -274,22 +328,22 @@ export const generateInvoice = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canManage = await canManageInvoiceForProperty(userId, userRole, propertyId);
       if (!canManage) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to generate invoices for this property' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to generate invoices for this property'
         });
       }
-      
+
       const hasCreatePermission = await permissionService.hasPermission(
-        userId, 
-        'CREATE_INVOICES', 
+        userId,
+        'CREATE_INVOICES',
         propertyId
       );
-      
+
       if (!hasCreatePermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to create invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to create invoices'
         });
       }
     }
@@ -319,6 +373,14 @@ export const generateInvoice = async (req, res) => {
     const invoiceNumber = await generateInvoiceNumber();
     const paymentPeriod = buildPaymentPeriodLabel(billingDate, paymentPolicy);
 
+    // Append withholding info to notes for auditability, if applicable.
+    const withholdingNote = calculated.totalWithheld > 0
+      ? `Withholding tax withheld: ${calculated.totalWithheld.toFixed(2)}. `
+        + `Amount before withholding: ${calculated.totalDueWithoutWithholding.toFixed(2)}.`
+      : null;
+
+    const effectiveNotes = [notes, withholdingNote].filter(Boolean).join(' ') || null;
+
     const invoice = await prisma.invoice.create({
       data: {
         invoiceNumber,
@@ -334,7 +396,7 @@ export const generateInvoice = async (req, res) => {
         amountPaid,
         balance,
         status: amountPaid >= calculated.totalDue ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UNPAID',
-        notes,
+        notes: effectiveNotes,
         paymentPolicy
       },
       include: {
@@ -344,7 +406,8 @@ export const generateInvoice = async (req, res) => {
               include: {
                 property: true
               }
-            }
+            },
+            serviceCharge: true    // needed by the PDF builder for VAT split
           }
         },
         paymentReport: true
@@ -358,7 +421,7 @@ export const generateInvoice = async (req, res) => {
       footerTemplate: buildInvoiceFooterTemplate(),
       margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
     });
-    
+
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
 
     const updatedInvoice = await prisma.invoice.update({
@@ -408,22 +471,22 @@ export const getInvoicesByTenant = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canView = await canViewInvoicesForProperty(userId, userRole, propertyId);
       if (!canView) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view invoices for this tenant' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view invoices for this tenant'
         });
       }
-      
+
       const hasViewPermission = await permissionService.hasPermission(
-        userId, 
-        'VIEW_INVOICES', 
+        userId,
+        'VIEW_INVOICES',
         propertyId
       );
-      
+
       if (!hasViewPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view invoices'
         });
       }
     }
@@ -485,49 +548,49 @@ export const getAllInvoices = async (req, res) => {
   try {
     const userId = req.user.id;
     const userRole = req.user.role;
-    const { 
-      page = 1, 
-      limit = 10, 
-      status, 
-      paymentPolicy, 
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      paymentPolicy,
       propertyId,
       startDate,
-      endDate 
+      endDate
     } = req.query;
-    
+
     const skip = (page - 1) * limit;
 
     // Check base permission
     if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
       const hasViewPermission = await permissionService.hasPermission(
-        userId, 
+        userId,
         'VIEW_INVOICES'
       );
       if (!hasViewPermission) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view invoices'
         });
       }
     }
 
     const where = {};
-    
+
     if (status) {
       where.status = status;
     }
     if (paymentPolicy) {
       where.paymentPolicy = paymentPolicy;
     }
-    
+
     // Filter by property with permission check
     if (propertyId) {
       if (userRole !== 'ADMIN') {
         const canView = await canViewInvoicesForProperty(userId, userRole, propertyId);
         if (!canView) {
-          return res.status(403).json({ 
-            success: false, 
-            message: 'You do not have permission to view invoices for this property' 
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have permission to view invoices for this property'
           });
         }
       }
@@ -543,7 +606,7 @@ export const getAllInvoices = async (req, res) => {
         select: { id: true }
       });
       const managedPropertyIds = managedProperties.map(p => p.id);
-      
+
       where.tenant = {
         unit: {
           propertyId: { in: managedPropertyIds }
@@ -558,7 +621,7 @@ export const getAllInvoices = async (req, res) => {
         }
       };
     }
-    
+
     if (startDate || endDate) {
       where.issueDate = {};
       if (startDate) {
@@ -630,7 +693,8 @@ export const getInvoiceById = async (req, res) => {
               include: {
                 property: true
               }
-            }
+            },
+            serviceCharge: true
           }
         },
         paymentReport: true
@@ -645,21 +709,21 @@ export const getInvoiceById = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view this invoice' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view this invoice'
         });
       }
-      
+
       const hasViewPermission = await permissionService.hasPermission(
-        userId, 
+        userId,
         'VIEW_INVOICES'
       );
-      
+
       if (!hasViewPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view invoices'
         });
       }
     }
@@ -974,7 +1038,8 @@ export const downloadInvoice = async (req, res) => {
               include: {
                 property: true
               }
-            }
+            },
+            serviceCharge: true    // needed by PDF builder for VAT split
           }
         },
         paymentReport: true
@@ -989,21 +1054,21 @@ export const downloadInvoice = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to download this invoice' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to download this invoice'
         });
       }
-      
+
       const hasViewPermission = await permissionService.hasPermission(
-        userId, 
+        userId,
         'DOWNLOAD_INVOICES'
       );
-      
+
       if (!hasViewPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to download invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to download invoices'
         });
       }
     }
@@ -1035,9 +1100,9 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     const { paymentReportId, dueDate, notes } = req.body;
 
     if (!paymentReportId) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'paymentReportId is required' 
+      return res.status(400).json({
+        success: false,
+        message: 'paymentReportId is required'
       });
     }
 
@@ -1060,9 +1125,9 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     });
 
     if (!paymentReport) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Payment report not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Payment report not found'
       });
     }
 
@@ -1072,39 +1137,39 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canManage = await canManageInvoiceForProperty(userId, userRole, propertyId);
       if (!canManage) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to generate invoices for this property' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to generate invoices for this property'
         });
       }
-      
+
       const hasCreatePermission = await permissionService.hasPermission(
-        userId, 
-        'CREATE_INVOICES', 
+        userId,
+        'CREATE_INVOICES',
         propertyId
       );
-      
+
       if (!hasCreatePermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to create invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to create invoices'
         });
       }
     }
 
     // Check if payment status is PARTIAL
     if (paymentReport.status !== 'PARTIAL') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Can only generate invoices for partial payments. Current status: ' + paymentReport.status 
+      return res.status(400).json({
+        success: false,
+        message: 'Can only generate invoices for partial payments. Current status: ' + paymentReport.status
       });
     }
 
     // Check if balance exists
     if (paymentReport.arrears <= 0) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'No outstanding balance to invoice' 
+      return res.status(400).json({
+        success: false,
+        message: 'No outstanding balance to invoice'
       });
     }
 
@@ -1125,7 +1190,7 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     if (paymentReport.paymentPeriod) {
       // Convert Date to string format (e.g., "June 2026" or "June 1, 2026 - June 30, 2026")
       const paymentDate = new Date(paymentReport.paymentPeriod);
-      
+
       // Use the existing buildPaymentPeriodLabel function to get a consistent format
       // Pass the tenant's payment policy to get the correct period label
       paymentPeriod = buildPaymentPeriodLabel(paymentDate, tenant.paymentPolicy || 'MONTHLY');
@@ -1160,7 +1225,8 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
               include: {
                 property: true
               }
-            }
+            },
+            serviceCharge: true    // needed by PDF builder for VAT split
           }
         },
         paymentReport: true
@@ -1174,7 +1240,7 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
       footerTemplate: buildInvoiceFooterTemplate(),
       margin: { top: '20px', right: '20px', bottom: '55px', left: '20px' }
     });
-    
+
     // Upload PDF to storage
     const pdfUrl = await uploadToStorage(pdfBuffer, `${invoiceNumber}.pdf`);
 
@@ -1208,18 +1274,18 @@ export const getPartialPayments = async (req, res) => {
     // Check base permission
     if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
       const hasViewPermission = await permissionService.hasPermission(
-        userId, 
+        userId,
         'VIEW_INVOICES'
       );
       if (!hasViewPermission) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to view partial payments' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to view partial payments'
         });
       }
     }
 
-    const where = { 
+    const where = {
       status: 'PARTIAL',
       arrears: {
         gt: 0
@@ -1231,9 +1297,9 @@ export const getPartialPayments = async (req, res) => {
       if (userRole !== 'ADMIN') {
         const canView = await canViewInvoicesForProperty(userId, userRole, propertyId);
         if (!canView) {
-          return res.status(403).json({ 
-            success: false, 
-            message: 'You do not have permission to view partial payments for this property' 
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have permission to view partial payments for this property'
           });
         }
       }
@@ -1248,7 +1314,7 @@ export const getPartialPayments = async (req, res) => {
         select: { id: true }
       });
       const managedPropertyIds = managedProperties.map(p => p.id);
-      
+
       where.tenant = {
         unit: {
           propertyId: { in: managedPropertyIds }
@@ -1327,7 +1393,13 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
     const { id } = req.params;
-    const { paymentPolicy, billingStartDate } = req.body;
+    const {
+      paymentPolicy,
+      billingStartDate,
+      paymentPeriod: explicitPeriod,   // NEW: allow direct period label override
+      dueDate: explicitDueDate,        // NEW: allow direct dueDate override
+      issueDate: explicitIssueDate     // NEW (optional): allow issueDate override
+    } = req.body;
 
     const normalizedPolicy = normalizePaymentPolicy(paymentPolicy);
 
@@ -1354,26 +1426,30 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to update this invoice' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to update this invoice'
         });
       }
-      
+
       const hasEditPermission = await permissionService.hasPermission(
-        userId, 
-        'EDIT_INVOICES', 
+        userId,
+        'EDIT_INVOICES',
         propertyId
       );
-      
+
       if (!hasEditPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to edit invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to edit invoices'
         });
       }
     }
 
+    // Determine the billing date used for recalculation:
+    //  1. explicit billingStartDate from body
+    //  2. the linked payment report's period (if any)
+    //  3. the invoice's existing issueDate
     const billingDate = billingStartDate
       ? toValidDate(billingStartDate)
       : invoice.paymentReport?.paymentPeriod
@@ -1388,19 +1464,52 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     const calculated = calculateInvoiceAmountsFromTenant(tenantForCalculation, billingDate);
     const amountPaid = roundMoney(invoice.amountPaid || 0);
     const balance = roundMoney(calculated.totalDue - amountPaid);
-    const status = amountPaid >= calculated.totalDue ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UNPAID';
+    const status =
+      amountPaid >= calculated.totalDue ? 'PAID'
+      : amountPaid > 0 ? 'PARTIAL'
+      : 'UNPAID';
+
+    // NEW: allow explicit label override; otherwise derive from billingDate + policy
+    const finalPeriod = explicitPeriod
+      ? String(explicitPeriod).trim()
+      : buildPaymentPeriodLabel(billingDate, normalizedPolicy);
+
+    // NEW: allow explicit dueDate override; otherwise preserve existing
+    const finalDueDate = explicitDueDate
+      ? toValidDate(explicitDueDate, invoice.dueDate)
+      : invoice.dueDate;
+
+    // NEW (optional): allow explicit issueDate override; otherwise preserve existing
+    const finalIssueDate = explicitIssueDate
+      ? toValidDate(explicitIssueDate, invoice.issueDate)
+      : invoice.issueDate;
 
     const updatedInvoice = await prisma.invoice.update({
       where: { id },
       data: {
         paymentPolicy: normalizedPolicy,
-        paymentPeriod: buildPaymentPeriodLabel(billingDate, normalizedPolicy),
+        paymentPeriod: finalPeriod,
+        issueDate: finalIssueDate,
+        dueDate: finalDueDate,
         rent: calculated.rent,
         serviceCharge: calculated.serviceCharge,
         vat: calculated.vat,
         totalDue: calculated.totalDue,
         balance,
         status
+      },
+      include: {
+        tenant: {
+          include: {
+            unit: {
+              include: {
+                property: true
+              }
+            },
+            serviceCharge: true
+          }
+        },
+        paymentReport: true
       }
     });
 
@@ -1423,16 +1532,16 @@ export const deleteInvoice = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
     const { id } = req.params;
-    const { 
+    const {
       deletePaymentReport = true,
-      deleteRelatedInvoices = true, 
+      deleteRelatedInvoices = true,
       deleteBillInvoices = true,
       deleteIncome = true,
       deleteCommissions = true,
-      cascadeDelete = true, 
-      force = false 
+      cascadeDelete = true,
+      force = false
     } = req.body;
-    
+
     // Find invoice with comprehensive related data
     const invoice = await prisma.invoice.findUnique({
       where: { id },
@@ -1470,9 +1579,9 @@ export const deleteInvoice = async (req, res) => {
             unit: {
               select: {
                 property: {
-                  select: { 
+                  select: {
                     id: true,
-                    name: true 
+                    name: true
                   }
                 }
               }
@@ -1481,11 +1590,11 @@ export const deleteInvoice = async (req, res) => {
         }
       }
     });
-    
+
     if (!invoice) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Invoice not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
       });
     }
 
@@ -1495,30 +1604,30 @@ export const deleteInvoice = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to delete this invoice' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to delete this invoice'
         });
       }
-      
+
       const hasDeletePermission = await permissionService.hasPermission(
-        userId, 
-        'DELETE_INVOICES', 
+        userId,
+        'DELETE_INVOICES',
         propertyId
       );
-      
+
       if (!hasDeletePermission) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to delete invoices' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to delete invoices'
         });
       }
     }
-    
+
     // Check age for safety
     const invoiceAge = Date.now() - new Date(invoice.createdAt).getTime();
     const maxAge = 60 * 24 * 60 * 60 * 1000; // 60 days
-    
+
     if (!force && invoiceAge > maxAge && userRole !== 'ADMIN') {
       return res.status(400).json({
         success: false,
@@ -1526,7 +1635,7 @@ export const deleteInvoice = async (req, res) => {
         ageInDays: Math.floor(invoiceAge / (24 * 60 * 60 * 1000))
       });
     }
-    
+
     const result = {
       deletedInvoice: {
         id: invoice.id,
@@ -1547,7 +1656,7 @@ export const deleteInvoice = async (req, res) => {
       receiptDeleted: false,
       unlinkedRecords: 0
     };
-    
+
     // Start transaction for comprehensive cleanup
     await prisma.$transaction(async (tx) => {
       // 1. Delete the main invoice PDF
@@ -1555,7 +1664,7 @@ export const deleteInvoice = async (req, res) => {
         try {
           const fileName = invoice.pdfUrl.split('/').pop();
           const filePath = path.join(process.cwd(), 'uploads', 'invoices', fileName);
-          
+
           if (existsSync(filePath)) {
             await fs.promises.unlink(filePath);
             result.deletedPdfs++;
@@ -1565,11 +1674,11 @@ export const deleteInvoice = async (req, res) => {
           console.warn(`PDF delete failed for ${invoice.invoiceNumber}:`, fileError.message);
         }
       }
-      
+
       // 2. Handle payment report and related data
       if (invoice.paymentReportId && invoice.paymentReport && (deletePaymentReport || cascadeDelete)) {
         const paymentReport = invoice.paymentReport;
-        
+
         // 2a. Delete receipt PDF
         if (paymentReport.receiptUrl) {
           try {
@@ -1580,11 +1689,11 @@ export const deleteInvoice = async (req, res) => {
             console.warn('Failed to delete receipt PDF:', error.message);
           }
         }
-        
+
         // 2b. Delete related income records
         if (deleteIncome || cascadeDelete) {
           const incomeRecords = await tx.income.findMany({
-            where: { 
+            where: {
               tenantId: invoice.tenantId,
               createdAt: {
                 gte: new Date(invoice.createdAt.getTime() - 24 * 60 * 60 * 1000),
@@ -1592,18 +1701,18 @@ export const deleteInvoice = async (req, res) => {
               }
             }
           });
-          
+
           if (incomeRecords.length > 0) {
-            let incomeToDelete = incomeRecords.find(inc => 
-              inc.amount === invoice.amountPaid || 
+            let incomeToDelete = incomeRecords.find(inc =>
+              inc.amount === invoice.amountPaid ||
               Math.abs(inc.amount - invoice.amountPaid) < 0.01
             ) || incomeRecords[0];
-            
+
             if (incomeToDelete) {
               await tx.income.delete({
                 where: { id: incomeToDelete.id }
               });
-              
+
               result.deletedIncome = {
                 id: incomeToDelete.id,
                 amount: incomeToDelete.amount
@@ -1611,7 +1720,7 @@ export const deleteInvoice = async (req, res) => {
             }
           }
         }
-        
+
         // 2c. Delete commission records
         if (deleteCommissions || cascadeDelete) {
           await tx.managerCommission.deleteMany({
@@ -1623,7 +1732,7 @@ export const deleteInvoice = async (req, res) => {
             }
           });
         }
-        
+
         // 2d. Delete related bill invoices
         if ((deleteBillInvoices || cascadeDelete) && paymentReport.billInvoices.length > 0) {
           for (const billInvoice of paymentReport.billInvoices) {
@@ -1639,18 +1748,18 @@ export const deleteInvoice = async (req, res) => {
                 console.warn(`PDF delete failed for bill invoice:`, fileError.message);
               }
             }
-            
+
             await tx.billInvoice.delete({
               where: { id: billInvoice.id }
             });
-            
+
             result.deletedBillInvoices.push({
               id: billInvoice.id,
               invoiceNumber: billInvoice.invoiceNumber
             });
           }
         }
-        
+
         // 2e. Delete related invoices
         if ((deleteRelatedInvoices || cascadeDelete) && paymentReport.invoices.length > 0) {
           for (const relatedInvoice of paymentReport.invoices) {
@@ -1667,11 +1776,11 @@ export const deleteInvoice = async (req, res) => {
                   console.warn(`PDF delete failed for related invoice:`, fileError.message);
                 }
               }
-              
+
               await tx.invoice.delete({
                 where: { id: relatedInvoice.id }
               });
-              
+
               result.deletedRelatedInvoices.push({
                 id: relatedInvoice.id,
                 invoiceNumber: relatedInvoice.invoiceNumber
@@ -1679,36 +1788,36 @@ export const deleteInvoice = async (req, res) => {
             }
           }
         }
-        
+
         // 2f. Delete payment report
         await tx.paymentReport.delete({
           where: { id: paymentReport.id }
         });
-        
+
         result.deletedPaymentReport = {
           id: paymentReport.id,
           amountPaid: paymentReport.amountPaid,
           status: paymentReport.status
         };
       }
-      
+
       // 3. Delete the main invoice
       await tx.invoice.delete({
         where: { id }
       });
     });
-    
+
     res.json({
       success: true,
       data: result,
       message: `Invoice ${invoice.invoiceNumber} deleted successfully`
     });
-    
+
   } catch (error) {
     console.error('Error in comprehensive invoice deletion:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message || 'Failed to delete invoice' 
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to delete invoice'
     });
   }
 };
@@ -1721,7 +1830,7 @@ export const deleteInvoicePDF = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
     const { id } = req.params;
-    
+
     const invoice = await prisma.invoice.findUnique({
       where: { id },
       include: {
@@ -1736,11 +1845,11 @@ export const deleteInvoicePDF = async (req, res) => {
         }
       }
     });
-    
+
     if (!invoice) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Invoice not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
       });
     }
 
@@ -1750,60 +1859,60 @@ export const deleteInvoicePDF = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canAccess = await canAccessInvoice(userId, userRole, id);
       if (!canAccess) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to modify this invoice' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to modify this invoice'
         });
       }
-      
+
       const hasEditPermission = await permissionService.hasPermission(
-        userId, 
-        'EDIT_INVOICES', 
+        userId,
+        'EDIT_INVOICES',
         propertyId
       );
-      
+
       if (!hasEditPermission) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to delete invoice PDFs' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to delete invoice PDFs'
         });
       }
     }
-    
+
     if (!invoice.pdfUrl) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'No PDF associated with this invoice' 
+      return res.status(400).json({
+        success: false,
+        message: 'No PDF associated with this invoice'
       });
     }
-    
+
     // Delete PDF file from storage
     const filePath = path.join(
-      process.cwd(), 
-      'uploads', 
-      'invoices', 
+      process.cwd(),
+      'uploads',
+      'invoices',
       path.basename(invoice.pdfUrl)
     );
-    
+
     if (existsSync(filePath)) {
       await fs.promises.unlink(filePath);
     }
-    
+
     // Update invoice to remove PDF URL
     await prisma.invoice.update({
       where: { id },
       data: { pdfUrl: null }
     });
-    
+
     res.json({
       success: true,
       message: 'Invoice PDF deleted successfully'
     });
   } catch (error) {
     console.error('Error deleting invoice PDF:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
+    res.status(500).json({
+      success: false,
+      message: error.message
     });
   }
 };

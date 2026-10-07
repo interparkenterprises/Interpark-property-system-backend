@@ -196,19 +196,34 @@ export const getBaseRent = (totalRent, vatType, vatRate) => {
 };
 
 /**
- * Calculate service charge amount based on tenant's service charge settings
- * Service charge is calculated based on rent ONLY (not rent + VAT)
- * When VAT is INCLUSIVE, we use the base rent (excluding VAT)
+ * Calculate service charge amount based on tenant's service charge settings.
+ *
+ * Service charge is calculated based on BASE rent (excluding VAT) when the
+ * type is PERCENTAGE. For FIXED and PER_SQ_FT, the configured value is used
+ * directly and treated according to the service charge's own VAT settings.
+ *
+ * VAT CONVENTION (mirrors how rent is handled elsewhere in this file):
+ *   - When vatType is INCLUSIVE, the configured/derived `amount` is the
+ *     gross figure the tenant pays. `exclusiveAmount` is backed out.
+ *   - When vatType is EXCLUSIVE, the configured/derived `amount` is the base
+ *     and `totalWithVat` adds VAT on top.
+ *   - When vatType is NOT_APPLICABLE, `amount === totalWithVat === exclusiveAmount`.
+ *
+ * The returned `amount` is therefore ALWAYS the figure the tenant is billed
+ * for the service charge (inclusive when VAT is inclusive), matching the
+ * convention used for rent. `vatAmount` remains a memo.
+ *
  * @param {Object} tenant - Tenant object with serviceCharge relation
  * @param {number} monthlyRent - Current monthly rent amount (may include VAT)
  * @returns {Object} - Service charge details
  */
 export const calculateServiceCharge = (tenant, monthlyRent) => {
   const serviceCharge = tenant.serviceCharge;
-  
+
   if (!serviceCharge) {
     return {
       amount: 0,
+      exclusiveAmount: 0,
       type: null,
       vatType: 'NOT_APPLICABLE',
       vatRate: 0,
@@ -218,71 +233,92 @@ export const calculateServiceCharge = (tenant, monthlyRent) => {
     };
   }
 
-  // Get the base rent (excluding VAT) for service charge calculation
+  // Get the base rent (excluding VAT) for PERCENTAGE service charge calculation
   const baseRent = getBaseRent(monthlyRent, tenant.vatType, tenant.vatRate);
-  
-  let amount = 0;
+
+  // ---- 1. Compute the raw configured amount (per the SC type) ----
+  let rawAmount = 0;
   let breakdown = null;
 
   switch (serviceCharge.type) {
     case 'FIXED':
-      amount = serviceCharge.fixedAmount || 0;
+      rawAmount = serviceCharge.fixedAmount || 0;
       breakdown = {
         type: 'FIXED',
-        fixedAmount: amount
+        fixedAmount: rawAmount
       };
       break;
+
     case 'PERCENTAGE':
-      // Calculate percentage based on BASE rent (excluding VAT)
-      amount = (baseRent * (serviceCharge.percentage || 0)) / 100;
+      // Percentage is on the BASE rent (excluding VAT). The result is
+      // therefore exclusive-of-VAT by construction — but we still apply
+      // the SC's own vatType below, because the SC config governs its VAT.
+      rawAmount = (baseRent * (serviceCharge.percentage || 0)) / 100;
       breakdown = {
         type: 'PERCENTAGE',
         percentage: serviceCharge.percentage,
         baseAmount: baseRent,
         totalRentIncludingVat: monthlyRent,
-        calculatedAmount: amount,
+        calculatedAmount: rawAmount,
         note: `Calculated on base rent (${baseRent}) excluding VAT`
       };
       break;
-    case 'PER_SQ_FT':
+
+    case 'PER_SQ_FT': {
       const sizeSqFt = tenant.unit?.sizeSqFt || 0;
-      amount = sizeSqFt * (serviceCharge.perSqFtRate || 0);
+      rawAmount = sizeSqFt * (serviceCharge.perSqFtRate || 0);
       breakdown = {
         type: 'PER_SQ_FT',
-        sizeSqFt: sizeSqFt,
+        sizeSqFt,
         perSqFtRate: serviceCharge.perSqFtRate,
-        calculatedAmount: amount
+        calculatedAmount: rawAmount
       };
       break;
+    }
+
     default:
-      amount = 0;
+      rawAmount = 0;
   }
 
-  // Round to 2 decimal places
-  amount = parseFloat(amount.toFixed(2));
+  rawAmount = parseFloat(rawAmount.toFixed(2));
 
-  // Calculate VAT on service charge using service charge's own VAT settings
+  // ---- 2. Apply the service charge's OWN VAT settings ----
   const vatType = serviceCharge.vatType || 'NOT_APPLICABLE';
   const vatRate = serviceCharge.vatRate || 0;
-  let vatAmount = 0;
 
-  if (vatType !== 'NOT_APPLICABLE' && vatRate > 0) {
-    if (vatType === 'INCLUSIVE') {
-      vatAmount = (amount * vatRate) / (100 + vatRate);
-    } else if (vatType === 'EXCLUSIVE') {
-      vatAmount = (amount * vatRate) / 100;
-    }
+  let exclusiveAmount;
+  let vatAmount = 0;
+  let totalWithVat;
+
+  if (vatType === 'INCLUSIVE' && vatRate > 0) {
+    // rawAmount is already the gross figure; back out the VAT.
+    totalWithVat = rawAmount;
+    vatAmount = parseFloat(((rawAmount * vatRate) / (100 + vatRate)).toFixed(2));
+    exclusiveAmount = parseFloat((rawAmount - vatAmount).toFixed(2));
+  } else if (vatType === 'EXCLUSIVE' && vatRate > 0) {
+    // rawAmount is the net base; VAT is added on top.
+    exclusiveAmount = rawAmount;
+    vatAmount = parseFloat(((rawAmount * vatRate) / 100).toFixed(2));
+    totalWithVat = parseFloat((rawAmount + vatAmount).toFixed(2));
+  } else {
+    // NOT_APPLICABLE (or rate is 0)
+    exclusiveAmount = rawAmount;
+    vatAmount = 0;
+    totalWithVat = rawAmount;
   }
 
-  vatAmount = parseFloat(vatAmount.toFixed(2));
-
   return {
-    amount,
+    // `amount` is the tenant-facing figure (inclusive when VAT is inclusive)
+    amount: totalWithVat,
+    // `exclusiveAmount` is the net-of-VAT base
+    exclusiveAmount,
+    // `totalWithVat` mirrors `amount` — kept for backward compatibility
+    totalWithVat,
+    // Memo VAT amount (informational)
+    vatAmount,
     type: serviceCharge.type,
     vatType,
     vatRate,
-    vatAmount,
-    totalWithVat: parseFloat((amount + vatAmount).toFixed(2)),
     breakdown
   };
 };
@@ -310,58 +346,113 @@ export const calculateVAT = (amount, vatType, vatRate) => {
 };
 
 /**
- * Calculate total payment including rent, service charge, and VAT
+ * Calculate total payment including rent, service charge, and VAT.
+ *
+ * VAT CONVENTION:
+ *   - Rent: `paymentByPolicy` is the raw rent × months (inclusive if the
+ *     tenant's vatType is INCLUSIVE, exclusive if EXCLUSIVE). `vatAmount`
+ *     holds the VAT portion for memos.
+ *   - Service charge: `paymentByPolicy` is the tenant-facing SC × months
+ *     (inclusive when the SC's vatType is INCLUSIVE). `vatAmount` holds
+ *     the memo VAT portion.
+ *
+ * Because both components already carry their own VAT treatment inside
+ * their `totalByPolicy` / `paymentByPolicy`, the grand total is simply
+ * their sum plus the (possibly zero) rent VAT when rent is EXCLUSIVE.
+ *
  * @param {Object} tenant - Tenant object with serviceCharge relation
  * @param {number} monthlyRent - Current monthly rent amount
  * @param {string} paymentPolicy - MONTHLY, QUARTERLY, or ANNUAL
  * @returns {Object} - Complete payment breakdown
  */
 export const calculateTotalPayment = (tenant, monthlyRent, paymentPolicy) => {
-  // Calculate rent payment by policy
+  const policyMonths = getPolicyMonths(paymentPolicy);
+
+  // ---- Rent ----
   const rentPayment = calculatePaymentByPolicy(monthlyRent, paymentPolicy);
-  
-  // Calculate service charge (based on base rent ONLY)
+  const rentVatType = tenant.vatType || 'NOT_APPLICABLE';
+  const rentVatRate = tenant.vatRate || 0;
+
+  // `vatOnRent` is a memo VAT figure regardless of rent VAT mode.
+  const vatOnRent = calculateVAT(rentPayment, rentVatType, rentVatRate);
+
+  // The amount the tenant owes for rent (inclusive if INCLUSIVE, base if EXCLUSIVE).
+  // `calculatePaymentByPolicy` returns `monthlyRent * months`, which is
+  // whatever the tenant's stored rent represents. So this is already correct
+  // for both VAT modes.
+  const rentAmountPayable = rentPayment;
+
+  // ---- Service charge ----
   const serviceChargeDetails = calculateServiceCharge(tenant, monthlyRent);
-  
-  // Calculate service charge by policy (if it's monthly, multiply by policy months)
-  const serviceChargeByPolicy = serviceChargeDetails.amount * getPolicyMonths(paymentPolicy);
-  const serviceChargeVatByPolicy = serviceChargeDetails.vatAmount * getPolicyMonths(paymentPolicy);
-  const serviceChargeTotalByPolicy = serviceChargeDetails.totalWithVat * getPolicyMonths(paymentPolicy);
-  
-  // Calculate VAT on rent using tenant's VAT settings
-  const vatOnRent = calculateVAT(rentPayment, tenant.vatType, tenant.vatRate);
-  
-  // Total
-  const total = rentPayment + vatOnRent + serviceChargeTotalByPolicy;
+
+  // `serviceChargeDetails.amount` is the tenant-facing figure (inclusive
+  // when the SC's vatType is INCLUSIVE). Multiply by policy months.
+  const serviceChargeByPolicy = parseFloat(
+    (serviceChargeDetails.amount * policyMonths).toFixed(2)
+  );
+  const serviceChargeExclusiveByPolicy = parseFloat(
+    (serviceChargeDetails.exclusiveAmount * policyMonths).toFixed(2)
+  );
+  const serviceChargeVatByPolicy = parseFloat(
+    (serviceChargeDetails.vatAmount * policyMonths).toFixed(2)
+  );
+
+  // ---- Grand total ----
+  // Rent: if EXCLUSIVE, we add VAT on top; if INCLUSIVE, rentPayment already includes it.
+  // Service charge: `serviceChargeByPolicy` already includes its own VAT if applicable.
+  let total;
+  if (rentVatType === 'EXCLUSIVE' && rentVatRate > 0) {
+    total = rentAmountPayable + vatOnRent + serviceChargeByPolicy;
+  } else {
+    // INCLUSIVE or NOT_APPLICABLE — VAT (if any) is already inside the amounts
+    total = rentAmountPayable + serviceChargeByPolicy;
+  }
+
+  total = parseFloat(total.toFixed(2));
+
+  // Total VAT (memo, for reporting)
+  const totalVat = parseFloat(
+    (
+      (rentVatType === 'EXCLUSIVE' ? vatOnRent : 0) +
+      serviceChargeVatByPolicy
+    ).toFixed(2)
+  );
 
   return {
     rent: {
       monthly: monthlyRent,
-      paymentByPolicy: rentPayment,
-      vatType: tenant.vatType || 'NOT_APPLICABLE',
-      vatRate: tenant.vatRate || 0,
+      paymentByPolicy: rentAmountPayable,
+      vatType: rentVatType,
+      vatRate: rentVatRate,
       vatAmount: vatOnRent,
-      baseRent: getBaseRent(monthlyRent, tenant.vatType, tenant.vatRate)
+      baseRent: getBaseRent(monthlyRent, rentVatType, rentVatRate)
     },
     serviceCharge: {
       monthly: serviceChargeDetails.amount,
+      monthlyExclusive: serviceChargeDetails.exclusiveAmount,
       paymentByPolicy: serviceChargeByPolicy,
+      paymentByPolicyExclusive: serviceChargeExclusiveByPolicy,
       type: serviceChargeDetails.type,
       vatType: serviceChargeDetails.vatType,
       vatRate: serviceChargeDetails.vatRate,
       vatAmount: serviceChargeVatByPolicy,
-      totalByPolicy: serviceChargeTotalByPolicy,
+      totalByPolicy: serviceChargeByPolicy,
       breakdown: serviceChargeDetails.breakdown
     },
     total: {
-      monthly: parseFloat((monthlyRent + serviceChargeDetails.amount + serviceChargeDetails.vatAmount).toFixed(2)),
-      paymentByPolicy: parseFloat(total.toFixed(2)),
-      vatTotal: parseFloat((vatOnRent + serviceChargeVatByPolicy).toFixed(2))
+      monthly: parseFloat(
+        (
+          monthlyRent +
+          serviceChargeDetails.amount +
+          (rentVatType === 'EXCLUSIVE' ? vatOnRent / policyMonths : 0)
+        ).toFixed(2)
+      ),
+      paymentByPolicy: total,
+      vatTotal: totalVat
     },
     paymentPolicy
   };
 };
-
 // =============================================
 // WITHHOLDING TAX FUNCTIONS
 // =============================================
@@ -429,65 +520,110 @@ export const calculateWithholdingVat = (vatAmount, withholdingVatRate, isExempt 
 
 /**
  * Calculate total payment with withholding taxes
+ *
+ * Withholding tax is deducted from the invoice total, giving the "net
+ * payable" — what the tenant actually hands over. The gross total (before
+ * withholding) is preserved as `totalDueWithoutWithholding`.
+ *
+ * VAT CONVENTION:
+ *   - The grand total (before withholding) already accounts for rent VAT
+ *     and service charge VAT according to each component's own settings.
+ *   - Withholding tax is computed on the rent base (excluding rent VAT),
+ *     per Kenyan practice.
+ *   - Withholding VAT is computed on the rent VAT amount (memo), per
+ *     Kenyan practice.
+ *   - The service charge is NOT subject to withholding tax; its VAT is
+ *     already inside `serviceCharge.totalByPolicy` and is never re-added.
+ *
  * @param {Object} tenant - Tenant object with withholding tax fields
  * @param {number} monthlyRent - Current monthly rent amount
  * @param {string} paymentPolicy - MONTHLY, QUARTERLY, or ANNUAL
  * @returns {Object} - Complete payment breakdown with withholding taxes
  */
 export const calculateTotalPaymentWithWithholding = (tenant, monthlyRent, paymentPolicy) => {
-  // Get base calculations
+  // Base calculations (rent + SC + VAT)
   const basePayment = calculateTotalPayment(tenant, monthlyRent, paymentPolicy);
-  
-  // Get base rent (excluding VAT) for WHT calculation
+
+  const policyMonths = getPolicyMonths(paymentPolicy);
+
+  // Base rent (excluding VAT) for WHT calculation
   const baseRent = basePayment.rent.baseRent || monthlyRent;
   const rentPaymentByPolicy = basePayment.rent.paymentByPolicy;
   const vatOnRent = basePayment.rent.vatAmount;
-  const policyMonths = getPolicyMonths(paymentPolicy);
-  
-  // Calculate withholding tax on rent (based on base rent excluding VAT)
+
+  // Service charge is NOT subject to withholding tax.
+  // Its VAT is already inside `serviceCharge.totalByPolicy` — do not re-add.
+  const serviceChargeTotal = basePayment.serviceCharge.totalByPolicy;
+
+  // ---- Withholding tax on rent (on the base, exclusive of VAT) ----
   const wht = calculateWithholdingTax(
     baseRent * policyMonths,
     tenant.withholdingTaxRate || 0,
     tenant.isWithholdingTaxExempt || false
   );
-  
-  // Calculate withholding VAT on VAT amount
+
+  // ---- Withholding VAT (on the rent VAT amount) ----
   const whVat = calculateWithholdingVat(
     vatOnRent,
     tenant.withholdingVatRate || 0,
     tenant.isWithholdingTaxExempt || false
   );
-  
-  // Net amounts after withholding
-  const netRent = rentPaymentByPolicy - wht.amount;
-  const netVat = vatOnRent - whVat.amount;
-  const netServiceCharge = basePayment.serviceCharge.totalByPolicy;
-  const netServiceChargeVat = basePayment.serviceCharge.vatAmount;
-  
-  // Total payable (amount tenant actually pays after withholding)
-  const totalPayable = netRent + netVat + netServiceCharge + netServiceChargeVat;
-  
+
+  // ---- Net amounts after withholding ----
+  // Rent: subtract WHT from the rent payable
+  const netRent = parseFloat((rentPaymentByPolicy - wht.amount).toFixed(2));
+
+  // Rent VAT: subtract withholding VAT. Only meaningful when rent VAT is
+  // EXCLUSIVE (added on top). If rent VAT is INCLUSIVE, `vatOnRent` is
+  // already inside `rentPaymentByPolicy` and `whVat` still reduces the
+  // tenant's cash outflow, so we subtract it from the rent amount too.
+  const netVat = parseFloat((vatOnRent - whVat.amount).toFixed(2));
+
+  // Service charge: unchanged (withholding does not apply).
+  const netServiceCharge = serviceChargeTotal;
+
+  // ---- Gross total (before withholding) ----
+  const totalDueWithoutWithholding = basePayment.total.paymentByPolicy;
+
+  // ---- Net payable (what the tenant actually pays) ----
+  //   For INCLUSIVE rent VAT:  rent (already includes VAT) + SC − WHT − WhVAT
+  //   For EXCLUSIVE rent VAT:  rent + rent VAT + SC − WHT − WhVAT
+  //   For NOT_APPLICABLE:      rent + SC − WHT
+  let totalPayable;
+  if (basePayment.rent.vatType === 'EXCLUSIVE' && basePayment.rent.vatRate > 0) {
+    totalPayable = netRent + netVat + netServiceCharge;
+  } else {
+    // INCLUSIVE or NOT_APPLICABLE — VAT (if any) is inside rentPayment.
+    // Subtract withholding VAT from the rent side.
+    totalPayable = netRent - whVat.amount + netServiceCharge;
+    // The line above intentionally subtracts whVat separately because
+    // netRent only accounts for WHT, not WhVAT, when VAT is inclusive.
+  }
+  totalPayable = parseFloat(totalPayable.toFixed(2));
+
   // Amounts withheld (to be remitted to tax authorities)
-  const totalWithheld = wht.amount + whVat.amount;
-  
+  const totalWithheld = parseFloat((wht.amount + whVat.amount).toFixed(2));
+
   return {
     ...basePayment,
     withholdingTax: {
       rent: wht,
       vat: whVat,
-      totalWithheld: parseFloat(totalWithheld.toFixed(2)),
-      netPayable: parseFloat(totalPayable.toFixed(2)),
+      totalWithheld,
+      netPayable: totalPayable,
       breakdown: {
-        rentBaseAmount: baseRent * policyMonths,
+        rentBaseAmount: parseFloat((baseRent * policyMonths).toFixed(2)),
         rentVatAmount: vatOnRent,
+        serviceChargeAmount: serviceChargeTotal,
         whtRate: tenant.withholdingTaxRate || 0,
         whVatRate: tenant.withholdingVatRate || 0,
         isExempt: tenant.isWithholdingTaxExempt || false
       }
-    }
+    },
+    // Convenience: the gross total before withholding (for display)
+    totalDueWithoutWithholding: parseFloat(totalDueWithoutWithholding.toFixed(2))
   };
 };
-
 /**
  * Get net payment amount after withholding taxes
  * @param {Object} tenant - Tenant object
