@@ -31,39 +31,62 @@ const statusColor = (status) =>
     ? "#0d6efd"
     : "#ef4444";
 
-//  How many months a policy spans
+// How many months a policy spans
 const policyMonthsFor = (policy) => {
   switch ((policy || "").toUpperCase()) {
-    case "QUARTERLY": return 3;
-    case "ANNUAL": return 12;
+    case "QUARTERLY":
+      return 3;
+    case "ANNUAL":
+      return 12;
     case "MONTHLY":
-    default: return 1;
+    default:
+      return 1;
   }
 };
 
-//  Parse a period string like "September 2026 - November 2026",
-// "May 2026", or an ISO date into a Date (start of that month).
-// Returns null if it can't be parsed.
+const MONTH_NAMES = [
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+];
+
+/**
+ * Parse a period string like "September 2026 - November 2026",
+ * "May 2026", or an ISO date into a Date (start of that month).
+ * Returns null if it can't be parsed.
+ *
+ * IMPORTANT: the explicit "Month YYYY" regex is tried FIRST because
+ * `new Date("February 2027 - April 2027")` behaves differently across
+ * JS engines / Node versions (valid Date on some, Invalid Date on
+ * others). That engine divergence is what caused localhost and
+ * production to disagree on grouping keys and row order.
+ */
 const parsePaymentPeriodToDate = (paymentPeriod) => {
   if (!paymentPeriod) return null;
   if (paymentPeriod instanceof Date) return paymentPeriod;
 
-  // ISO date string?
-  const iso = new Date(paymentPeriod);
-  if (!isNaN(iso.getTime())) return iso;
-
-  // "Month YYYY - Month YYYY" or "Month YYYY"
+  // 1) Explicit "Month YYYY" / "Month YYYY - Month YYYY" form FIRST.
   const match = String(paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
   if (match) {
-    const monthNames = [
-      'january','february','march','april','may','june',
-      'july','august','september','october','november','december'
-    ];
-    const mIdx = monthNames.indexOf(match[1].toLowerCase());
+    const mIdx = MONTH_NAMES.indexOf(match[1].toLowerCase());
     if (mIdx >= 0) {
       return new Date(parseInt(match[2], 10), mIdx, 1);
     }
   }
+
+  // 2) Fall back to ISO date parsing.
+  const iso = new Date(paymentPeriod);
+  if (!isNaN(iso.getTime())) return iso;
+
   return null;
 };
 
@@ -79,13 +102,35 @@ const parsePaymentPeriodToDate = (paymentPeriod) => {
 const reportGroupKey = (report) => {
   const parsed = parsePaymentPeriodToDate(report.paymentPeriod);
   if (parsed && !isNaN(parsed.getTime())) {
-    return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}`;
+    return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(
+      2,
+      "0"
+    )}`;
   }
   // Fallback: stringify whatever we have
   return `unknown:${String(report.paymentPeriod ?? "null")}`;
 };
 
-//  Format a period using the tenant's payment policy.
+/**
+ * Deterministically pick the "latest" report in a bucket.
+ *
+ * Sort by datePaid descending; if tied (very common when several
+ * reports were generated on the same day, e.g. all four rows here
+ * share datePaid = 29/09/2026), fall back to a stable tiebreak on
+ * report id so localhost and production produce identical output.
+ */
+const pickLatest = (reports) => {
+  if (!reports || reports.length === 0) return null;
+  return [...reports].sort((a, b) => {
+    const ta = new Date(a.datePaid ?? 0).getTime() || 0;
+    const tb = new Date(b.datePaid ?? 0).getTime() || 0;
+    if (tb !== ta) return tb - ta; // newest datePaid first
+    // Stable tiebreak: newest report id first
+    return String(b.id ?? "").localeCompare(String(a.id ?? ""));
+  })[0];
+};
+
+// Format a period using the tenant's payment policy.
 // Normalizes the start to the 1st of the month BEFORE doing arithmetic,
 // so a start date like "28 Sept 2026" can't leak into December.
 const formatPaymentPeriodLabel = (startDate, paymentPolicy) => {
@@ -99,7 +144,10 @@ const formatPaymentPeriodLabel = (startDate, paymentPolicy) => {
   const months = policyMonthsFor(paymentPolicy);
 
   if (months <= 1) {
-    return start.toLocaleDateString("en-KE", { month: "short", year: "numeric" });
+    return start.toLocaleDateString("en-KE", {
+      month: "short",
+      year: "numeric",
+    });
   }
 
   // Last covered month = start + months - 1
@@ -136,10 +184,18 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
 
   const property = tenant.unit?.property || {};
 
+  // ---------------------------------------------------------------
+  // SORT — newest billing period first.
+  // We must use parsePaymentPeriodToDate (regex-first) because
+  // `new Date("February 2027 - April 2027")` yields NaN on some
+  // Node versions, which silently disabled the original sort.
+  // ---------------------------------------------------------------
   const sorted = [...paymentReports].sort((a, b) => {
-    const da = a.paymentPeriod ? new Date(a.paymentPeriod).getTime() : 0;
-    const db = b.paymentPeriod ? new Date(b.paymentPeriod).getTime() : 0;
-    return db - da;
+    const da = parsePaymentPeriodToDate(a.paymentPeriod);
+    const db = parsePaymentPeriodToDate(b.paymentPeriod);
+    const ta = da && !isNaN(da.getTime()) ? da.getTime() : 0;
+    const tb = db && !isNaN(db.getTime()) ? db.getTime() : 0;
+    return tb - ta;
   });
 
   // =============================================
@@ -175,11 +231,13 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
   // =============================================
   let totalBilled = 0;
   let totalArrears = 0;
+  let totalRent = 0;
+  let totalServiceCharge = 0;
+  let totalVat = 0;
 
   for (const [, groupReports] of groups) {
-    const latest = [...groupReports].sort(
-      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
-    )[groupReports.length - 1];
+    const latest = pickLatest(groupReports);
+    if (!latest) continue;
 
     // Billed = the constant amount due for this period
     const billedTotal = Number(latest.totalDue ?? 0);
@@ -192,48 +250,30 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
     } else {
       totalArrears += Math.max(0, Number(latest.arrears ?? 0));
     }
+
+    // Component totals come from the same "latest per group" report
+    // so they always reconcile with the billed total.
+    totalRent += Number(latest.rent ?? 0);
+    totalServiceCharge += Number(latest.serviceCharge ?? 0);
+    totalVat += Number(latest.vat ?? 0);
   }
 
   // Round to 2dp to avoid float drift
   totalBilled = parseFloat(totalBilled.toFixed(2));
   totalArrears = parseFloat(totalArrears.toFixed(2));
+  totalRent = parseFloat(totalRent.toFixed(2));
+  totalServiceCharge = parseFloat(totalServiceCharge.toFixed(2));
+  totalVat = parseFloat(totalVat.toFixed(2));
 
   // Paid is DERIVED, never summed from report.amountPaid
   const totalPaid = parseFloat(
     Math.max(0, totalBilled - totalArrears).toFixed(2)
   );
 
-  const totalRent = sorted.reduce((sum, r) => {
-    const key = reportGroupKey(r);
-    const group = groups.get(key);
-    const latest = [...group].sort(
-      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
-    )[group.length - 1];
-    return sum + (latest.id === r.id ? Number(r.rent ?? 0) : 0);
-  }, 0);
-
-  const totalServiceCharge = sorted.reduce((sum, r) => {
-    const key = reportGroupKey(r);
-    const group = groups.get(key);
-    const latest = [...group].sort(
-      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
-    )[group.length - 1];
-    return sum + (latest.id === r.id ? Number(r.serviceCharge ?? 0) : 0);
-  }, 0);
-
-  const totalVat = sorted.reduce((sum, r) => {
-    const key = reportGroupKey(r);
-    const group = groups.get(key);
-    const latest = [...group].sort(
-      (a, b) => new Date(a.datePaid) - new Date(b.datePaid)
-    )[group.length - 1];
-    return sum + (latest.id === r.id ? Number(r.vat ?? 0) : 0);
-  }, 0);
-
   const totals = {
-    rent: parseFloat(totalRent.toFixed(2)),
-    serviceCharge: parseFloat(totalServiceCharge.toFixed(2)),
-    vat: parseFloat(totalVat.toFixed(2)),
+    rent: totalRent,
+    serviceCharge: totalServiceCharge,
+    vat: totalVat,
     totalDue: totalBilled,
     amountPaid: totalPaid,
     arrears: totalArrears,
@@ -428,13 +468,17 @@ table.history tbody tr:nth-child(even) { background: #f9fafb; }
     </div>
     <div class="col">
       <p><span class="label">Premise:</span> ${property.name ?? "-"}</p>
-      <p><span class="label">Monthly Rent:</span> Ksh ${amountOnly(tenant.rent)}</p>
+      <p><span class="label">Monthly Rent:</span> Ksh ${amountOnly(
+        tenant.rent
+      )}</p>
       <p><span class="label">KRA PIN:</span> ${tenant.KRAPin ?? "-"}</p>
     </div>
   </div>
 </div>
 
-<div class="section-label">Payment History (${sorted.length} report${sorted.length > 1 ? "s" : ""})</div>
+<div class="section-label">Payment History (${sorted.length} report${
+    sorted.length > 1 ? "s" : ""
+  })</div>
 <table class="history">
 <thead>
 <tr>
@@ -462,11 +506,26 @@ ${sorted
       tenant.paymentPolicy ||
       "MONTHLY";
 
-    // Prefer the invoice's own period string (authoritative),
-    // then fall back to deriving from the report's Date + policy
-    const periodLabel =
-      (invoice && invoice.paymentPeriod) ||
-      formatPaymentPeriodLabel(r.paymentPeriod, reportPolicy);
+    // ---------------------------------------------------------------
+    // Derive the period label from the GROUP KEY rather than from the
+    // individual row's paymentPeriod string. Every row in the same
+    // bucket then renders the same label, and that label matches the
+    // sort key. Falls back to the invoice's own period string (if
+    // present) for display fidelity.
+    // ---------------------------------------------------------------
+    const groupKey = reportGroupKey(r);
+    let periodLabel;
+    if (invoice && invoice.paymentPeriod) {
+      periodLabel = invoice.paymentPeriod;
+    } else if (/^\d{4}-\d{2}$/.test(groupKey)) {
+      const [gy, gm] = groupKey.split("-").map(Number);
+      periodLabel = formatPaymentPeriodLabel(
+        new Date(gy, gm - 1, 1),
+        reportPolicy
+      );
+    } else {
+      periodLabel = formatPaymentPeriodLabel(r.paymentPeriod, reportPolicy);
+    }
 
     // ---------------------------------------------------------------
     // Determine the Paid / Arrears for THIS row.
@@ -482,7 +541,6 @@ ${sorted
     //   - PARTIAL / UNPAID reports show transactional amountPaid
     //     and the stored arrears / live balance.
     // ---------------------------------------------------------------
-    const groupKey = reportGroupKey(r);
     const groupReports = groups.get(groupKey) || [r];
     const hasSiblings = groupReports.length > 1;
 
@@ -510,16 +568,26 @@ ${sorted
     return `
 <tr>
   <td>${periodLabel}</td>
-  <td>${r.datePaid ? new Date(r.datePaid).toLocaleDateString("en-KE") : "-"}</td>
+  <td>${
+    r.datePaid ? new Date(r.datePaid).toLocaleDateString("en-KE") : "-"
+  }</td>
   <td>${invoice?.invoiceNumber ?? "-"}</td>
-  <td>${invoice?.issueDate ? new Date(invoice.issueDate).toLocaleDateString("en-KE") : "-"}</td>
+  <td>${
+    invoice?.issueDate
+      ? new Date(invoice.issueDate).toLocaleDateString("en-KE")
+      : "-"
+  }</td>
   <td>${currencyCell(r.rent)}</td>
   <td>${r.serviceCharge ? currencyCell(r.serviceCharge) : "-"}</td>
   <td>${r.vat ? currencyCell(r.vat) : "-"}</td>
   <td>${currencyCell(r.totalDue)}</td>
   <td>${currencyCell(paidCellValue, { emphasis: "positive" })}</td>
-  <td>${currencyCell(arrearsCellValue, { emphasis: arrearsCellValue > 0 ? "warning" : "" })}</td>
-  <td><span class="status-pill" style="background:${statusColor(r.status)}">${r.status ?? "-"}</span></td>
+  <td>${currencyCell(arrearsCellValue, {
+    emphasis: arrearsCellValue > 0 ? "warning" : "",
+  })}</td>
+  <td><span class="status-pill" style="background:${statusColor(
+    r.status
+  )}">${r.status ?? "-"}</span></td>
 </tr>`;
   })
   .join("")}
@@ -529,14 +597,28 @@ ${sorted
 <div class="section-label">Summary</div>
 <div class="summary-grid">
   <div class="summary-card">
-    <div class="row"><span class="row-label">Total Rent</span>${currencyCell(totals.rent)}</div>
-    <div class="row"><span class="row-label">Total Service Charge</span>${currencyCell(totals.serviceCharge)}</div>
-    <div class="row"><span class="row-label">Total VAT</span>${currencyCell(totals.vat)}</div>
+    <div class="row"><span class="row-label">Total Rent</span>${currencyCell(
+      totals.rent
+    )}</div>
+    <div class="row"><span class="row-label">Total Service Charge</span>${currencyCell(
+      totals.serviceCharge
+    )}</div>
+    <div class="row"><span class="row-label">Total VAT</span>${currencyCell(
+      totals.vat
+    )}</div>
   </div>
   <div class="summary-card">
-    <div class="row"><span class="row-label">Total Due</span>${currencyCell(totals.totalDue)}</div>
-    <div class="row"><span class="row-label">Total Paid</span>${currencyCell(totals.amountPaid, { emphasis: "positive" })}</div>
-    <div class="row"><span class="row-label">Total Arrears</span>${currencyCell(totals.arrears, { emphasis: totals.arrears > 0 ? "warning" : "positive" })}</div>
+    <div class="row"><span class="row-label">Total Due</span>${currencyCell(
+      totals.totalDue
+    )}</div>
+    <div class="row"><span class="row-label">Total Paid</span>${currencyCell(
+      totals.amountPaid,
+      { emphasis: "positive" }
+    )}</div>
+    <div class="row"><span class="row-label">Total Arrears</span>${currencyCell(
+      totals.arrears,
+      { emphasis: totals.arrears > 0 ? "warning" : "positive" }
+    )}</div>
   </div>
 </div>
 
