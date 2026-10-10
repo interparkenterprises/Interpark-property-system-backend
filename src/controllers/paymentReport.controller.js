@@ -918,27 +918,36 @@ function toScalarNumber(value, objectKey = 'amount') {
  * Parse a paymentPeriod string like "September 2026 - November 2026",
  * "May 2026", or an ISO date into a Date (start of that month).
  * Returns null if it can't be parsed.
+ *
+ * IMPORTANT: the explicit "Month YYYY" regex is tried FIRST because
+ * `new Date("February 2027 - April 2027")` behaves differently across
+ * JS engines / Node versions (valid Date on some, Invalid Date on
+ * others, or a Date shifted into the range's end month on others).
+ * That divergence was causing the prepaid-period step-forward loop
+ * to start one month too early in production.
  */
 function parsePaymentPeriodToDate(paymentPeriod) {
   if (!paymentPeriod) return null;
   if (paymentPeriod instanceof Date) return paymentPeriod;
 
-  // ISO date string?
-  const iso = new Date(paymentPeriod);
-  if (!isNaN(iso.getTime())) return iso;
+  const monthNames = [
+    'january','february','march','april','may','june',
+    'july','august','september','october','november','december'
+  ];
 
-  // "Month YYYY - Month YYYY" or "Month YYYY"
+  // 1) Explicit "Month YYYY" / "Month YYYY - Month YYYY" form FIRST.
   const match = String(paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
   if (match) {
-    const monthNames = [
-      'january','february','march','april','may','june',
-      'july','august','september','october','november','december'
-    ];
     const mIdx = monthNames.indexOf(match[1].toLowerCase());
     if (mIdx >= 0) {
       return new Date(parseInt(match[2], 10), mIdx, 1);
     }
   }
+
+  // 2) Fall back to ISO date parsing.
+  const iso = new Date(paymentPeriod);
+  if (!isNaN(iso.getTime())) return iso;
+
   return null;
 }
 
