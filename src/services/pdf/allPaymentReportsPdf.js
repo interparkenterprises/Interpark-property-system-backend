@@ -59,33 +59,73 @@ const MONTH_NAMES = [
   "december",
 ];
 
-/**
- * Parse a period string like "September 2026 - November 2026",
- * "May 2026", or an ISO date into a Date (start of that month).
- * Returns null if it can't be parsed.
- *
- * IMPORTANT: the explicit "Month YYYY" regex is tried FIRST because
- * `new Date("February 2027 - April 2027")` behaves differently across
- * JS engines / Node versions (valid Date on some, Invalid Date on
- * others). That engine divergence is what caused localhost and
- * production to disagree on grouping keys and row order.
- */
-const parsePaymentPeriodToDate = (paymentPeriod) => {
-  if (!paymentPeriod) return null;
-  if (paymentPeriod instanceof Date) return paymentPeriod;
+const MONTH_NAMES_SHORT = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
 
-  // 1) Explicit "Month YYYY" / "Month YYYY - Month YYYY" form FIRST.
+// Business operates in Nairobi (UTC+3).
+//
+// The DB stores `paymentPeriod` as a DateTime representing
+// "00:00 EAT on the 1st of the target month". In UTC that looks
+// like "21:00 on the LAST day of the PREVIOUS month" — e.g.
+// 2026-11-01 00:00 EAT is stored as 2026-10-31T21:00:00Z.
+//
+// If we read that Date with local accessors on a UTC server we
+// land on October instead of November; on a Nairobi server we land
+// on November. That's what made localhost and production disagree.
+//
+// Fix: shift the timestamp into EAT, then snap to the 1st of that
+// month in UTC. The result is stable regardless of the server's own
+// timezone, and matches what the business means by the period.
+const EAT_OFFSET_MS = 3 * 60 * 60 * 1000;
+
+/**
+ * Convert any `paymentPeriod` value (Date | string | null) into a
+ * UTC Date representing the 1st of the intended calendar month.
+ *
+ * Returns null if the value cannot be parsed.
+ */
+const toUtcMonthStart = (paymentPeriod) => {
+  if (!paymentPeriod) return null;
+
+  // 1) Date object — shift into EAT, then snap to 1st of that month in UTC.
+  if (paymentPeriod instanceof Date) {
+    if (isNaN(paymentPeriod.getTime())) return null;
+    const shifted = new Date(paymentPeriod.getTime() + EAT_OFFSET_MS);
+    return new Date(
+      Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), 1)
+    );
+  }
+
+  // 2) Explicit "Month YYYY" / "Month YYYY - Month YYYY" form FIRST.
+  //    This is engine-independent and the safest parse.
   const match = String(paymentPeriod).match(/^([A-Za-z]+)\s+(\d{4})/);
   if (match) {
     const mIdx = MONTH_NAMES.indexOf(match[1].toLowerCase());
     if (mIdx >= 0) {
-      return new Date(parseInt(match[2], 10), mIdx, 1);
+      return new Date(Date.UTC(parseInt(match[2], 10), mIdx, 1));
     }
   }
 
-  // 2) Fall back to ISO date parsing.
+  // 3) Fall back to ISO parsing, then shift + snap.
   const iso = new Date(paymentPeriod);
-  if (!isNaN(iso.getTime())) return iso;
+  if (!isNaN(iso.getTime())) {
+    const shifted = new Date(iso.getTime() + EAT_OFFSET_MS);
+    return new Date(
+      Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), 1)
+    );
+  }
 
   return null;
 };
@@ -98,16 +138,16 @@ const parsePaymentPeriodToDate = (paymentPeriod) => {
  *     sibling DOES — so grouping by invoice id splits them apart.
  *   - The tenant is already fixed (single-tenant PDF), so we don't
  *     need tenantId in the key here.
+ *
+ * The key uses UTC accessors so it is stable across server timezones.
  */
 const reportGroupKey = (report) => {
-  const parsed = parsePaymentPeriodToDate(report.paymentPeriod);
+  const parsed = toUtcMonthStart(report.paymentPeriod);
   if (parsed && !isNaN(parsed.getTime())) {
-    return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(
-      2,
-      "0"
-    )}`;
+    return `${parsed.getUTCFullYear()}-${String(
+      parsed.getUTCMonth() + 1
+    ).padStart(2, "0")}`;
   }
-  // Fallback: stringify whatever we have
   return `unknown:${String(report.paymentPeriod ?? "null")}`;
 };
 
@@ -115,58 +155,49 @@ const reportGroupKey = (report) => {
  * Deterministically pick the "latest" report in a bucket.
  *
  * Sort by datePaid descending; if tied (very common when several
- * reports were generated on the same day, e.g. all four rows here
- * share datePaid = 29/09/2026), fall back to a stable tiebreak on
- * report id so localhost and production produce identical output.
+ * reports were generated on the same day), fall back to a stable
+ * tiebreak on report id so localhost and production produce
+ * identical output.
  */
 const pickLatest = (reports) => {
   if (!reports || reports.length === 0) return null;
   return [...reports].sort((a, b) => {
     const ta = new Date(a.datePaid ?? 0).getTime() || 0;
     const tb = new Date(b.datePaid ?? 0).getTime() || 0;
-    if (tb !== ta) return tb - ta; // newest datePaid first
-    // Stable tiebreak: newest report id first
+    if (tb !== ta) return tb - ta;
     return String(b.id ?? "").localeCompare(String(a.id ?? ""));
   })[0];
 };
 
-// Format a period using the tenant's payment policy.
-// Normalizes the start to the 1st of the month BEFORE doing arithmetic,
-// so a start date like "28 Sept 2026" can't leak into December.
+/**
+ * Format a period label using the tenant's payment policy.
+ *
+ * Operates entirely in UTC, so the server's own timezone is
+ * irrelevant. The start Date is expected to be a "1st of the month
+ * in UTC" value, as produced by toUtcMonthStart.
+ */
 const formatPaymentPeriodLabel = (startDate, paymentPolicy) => {
   if (!startDate) return "-";
-  let start = new Date(startDate);
+  const start = new Date(startDate);
   if (isNaN(start.getTime())) return "-";
 
-  // Snap to 1st of the month
-  start = new Date(start.getFullYear(), start.getMonth(), 1);
+  const startMonthIdx = start.getUTCMonth();
+  const startYear = start.getUTCFullYear();
 
   const months = policyMonthsFor(paymentPolicy);
 
   if (months <= 1) {
-    return start.toLocaleDateString("en-KE", {
-      month: "short",
-      year: "numeric",
-    });
+    return `${MONTH_NAMES_SHORT[startMonthIdx]} ${startYear}`;
   }
 
-  // Last covered month = start + months - 1
-  const lastCoveredMonthStart = new Date(
-    start.getFullYear(),
-    start.getMonth() + months - 1,
-    1
-  );
-  // End day = last day of last covered month
-  const end = new Date(
-    lastCoveredMonthStart.getFullYear(),
-    lastCoveredMonthStart.getMonth() + 1,
-    0
-  );
+  // Last covered month = start + months - 1 (0-indexed month arithmetic)
+  const totalMonths = startMonthIdx + months - 1;
+  const endMonthIdx = totalMonths % 12;
+  const yearRollover = Math.floor(totalMonths / 12);
+  const endYear = startYear + yearRollover;
 
-  const startYear = start.getFullYear();
-  const endYear = end.getFullYear();
-  const startMonth = start.toLocaleDateString("en-KE", { month: "short" });
-  const endMonth = end.toLocaleDateString("en-KE", { month: "short" });
+  const startMonth = MONTH_NAMES_SHORT[startMonthIdx];
+  const endMonth = MONTH_NAMES_SHORT[endMonthIdx];
 
   if (startYear === endYear) {
     return `${startMonth} - ${endMonth} ${startYear}`;
@@ -186,13 +217,12 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
 
   // ---------------------------------------------------------------
   // SORT — newest billing period first.
-  // We must use parsePaymentPeriodToDate (regex-first) because
-  // `new Date("February 2027 - April 2027")` yields NaN on some
-  // Node versions, which silently disabled the original sort.
+  // Uses toUtcMonthStart (timezone-safe) instead of new Date(...)
+  // so localhost and production sort identically.
   // ---------------------------------------------------------------
   const sorted = [...paymentReports].sort((a, b) => {
-    const da = parsePaymentPeriodToDate(a.paymentPeriod);
-    const db = parsePaymentPeriodToDate(b.paymentPeriod);
+    const da = toUtcMonthStart(a.paymentPeriod);
+    const db = toUtcMonthStart(b.paymentPeriod);
     const ta = da && !isNaN(da.getTime()) ? da.getTime() : 0;
     const tb = db && !isNaN(db.getTime()) ? db.getTime() : 0;
     return tb - ta;
@@ -239,11 +269,9 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
     const latest = pickLatest(groupReports);
     if (!latest) continue;
 
-    // Billed = the constant amount due for this period
     const billedTotal = Number(latest.totalDue ?? 0);
     totalBilled += billedTotal;
 
-    // Arrears = the live outstanding balance for this period.
     // PREPAID / CREDIT periods have no outstanding balance.
     if (latest.status === "PREPAID" || latest.status === "CREDIT") {
       totalArrears += 0;
@@ -251,14 +279,11 @@ export function buildAllPaymentReportsHtml(tenant, paymentReports) {
       totalArrears += Math.max(0, Number(latest.arrears ?? 0));
     }
 
-    // Component totals come from the same "latest per group" report
-    // so they always reconcile with the billed total.
     totalRent += Number(latest.rent ?? 0);
     totalServiceCharge += Number(latest.serviceCharge ?? 0);
     totalVat += Number(latest.vat ?? 0);
   }
 
-  // Round to 2dp to avoid float drift
   totalBilled = parseFloat(totalBilled.toFixed(2));
   totalArrears = parseFloat(totalArrears.toFixed(2));
   totalRent = parseFloat(totalRent.toFixed(2));
@@ -507,11 +532,10 @@ ${sorted
       "MONTHLY";
 
     // ---------------------------------------------------------------
-    // Derive the period label from the GROUP KEY rather than from the
-    // individual row's paymentPeriod string. Every row in the same
-    // bucket then renders the same label, and that label matches the
-    // sort key. Falls back to the invoice's own period string (if
-    // present) for display fidelity.
+    // Derive the period label from the GROUP KEY (which is timezone-
+    // safe) rather than from the individual row's raw paymentPeriod.
+    // The invoice's own period string is preferred when present, since
+    // it was written by the business at invoice time.
     // ---------------------------------------------------------------
     const groupKey = reportGroupKey(r);
     let periodLabel;
@@ -520,11 +544,12 @@ ${sorted
     } else if (/^\d{4}-\d{2}$/.test(groupKey)) {
       const [gy, gm] = groupKey.split("-").map(Number);
       periodLabel = formatPaymentPeriodLabel(
-        new Date(gy, gm - 1, 1),
+        new Date(Date.UTC(gy, gm - 1, 1)),
         reportPolicy
       );
     } else {
-      periodLabel = formatPaymentPeriodLabel(r.paymentPeriod, reportPolicy);
+      const safeStart = toUtcMonthStart(r.paymentPeriod);
+      periodLabel = formatPaymentPeriodLabel(safeStart, reportPolicy);
     }
 
     // ---------------------------------------------------------------
@@ -548,19 +573,15 @@ ${sorted
     let arrearsCellValue;
 
     if (r.status === "PREPAID" || r.status === "CREDIT") {
-      // Fully covered period — no cash trail to display per row.
       paidCellValue = Number(r.totalDue ?? 0);
       arrearsCellValue = 0;
     } else if (r.status === "PAID" && !hasSiblings) {
-      // Single report, fully settled.
       paidCellValue = Number(r.totalDue ?? 0);
       arrearsCellValue = 0;
     } else if (r.status === "PAID" && hasSiblings) {
-      // Part of a split-payment trail — show transactional amount.
       paidCellValue = Number(r.amountPaid ?? 0);
       arrearsCellValue = Number(r.arrears ?? 0);
     } else {
-      // PARTIAL / UNPAID — show transactional amount and arrears.
       paidCellValue = Number(r.amountPaid ?? 0);
       arrearsCellValue = Number(r.arrears ?? 0);
     }
