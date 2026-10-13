@@ -411,6 +411,34 @@ table.history td {
 
 table.history tbody tr:nth-child(even) { background: #f9fafb; }
 
+/* ---- Totals row (tfoot) ---- */
+table.history tfoot td {
+  padding: 8px 6px;
+  border-top: 2px solid #004f79;
+  border-bottom: none;
+  background: #eef4f8;
+  font-size: 9.5px;
+  font-weight: bold;
+  color: #004f79;
+  vertical-align: middle;
+}
+
+table.history tfoot td.tfoot-label {
+  text-align: right;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+table.history tfoot td .currency-label {
+  color: #004f79;
+}
+
+table.history tfoot td .currency-amount {
+  color: #004f79;
+  font-size: 11px;
+}
+
 .currency-cell {
   display: flex;
   flex-direction: column;
@@ -440,37 +468,6 @@ table.history tbody tr:nth-child(even) { background: #f9fafb; }
   color: #fff;
   font-weight: bold;
   font-size: 9px;
-}
-
-.summary-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.summary-card {
-  border: 1px solid #e2e6ea;
-  border-radius: 6px;
-  padding: 14px 18px;
-  background: #fafbfc;
-}
-
-.summary-card .row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 7px 0;
-  font-size: 12px;
-  border-bottom: 1px solid #eef1f3;
-}
-
-.summary-card .row:last-child { border-bottom: none; }
-
-.summary-card .row .row-label { color: #444; }
-
-.summary-card .row .currency-cell {
-  align-items: flex-end;
 }
 </style>
 </head>
@@ -613,35 +610,21 @@ ${sorted
   })
   .join("")}
 </tbody>
+<tfoot>
+<tr>
+  <td colspan="4" class="tfoot-label">Totals</td>
+  <td>${currencyCell(totals.rent)}</td>
+  <td>${currencyCell(totals.serviceCharge)}</td>
+  <td>${currencyCell(totals.vat)}</td>
+  <td>${currencyCell(totals.totalDue)}</td>
+  <td>${currencyCell(totals.amountPaid, { emphasis: "positive" })}</td>
+  <td>${currencyCell(totals.arrears, {
+    emphasis: totals.arrears > 0 ? "warning" : "positive",
+  })}</td>
+  <td></td>
+</tr>
+</tfoot>
 </table>
-
-<div class="section-label">Summary</div>
-<div class="summary-grid">
-  <div class="summary-card">
-    <div class="row"><span class="row-label">Total Rent</span>${currencyCell(
-      totals.rent
-    )}</div>
-    <div class="row"><span class="row-label">Total Service Charge</span>${currencyCell(
-      totals.serviceCharge
-    )}</div>
-    <div class="row"><span class="row-label">Total VAT</span>${currencyCell(
-      totals.vat
-    )}</div>
-  </div>
-  <div class="summary-card">
-    <div class="row"><span class="row-label">Total Due</span>${currencyCell(
-      totals.totalDue
-    )}</div>
-    <div class="row"><span class="row-label">Total Paid</span>${currencyCell(
-      totals.amountPaid,
-      { emphasis: "positive" }
-    )}</div>
-    <div class="row"><span class="row-label">Total Arrears</span>${currencyCell(
-      totals.arrears,
-      { emphasis: totals.arrears > 0 ? "warning" : "positive" }
-    )}</div>
-  </div>
-</div>
 
 </body>
 </html>
