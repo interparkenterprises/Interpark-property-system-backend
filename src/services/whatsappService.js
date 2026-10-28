@@ -1,6 +1,3 @@
-// ES Modules version -- media is generated and uploaded entirely in memory,
-// no temp disk writes for the WhatsApp send path.
-
 import axios from 'axios';
 import FormData from 'form-data';
 import prisma from '../lib/prisma.js';
@@ -13,6 +10,7 @@ import { buildDemandLetterHtml, buildDemandLetterFooterTemplate } from "./pdf/de
 import { buildAllPaymentReportsHtml, buildAllPaymentReportsFooterTemplate } from "./pdf/allPaymentReportsPdf.js";
 import crypto from 'crypto';
 import { Readable } from 'stream';
+import permissionService from './permissionService.js';
 
 // Configuration from environment variables
 const WHATSAPP_API_VERSION = process.env.WHATSAPP_API_VERSION || 'v18.0';
@@ -24,36 +22,73 @@ const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET;
 
 console.log("===== WHATSAPP CONFIG =====");
 console.log("PHONE ID:", WHATSAPP_PHONE_ID);
-console.log(
-  //"TOKEN:",
-  //WHATSAPP_ACCESS_TOKEN
-   // ? `${WHATSAPP_ACCESS_TOKEN.substring(0, 25)}...${WHATSAPP_ACCESS_TOKEN.slice(-15)}`
-   // : "UNDEFINED"
-);
 console.log("===========================");
 
 // Retry configuration
-const MAX_RETRIES = 5; // was 70 -- see note below on why that was a bug, not a feature
-const RETRY_DELAY_MS = 2000;
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 8000;
 
 // Supported document types and their generators.
-// Each generator now returns { buffer, filename, mimeType } -- no disk path.
+// Each generator returns { buffer, filename, mimeType } -- no disk path.
 const DOCUMENT_GENERATORS = {
   "Invoice": generateInvoice,
   "Demand Letter": generateDemandLetter,
   "Bill Invoices": generateBillInvoice
 };
 
-/**
- * Main service to send document via WhatsApp
- */
+// ======================================================
+// DEFENSE-IN-DEPTH PERMISSION GUARD
+// ------------------------------------------------------
+// Every public service function that materialises a tenant's financial
+// data accepts an optional `requester = { id, role }`. When provided,
+// the service re-checks the correct permission before touching the
+// database or WhatsApp. When omitted, the caller is trusted to have
+// already gated the request (controller layer). This lets us migrate
+// incrementally without breaking existing internal callers, and
+// closes the hole if anyone forgets to gate a future endpoint.
+// ======================================================
+async function assertCanAccessTenantReport(requester, tenantId, operation) {
+  if (!requester) return; // caller already gated (legacy callers)
+
+  if (!tenantId) {
+    throw new Error('tenantId is required for permission check');
+  }
+
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    select: { unit: { select: { propertyId: true } } }
+  });
+
+  const propertyId = tenant?.unit?.propertyId || null;
+
+  const allowed = await permissionService.canDownloadReportForProperty(
+    requester.id,
+    requester.role,
+    propertyId,
+    operation
+  );
+
+  if (!allowed) {
+    const err = new Error(
+      `Permission denied: requester ${requester.id} (${requester.role}) cannot ${operation} for tenant ${tenantId}`
+    );
+    err.code = 'PERMISSION_DENIED';
+    err.statusCode = 403;
+    throw err;
+  }
+}
+
+// ======================================================
+// MAIN SEND DOCUMENT
+// ======================================================
 export async function sendDocumentViaWhatsApp(options) {
   const {
     documentId,
     documentType,
     propertyId,
     managerId,
-    customMessage
+    customMessage,
+    requester
   } = options;
 
   let resolvedPropertyId = propertyId;
@@ -81,9 +116,7 @@ export async function sendDocumentViaWhatsApp(options) {
         }
       });
 
-      if (!documentRecord)
-        throw new Error("Invoice not found");
-
+      if (!documentRecord) throw new Error("Invoice not found");
       tenant = documentRecord.tenant;
       break;
 
@@ -101,9 +134,7 @@ export async function sendDocumentViaWhatsApp(options) {
         }
       });
 
-      if (!documentRecord)
-        throw new Error("Bill Invoice not found");
-
+      if (!documentRecord) throw new Error("Bill Invoice not found");
       tenant = documentRecord.tenant;
       break;
 
@@ -119,9 +150,7 @@ export async function sendDocumentViaWhatsApp(options) {
         }
       });
 
-      if (!documentRecord)
-        throw new Error("Demand Letter not found");
-
+      if (!documentRecord) throw new Error("Demand Letter not found");
       tenant = documentRecord.tenant;
       resolvedPropertyId = resolvedPropertyId || documentRecord.property?.id;
       break;
@@ -130,7 +159,20 @@ export async function sendDocumentViaWhatsApp(options) {
       throw new Error(`Unsupported document type: ${documentType}`);
   }
 
-  // Get phone number with fallback - using contact field
+  // Defense-in-depth: if requester provided, verify send permission
+  if (requester) {
+    const opMap = {
+      'Invoice': 'downloadReport',
+      'Bill Invoices': 'downloadBillReport',
+      'Demand Letter': 'downloadComprehensiveReport'
+    };
+    await assertCanAccessTenantReport(
+      requester,
+      tenant.id,
+      opMap[documentType] || 'downloadReport'
+    );
+  }
+
   const contact = tenant.contact || tenant.phoneNumber || tenant.alternativePhone;
   if (!contact) {
     throw new Error(`Tenant ${tenant.id} has no valid phone number`);
@@ -138,8 +180,7 @@ export async function sendDocumentViaWhatsApp(options) {
 
   const formattedPhone = formatcontactForWhatsApp(contact);
 
-  // Generate document in memory, with retry
-  let document; // { buffer, filename, mimeType }
+  let document;
   let retryCount = 0;
 
   while (retryCount < MAX_RETRIES) {
@@ -160,7 +201,6 @@ export async function sendDocumentViaWhatsApp(options) {
     throw new Error(`Document generation failed for ${documentType}`);
   }
 
-  // Upload media (in-memory buffer) with retry
   let mediaResponse;
   retryCount = 0;
 
@@ -180,11 +220,8 @@ export async function sendDocumentViaWhatsApp(options) {
     }
   }
 
-  if (!mediaResponse?.id) {
-    throw new Error('Media upload failed');
-  }
+  if (!mediaResponse?.id) throw new Error('Media upload failed');
 
-  // Send message with retry
   let messageResponse;
   retryCount = 0;
 
@@ -227,8 +264,6 @@ export async function sendDocumentViaWhatsApp(options) {
     status: "sent"
   });
 
-  // No temp file to clean up -- nothing was ever written to disk.
-
   return {
     success: true,
     message: `${documentType} sent successfully to ${formattedPhone}`,
@@ -241,24 +276,19 @@ export async function sendDocumentViaWhatsApp(options) {
   };
 }
 
-/**
- * Fetch a tenant with everything needed to build the combined payment
- * reports PDF. Shared by both the WhatsApp send path and the download
- * path so there is exactly ONE query shape.
- */
+// ======================================================
+// FETCHERS
+// ======================================================
+
 async function fetchTenantWithPaymentReports(tenantId) {
-  if (!tenantId) {
-    throw new Error("tenantId is required");
-  }
+  if (!tenantId) throw new Error("tenantId is required");
 
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantId },
     include: {
       unit: { include: { property: true } },
       paymentReports: {
-        include: {
-          invoices: { orderBy: { issueDate: 'desc' }, take: 1 }
-        }
+        include: { invoices: { orderBy: { issueDate: 'desc' }, take: 1 } }
       }
     }
   });
@@ -288,6 +318,29 @@ async function fetchTenantWithBillInvoices(tenantId) {
   return { tenant, billInvoices };
 }
 
+async function fetchTenantComprehensiveData(tenantId) {
+  if (!tenantId) throw new Error("tenantId is required");
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    include: {
+      unit: { include: { property: true } },
+      paymentReports: true,
+      invoices: true,
+      billInvoices: { include: { bill: true } }
+    }
+  });
+  if (!tenant) throw new Error("Tenant not found");
+  const { paymentReports = [], invoices = [], billInvoices = [] } = tenant;
+  if (paymentReports.length === 0 && invoices.length === 0 && billInvoices.length === 0) {
+    throw new Error("This tenant has no records to include in a comprehensive report");
+  }
+  return { tenant, paymentReports, invoices, billInvoices };
+}
+
+// ======================================================
+// BILL REPORT
+// ======================================================
+
 export async function generateBillReportPdfBuffer(tenant, billInvoices) {
   const html = buildBillReportHtml(tenant, billInvoices);
   return generatePDF(html, {
@@ -298,13 +351,20 @@ export async function generateBillReportPdfBuffer(tenant, billInvoices) {
   });
 }
 
-export async function downloadBillReportBuffer(tenantId) {
+export async function downloadBillReportBuffer(tenantId, options = {}) {
+  if (options.requester) {
+    await assertCanAccessTenantReport(options.requester, tenantId, 'downloadBillReport');
+  }
   const { tenant, billInvoices } = await fetchTenantWithBillInvoices(tenantId);
   const buffer = await generateBillReportPdfBuffer(tenant, billInvoices);
   return { buffer, tenant };
 }
 
-export async function sendBillReportViaWhatsApp({ tenantId, customMessage, managerId }) {
+export async function sendBillReportViaWhatsApp({ tenantId, customMessage, managerId, requester }) {
+  if (requester) {
+    await assertCanAccessTenantReport(requester, tenantId, 'downloadBillReport');
+  }
+
   const { tenant, billInvoices } = await fetchTenantWithBillInvoices(tenantId);
   const contact = tenant.contact || tenant.phoneNumber || tenant.alternativePhone;
   if (!contact) throw new Error(`Tenant ${tenantId} has no valid phone number`);
@@ -344,24 +404,9 @@ export async function sendBillReportViaWhatsApp({ tenantId, customMessage, manag
   return { success: true, message: `Bill report sent successfully to ${formattedPhone}`, data: { messageId: whatsappMessageId, mediaId: mediaResponse.id, logId: log.id } };
 }
 
-async function fetchTenantComprehensiveData(tenantId) {
-  if (!tenantId) throw new Error("tenantId is required");
-  const tenant = await prisma.tenant.findUnique({
-    where: { id: tenantId },
-    include: {
-      unit: { include: { property: true } },
-      paymentReports: true,
-      invoices: true,
-      billInvoices: { include: { bill: true } }
-    }
-  });
-  if (!tenant) throw new Error("Tenant not found");
-  const { paymentReports = [], invoices = [], billInvoices = [] } = tenant;
-  if (paymentReports.length === 0 && invoices.length === 0 && billInvoices.length === 0) {
-    throw new Error("This tenant has no records to include in a comprehensive report");
-  }
-  return { tenant, paymentReports, invoices, billInvoices };
-}
+// ======================================================
+// COMPREHENSIVE REPORT
+// ======================================================
 
 export async function generateComprehensiveReportPdfBuffer(tenant, data) {
   const html = buildComprehensiveReportHtml(tenant, data);
@@ -373,15 +418,20 @@ export async function generateComprehensiveReportPdfBuffer(tenant, data) {
   });
 }
 
-export async function downloadComprehensiveReportBuffer(tenantId) {
+export async function downloadComprehensiveReportBuffer(tenantId, options = {}) {
+  if (options.requester) {
+    await assertCanAccessTenantReport(options.requester, tenantId, 'downloadComprehensiveReport');
+  }
   const { tenant, ...data } = await fetchTenantComprehensiveData(tenantId);
   const buffer = await generateComprehensiveReportPdfBuffer(tenant, data);
   return { buffer, tenant };
 }
 
-//comprehensive and bill report
+export async function sendComprehensiveReportViaWhatsApp({ tenantId, customMessage, managerId, requester }) {
+  if (requester) {
+    await assertCanAccessTenantReport(requester, tenantId, 'downloadComprehensiveReport');
+  }
 
-export async function sendComprehensiveReportViaWhatsApp({ tenantId, customMessage, managerId }) {
   const { tenant, ...data } = await fetchTenantComprehensiveData(tenantId);
   const contact = tenant.contact || tenant.phoneNumber || tenant.alternativePhone;
   if (!contact) throw new Error(`Tenant ${tenantId} has no valid phone number`);
@@ -421,10 +471,10 @@ export async function sendComprehensiveReportViaWhatsApp({ tenantId, customMessa
   return { success: true, message: `Comprehensive report sent successfully to ${formattedPhone}`, data: { messageId: whatsappMessageId, mediaId: mediaResponse.id, logId: log.id } };
 }
 
-/**
- * Build the combined payment reports PDF buffer. Single source of truth
- * for both the WhatsApp send flow and the download flow.
- */
+// ======================================================
+// ALL PAYMENT REPORTS
+// ======================================================
+
 export async function generatePaymentReportsPdfBuffer(tenant, paymentReports) {
   const html = buildAllPaymentReportsHtml(tenant, paymentReports);
   return generatePDF(html, {
@@ -435,28 +485,26 @@ export async function generatePaymentReportsPdfBuffer(tenant, paymentReports) {
   });
 }
 
-/**
- * Generate the combined payment reports PDF for direct download.
- */
-export async function downloadAllPaymentReportsBuffer(tenantId) {
+export async function downloadAllPaymentReportsBuffer(tenantId, options = {}) {
+  if (options.requester) {
+    await assertCanAccessTenantReport(options.requester, tenantId, 'downloadReport');
+  }
   const { tenant, paymentReports } = await fetchTenantWithPaymentReports(tenantId);
   const buffer = await generatePaymentReportsPdfBuffer(tenant, paymentReports);
   return { buffer, tenant };
 }
 
-/**
- * Send ALL payment reports for a tenant as one combined WhatsApp document.
- */
-export async function sendAllPaymentReportsViaWhatsApp({ tenantId, customMessage, managerId }) {
+export async function sendAllPaymentReportsViaWhatsApp({ tenantId, customMessage, managerId, requester }) {
+  if (requester) {
+    await assertCanAccessTenantReport(requester, tenantId, 'downloadReport');
+  }
+
   const { tenant, paymentReports } = await fetchTenantWithPaymentReports(tenantId);
 
   const contact = tenant.contact || tenant.phoneNumber || tenant.alternativePhone;
-  if (!contact) {
-    throw new Error(`Tenant ${tenantId} has no valid phone number`);
-  }
+  if (!contact) throw new Error(`Tenant ${tenantId} has no valid phone number`);
   const formattedPhone = formatcontactForWhatsApp(contact);
 
-  // Generate the combined PDF in memory
   let pdfBuffer;
   let retryCount = 0;
   while (retryCount < MAX_RETRIES) {
@@ -478,7 +526,6 @@ export async function sendAllPaymentReportsViaWhatsApp({ tenantId, customMessage
     mimeType: "application/pdf"
   };
 
-  // Upload + send, same pattern as the rest of the service
   let mediaResponse;
   retryCount = 0;
   while (retryCount < MAX_RETRIES) {
@@ -564,9 +611,10 @@ export async function sendAllPaymentReportsViaWhatsApp({ tenantId, customMessage
   };
 }
 
-/**
- * Send documents in bulk
- */
+// ======================================================
+// BULK SEND
+// ======================================================
+
 export async function sendBulkDocuments(sendOptionsArray) {
   const results = { success: [], failed: [] };
 
@@ -614,9 +662,10 @@ export async function sendBulkDocuments(sendOptionsArray) {
   };
 }
 
-/**
- * Get send status for a tenant's documents
- */
+// ======================================================
+// STATUS / HELPERS
+// ======================================================
+
 export async function getDocumentSendStatus(tenantId) {
   const documentTypes = [...Object.keys(DOCUMENT_GENERATORS), "All Payment Reports", "Bill Report", "Full Report"];
 
@@ -640,9 +689,6 @@ export async function getDocumentSendStatus(tenantId) {
   return statuses;
 }
 
-/**
- * Format phone number for WhatsApp API (Kenya +254)
- */
 export function formatcontactForWhatsApp(contact) {
   if (!contact) return null;
 
@@ -676,16 +722,8 @@ export function verifyWebhookSignature(req) {
   return crypto.timingSafeEqual(a, b);
 }
 
-/**
- * Distinguish permanent WhatsApp API errors (bad auth, invalid recipient,
- * malformed request) from transient ones (network blip, rate limit).
- * Retrying an OAuth failure 70 times just wastes ~2 minutes per send for
- * an error that will never resolve itself.
- */
 function isNonRetryableWhatsAppError(error) {
   const code = error?.response?.data?.error?.code;
-  // 190 = invalid/expired access token, 100 = invalid parameter,
-  // 131030/131031 = recipient not in allowed list / opted out
   return [190, 100, 131030, 131031].includes(code);
 }
 
@@ -694,16 +732,12 @@ function formatWhatsAppError(error) {
   return metaError?.message || error.message || 'WhatsApp request failed';
 }
 
-/**
- * Upload media to WhatsApp Cloud API directly from an in-memory buffer --
- * no temp file, no disk I/O.
- */
 async function uploadMediaToWhatsApp(document) {
   const form = new FormData();
 
   const stream = new Readable();
   stream.push(document.buffer);
-  stream.push(null); // signals end-of-stream
+  stream.push(null);
 
   form.append('file', stream, {
     filename: document.filename,
@@ -731,9 +765,7 @@ async function uploadMediaToWhatsApp(document) {
     throw error;
   }
 }
-/**
- * Send WhatsApp message with media
- */
+
 async function sendWhatsAppMessage(
   recipientPhone,
   mediaId,
@@ -773,9 +805,6 @@ async function sendWhatsAppMessage(
   }
 }
 
-/**
- * Generate WhatsApp message caption
- */
 function generateCaption(documentType, tenant, managerId = null) {
   const tenantName = tenant.fullName || tenant.name || tenant.companyName || 'Valued Tenant';
   const propertyName = tenant.property?.name || tenant.unit?.property?.name || 'Interpark Property';
@@ -794,9 +823,6 @@ function generateCaption(documentType, tenant, managerId = null) {
   return captions[documentType] || `Document: ${documentType}`;
 }
 
-/**
- * Save communication log to database
- */
 async function saveCommunicationLog(logData) {
   return await prisma.whatsAppLog.create({
     data: {
@@ -813,9 +839,10 @@ async function saveCommunicationLog(logData) {
   });
 }
 
-/**
- * Handle incoming WhatsApp webhook
- */
+// ======================================================
+// WEBHOOK HANDLING
+// ======================================================
+
 export async function handleWebhook(payload) {
   try {
     const data = payload.body;
@@ -838,9 +865,6 @@ export async function handleWebhook(payload) {
   }
 }
 
-/**
- * Process status updates from webhook
- */
 async function processStatusUpdates(value) {
   for (const status of value.statuses) {
     const { id: messageId, status: statusType, timestamp } = status;
@@ -870,9 +894,6 @@ async function processStatusUpdates(value) {
   }
 }
 
-/**
- * Get WhatsApp communication logs with filters
- */
 export async function getCommunicationLogs(filters = {}) {
   const {
     tenantId, propertyId, documentType, startDate, endDate,
@@ -917,9 +938,9 @@ export async function getCommunicationLogs(filters = {}) {
   };
 }
 
-// ============================================
-// DOCUMENT GENERATORS -- all return { buffer, filename, mimeType }
-// ============================================
+// ======================================================
+// DOCUMENT GENERATORS
+// ======================================================
 
 async function generateInvoice(invoice) {
   try {

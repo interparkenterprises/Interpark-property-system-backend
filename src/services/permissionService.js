@@ -6,7 +6,7 @@ class PermissionService {
   // ======================================================
   // PERMISSION CODE MAPPING
   // ======================================================
-  
+
   // Map resource operations to permission codes
   getPermissionCode(resource, operation) {
     const mapping = {
@@ -51,7 +51,7 @@ class PermissionService {
         pay: 'PAY_BILLS',
         recordMeterReading: 'RECORD_METER_READINGS'
       },
-      // Bill Invoice permissions (add this new section)
+      // Bill Invoice permissions
       billInvoice: {
         view: 'VIEW_BILL_INVOICES',
         create: 'CREATE_BILL_INVOICE',
@@ -79,18 +79,23 @@ class PermissionService {
       // Payment Report permissions
       paymentReport: {
         view: 'VIEW_PAYMENT_REPORTS',
-        create: 'RECORD_PAYMENTS',        // Recording payments
-        edit: 'EDIT_PAYMENT_RECORDS',     // Editing payment records
-        delete: 'DELETE_PAYMENT_RECORDS', // Deleting payment records
-        download: 'DOWNLOAD_PAYMENT_RECEIPT', // Downloading receipts
-        preview: 'PREVIEW_PAYMENTS',      // Previewing payments
-        viewArrears: 'VIEW_ARREARS'       // Viewing arrears
+        create: 'RECORD_PAYMENTS',                 // Recording payments
+        edit: 'EDIT_PAYMENT_RECORDS',              // Editing payment records
+        delete: 'DELETE_PAYMENT_RECORDS',          // Deleting payment records
+        download: 'DOWNLOAD_PAYMENT_RECEIPT',      // Downloading a single receipt
+        preview: 'PREVIEW_PAYMENTS',               // Previewing payments
+        viewArrears: 'VIEW_ARREARS',               // Viewing arrears
+        // NEW: aggregated report downloads
+        downloadReport: 'DOWNLOAD_PAYMENT_REPORT',
+        downloadBillReport: 'DOWNLOAD_BILL_REPORT',
+        downloadComprehensiveReport: 'DOWNLOAD_COMPREHENSIVE_REPORT'
       },
 
-      // Receipt permissions
+      // Receipt permissions (kept for backward-compat; DOWNLOAD_RECEIPTS is
+      // legacy — prefer paymentReport.download === DOWNLOAD_PAYMENT_RECEIPT)
       receipt: {
         view: 'VIEW_RECEIPTS',
-        download: 'DOWNLOAD_RECEIPTS',
+        download: 'DOWNLOAD_PAYMENT_RECEIPT',
         generate: 'GENERATE_RECEIPTS'
       },
       // Document permissions
@@ -161,7 +166,7 @@ class PermissionService {
         approveManager: 'APPROVE_MANAGER'
       }
     };
-    
+
     return mapping[resource]?.[operation] || null;
   }
 
@@ -170,25 +175,25 @@ class PermissionService {
   // ======================================================
   async checkPermission(userId, resource, operation, propertyId = null) {
     const permissionCode = this.getPermissionCode(resource, operation);
-    
+
     if (!permissionCode) {
       console.warn(`No permission code found for ${resource}.${operation}`);
       return false;
     }
-    
+
     // Special handling for CREATE operations (no property exists yet)
     if (operation === 'create') {
       const user = await prisma.user.findUnique({
         where: { id: userId },
         select: { role: true }
       });
-      
+
       // Allow ADMIN and MANAGER to create resources
       if (user?.role === 'ADMIN' || user?.role === 'MANAGER') {
         return true;
       }
     }
-    
+
     return this.hasPermission(userId, permissionCode, propertyId);
   }
 
@@ -196,7 +201,6 @@ class PermissionService {
   // UNIT PERMISSION CHECK (SPECIFIC HELPER)
   // ======================================================
   async checkUnitPermission(userId, propertyId, operation) {
-    // Map operation to the correct parameter
     const operationMap = {
       'view': 'view',
       'create': 'create',
@@ -204,7 +208,7 @@ class PermissionService {
       'delete': 'delete',
       'updateStatus': 'updateStatus'
     };
-    
+
     const mappedOperation = operationMap[operation] || operation;
     return this.checkPermission(userId, 'unit', mappedOperation, propertyId);
   }
@@ -245,6 +249,39 @@ class PermissionService {
   }
 
   // ======================================================
+  // NEW: DOWNLOAD-REPORT PERMISSION CHECK
+  // ------------------------------------------------------
+  // Centralised gate for the "download financial report as PDF"
+  // family of operations (payment report, bill report, comprehensive
+  // report). ADMIN bypasses; MANAGER is scoped to owned properties;
+  // everyone else needs the specific permission code, optionally
+  // scoped to the property.
+  //
+  // operation ∈ { 'downloadReport', 'downloadBillReport',
+  //               'downloadComprehensiveReport' }
+  // ======================================================
+  async canDownloadReportForProperty(userId, userRole, propertyId, operation = 'downloadReport') {
+    if (userRole === 'ADMIN') return true;
+
+    if (userRole === 'MANAGER') {
+      if (!propertyId) return false;
+      const property = await prisma.property.findUnique({
+        where: { id: propertyId },
+        select: { managerId: true }
+      });
+      return property?.managerId === userId;
+    }
+
+    const permissionCode = this.getPermissionCode('paymentReport', operation);
+    if (!permissionCode) {
+      console.warn(`No download-report permission code for operation: ${operation}`);
+      return false;
+    }
+
+    return this.hasPermission(userId, permissionCode, propertyId);
+  }
+
+  // ======================================================
   // PROPERTY ACCESS CHECK (WITH CACHE)
   // ======================================================
   async checkPropertyAccess(userId, propertyId, requiredPermission = 'canView') {
@@ -265,7 +302,6 @@ class PermissionService {
     });
 
     if (property?.managerId === userId) {
-      // Manager owns this property - grant all access
       cacheService.set(cacheKey, { [requiredPermission]: true });
       return true;
     }
@@ -286,9 +322,8 @@ class PermissionService {
     });
 
     if (directAccess) {
-      // Check the specific permission based on requiredPermission
       let hasPermission = false;
-      switch(requiredPermission) {
+      switch (requiredPermission) {
         case 'canView':
           hasPermission = directAccess.canView === true;
           break;
@@ -304,7 +339,7 @@ class PermissionService {
         default:
           hasPermission = directAccess.canView === true;
       }
-      
+
       if (hasPermission) {
         cacheService.set(cacheKey, { [requiredPermission]: true });
         return true;
@@ -339,9 +374,8 @@ class PermissionService {
     });
 
     for (const assignment of roleAccess) {
-      // Map requiredPermission to permission code
       let permissionCode;
-      switch(requiredPermission) {
+      switch (requiredPermission) {
         case 'canView':
           permissionCode = 'VIEW_PROPERTIES';
           break;
@@ -357,7 +391,7 @@ class PermissionService {
         default:
           permissionCode = 'VIEW_PROPERTIES';
       }
-      
+
       const hasPermission = assignment.role.permissions.some(
         p => p.permission.code === permissionCode
       );
@@ -393,25 +427,21 @@ class PermissionService {
         where: { id: userId },
         select: { role: true }
       });
-      
-      // MANAGERs have all permissions on properties they own
+
       if (user?.role === 'MANAGER') {
-        // Check if this MANAGER owns the property
         const property = await prisma.property.findUnique({
           where: { id: propertyId },
           select: { managerId: true }
         });
-        
+
         if (property?.managerId === userId) {
-          // MANAGER owns this property - grant all permissions
           return true;
         }
       }
     }
-    
+
     const cacheKey = cacheService.getUserPermissionsKey(userId);
 
-    // Try cache
     let permissions = cacheService.get(cacheKey);
 
     if (!permissions) {
@@ -438,7 +468,6 @@ class PermissionService {
       }
     }
 
-    // Check if user has the permission
     if (permissions.includes(permissionCode)) {
       return true;
     }
@@ -457,28 +486,24 @@ class PermissionService {
   // ======================================================
   async getPropertyIdFromModel(modelName, recordId) {
     switch (modelName) {
-      // Direct property relationship
       case 'Property':
         return (await prisma.property.findUnique({
           where: { id: recordId },
           select: { id: true }
         }))?.id;
 
-      // Unit -> Property
       case 'Unit':
         return (await prisma.unit.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // Tenant -> Unit -> Property
       case 'Tenant':
         return (await prisma.tenant.findUnique({
           where: { id: recordId },
           include: { unit: { select: { propertyId: true } } }
         }))?.unit?.propertyId;
 
-      // Invoice -> Tenant -> Unit -> Property
       case 'Invoice':
         return (await prisma.invoice.findUnique({
           where: { id: recordId },
@@ -489,7 +514,6 @@ class PermissionService {
           }
         }))?.tenant?.unit?.propertyId;
 
-      // Bill -> Tenant -> Unit -> Property
       case 'Bill':
         return (await prisma.bill.findUnique({
           where: { id: recordId },
@@ -500,7 +524,6 @@ class PermissionService {
           }
         }))?.tenant?.unit?.propertyId;
 
-      // BillInvoice -> Tenant -> Unit -> Property
       case 'BillInvoice':
         return (await prisma.billInvoice.findUnique({
           where: { id: recordId },
@@ -511,56 +534,48 @@ class PermissionService {
           }
         }))?.tenant?.unit?.propertyId;
 
-      // DailyReport -> Property (direct)
       case 'DailyReport':
         return (await prisma.dailyReport.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // OfferLetter -> Property (direct)
       case 'OfferLetter':
         return (await prisma.offerLetter.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // DemandLetter -> Property (direct)
       case 'DemandLetter':
         return (await prisma.demandLetter.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // ActivationRequest -> Property (direct)
       case 'ActivationRequest':
         return (await prisma.activationRequest.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // Lead -> Property (direct)
       case 'Lead':
         return (await prisma.lead.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // ServiceProvider -> Property (direct)
       case 'ServiceProvider':
         return (await prisma.serviceProvider.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // ManagerCommission -> Property (direct)
       case 'ManagerCommission':
         return (await prisma.managerCommission.findUnique({
           where: { id: recordId },
           select: { propertyId: true }
         }))?.propertyId;
 
-      // CommissionInvoice -> ManagerCommission -> Property
       case 'CommissionInvoice':
         const commissionInvoice = await prisma.commissionInvoice.findUnique({
           where: { id: recordId },
@@ -572,7 +587,6 @@ class PermissionService {
         });
         return commissionInvoice?.commission?.propertyId;
 
-      // Income -> Property (direct, but optional)
       case 'Income':
         const income = await prisma.income.findUnique({
           where: { id: recordId },
@@ -580,7 +594,6 @@ class PermissionService {
         });
         return income?.propertyId || income?.tenant?.unit?.propertyId;
 
-      // PaymentReport -> Tenant -> Unit -> Property
       case 'PaymentReport':
         return (await prisma.paymentReport.findUnique({
           where: { id: recordId },
@@ -591,7 +604,6 @@ class PermissionService {
           }
         }))?.tenant?.unit?.propertyId;
 
-      // ToDo -> User -> (no direct property, but users have managed properties)
       case 'ToDo':
         return null;
 
@@ -607,9 +619,7 @@ class PermissionService {
   async canAccessRecord(userId, modelName, recordId, action = 'view') {
     const propertyId = await this.getPropertyIdFromModel(modelName, recordId);
 
-    // If no property ID found, check if it's a user-specific record
     if (!propertyId) {
-      // For records without property association (like ToDo)
       if (modelName === 'ToDo') {
         const todo = await prisma.toDo.findUnique({
           where: { id: recordId },
@@ -639,14 +649,14 @@ class PermissionService {
   // ======================================================
   async getPropertyIdsFromModels(records) {
     const propertyIds = new Map();
-    
+
     for (const { modelName, recordId } of records) {
       const propertyId = await this.getPropertyIdFromModel(modelName, recordId);
       if (propertyId) {
         propertyIds.set(recordId, propertyId);
       }
     }
-    
+
     return propertyIds;
   }
 
@@ -667,7 +677,6 @@ class PermissionService {
       return ids;
     }
 
-    // For MANAGERs, include properties they manage
     const managed = await prisma.property.findMany({
       where: { managerId: userId },
       select: { id: true }

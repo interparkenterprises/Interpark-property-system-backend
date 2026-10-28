@@ -37,7 +37,7 @@ router.use(protect);
 // Only accessible to MANAGER and ADMIN
 router.post(
   '/send-document',
-  authorize('MANAGER', 'ADMIN'),
+  authorize('MANAGER', 'ADMIN', 'USER'),
   sendDocument
 );
 
@@ -49,36 +49,36 @@ router.post(
   bulkSendDocuments
 );
 //send bill report
-router.post('/send-bill-report/:tenantId', authorize('MANAGER', 'ADMIN'), sendBillReport);
+router.post('/send-bill-report/:tenantId', authorize('MANAGER', 'ADMIN', 'USER'), sendBillReport);
 
 //send comprehensive report
-router.post('/send-comprehensive-report/:tenantId', authorize('MANAGER', 'ADMIN'), sendComprehensiveReport);
+router.post('/send-comprehensive-report/:tenantId', authorize('MANAGER', 'ADMIN', 'USER'), sendComprehensiveReport);
 
 
 //send all payment reports via whatsapp
 router.post(
   '/send-payment-reports/:tenantId',
-  authorize('MANAGER', 'ADMIN'),
+  authorize('MANAGER', 'ADMIN', 'USER'),
   sendAllPaymentReports
 );
 // Get document send status for a tenant
 // Accessible to MANAGER, ADMIN, and users with property access
 router.get(
   '/status/:tenantId',
-  authorize('MANAGER', 'ADMIN'),
+  authorize('MANAGER', 'ADMIN', 'USER'),
   getSendStatus
 );
 //download allpaayment reports
 router.get(
   '/payment-reports/:tenantId/download',
-  authorize('MANAGER', 'ADMIN'),
+  authorize('MANAGER', 'ADMIN', 'USER'),
   downloadAllPaymentReports
 );
 
-router.get('/bill-report/:tenantId/download', authorize('MANAGER', 'ADMIN'), downloadBillReport);
+router.get('/bill-report/:tenantId/download', authorize('MANAGER', 'ADMIN', 'USER'), downloadBillReport);
 
 
-router.get('/comprehensive-report/:tenantId/download', authorize('MANAGER', 'ADMIN'), downloadComprehensiveReport);
+router.get('/comprehensive-report/:tenantId/download', authorize('MANAGER', 'ADMIN', 'USER'), downloadComprehensiveReport);
 
 // Get communication logs
 // Only accessible to ADMIN and MANAGER
