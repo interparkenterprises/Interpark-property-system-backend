@@ -2,6 +2,11 @@ import prisma from "../lib/prisma.js";
 import permissionService from "../services/permissionService.js";
 import fs from 'fs';
 import path from 'path';
+import {
+  isTenantFrozenOn,
+  isTenantFrozenNow,
+  frozenMonthStartsBetween,
+} from '../services/tenantFreeze.js';
 //import { deleteDocument, fileExists, getFilePath } from '../utils/uploadHelper.js';
 
 import { 
@@ -113,8 +118,17 @@ const daysBetween = (from, to) => {
 };
 
 // Helper: build the lifecycle metadata block for a tenant
+// (extended with freeze-period info)
 const buildLifecycleMetadata = (tenant) => {
   const leftTimestamp = tenant.leftAt || (tenant.status === 'LEFT' ? tenant.updatedAt : null);
+
+  // ── Freeze state ──
+  const periods = tenant.freezePeriods || [];
+  const activePeriod = periods.find(
+    (p) => !p.endDate || new Date(p.endDate) >= new Date()
+  );
+  const isFrozen = isTenantFrozenNow(tenant);
+
   return {
     status: tenant.status,
     isActive: tenant.status === 'ACTIVE',
@@ -122,7 +136,21 @@ const buildLifecycleMetadata = (tenant) => {
     leftReason: tenant.leftReason || null,
     tenureDays: tenant.status === 'LEFT'
       ? daysBetween(tenant.createdAt, leftTimestamp)
-      : daysBetween(tenant.createdAt, new Date())
+      : daysBetween(tenant.createdAt, new Date()),
+
+    // ── Freeze metadata ──
+    isFrozen,
+    frozenAt: activePeriod?.startDate || null,
+    freezeReason: activePeriod?.reason || null,
+    freezeEndDate: activePeriod?.endDate || null,
+    freezePeriodsCount: periods.length,
+    frozenPeriods: periods.map((p) => ({
+      id: p.id,
+      startDate: p.startDate,
+      endDate: p.endDate,
+      reason: p.reason,
+      durationDays: daysBetween(p.startDate, p.endDate || new Date()),
+    })),
   };
 };
 
@@ -180,6 +208,7 @@ const markTenantAsLeft = (tx, tenantId, leftReason = null, leftAt = new Date()) 
       leftReason
     }
   });
+
 // @desc    Get all tenants (active tenants only - excludes LEFT tenants by default)
 // @route   GET /api/tenants
 // @access  Private
@@ -217,7 +246,8 @@ export const getTenants = async (req, res) => {
           },
           paymentReports: true,
           serviceCharge: true,
-          incomes: true
+          incomes: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
         },
         orderBy: { fullName: 'asc' }
       });
@@ -239,7 +269,8 @@ export const getTenants = async (req, res) => {
           },
           paymentReports: true,
           serviceCharge: true,
-          incomes: true
+          incomes: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
         },
         orderBy: { fullName: 'asc' }
       });
@@ -254,6 +285,7 @@ export const getTenants = async (req, res) => {
             totalCount: 0,
             activeTenantsCount: 0,
             leftTenantsCount: 0,
+            frozenTenantsCount: 0,
             showLeftTenants: false,
             filter: 'active tenants only'
           }
@@ -276,6 +308,7 @@ export const getTenants = async (req, res) => {
             totalCount: 0,
             activeTenantsCount: 0,
             leftTenantsCount: 0,
+            frozenTenantsCount: 0,
             showLeftTenants: false,
             filter: 'active tenants only'
           }
@@ -299,7 +332,8 @@ export const getTenants = async (req, res) => {
           },
           paymentReports: true,
           serviceCharge: true,
-          incomes: true
+          incomes: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
         },
         orderBy: { fullName: 'asc' }
       });
@@ -364,9 +398,10 @@ export const getTenants = async (req, res) => {
       countWhere = { unit: { property: { id: { in: allowed } } } };
     }
 
-    const [activeCount, leftCount] = await Promise.all([
+    const [activeCount, leftCount, frozenCount] = await Promise.all([
       prisma.tenant.count({ where: { ...countWhere, status: 'ACTIVE' } }),
-      prisma.tenant.count({ where: { ...countWhere, status: 'LEFT' } })
+      prisma.tenant.count({ where: { ...countWhere, status: 'LEFT' } }),
+      prisma.tenant.count({ where: { ...countWhere, status: 'ACTIVE', isFrozen: true } })
     ]);
 
     const response = {
@@ -375,6 +410,7 @@ export const getTenants = async (req, res) => {
         totalCount: enhancedTenants.length,
         activeTenantsCount: activeCount,
         leftTenantsCount: leftCount,
+        frozenTenantsCount: frozenCount,
         showLeftTenants: showLeftTenants,
         filter: status === 'LEFT'
           ? 'left tenants only'
@@ -429,7 +465,8 @@ export const getTenant = async (req, res) => {
         billInvoices: { orderBy: { createdAt: 'desc' } },
         bills: { orderBy: { createdAt: 'desc' } },
         demandLetters: { orderBy: { createdAt: 'desc' } },
-        attachments: { orderBy: { uploadedAt: 'desc' } }
+        attachments: { orderBy: { uploadedAt: 'desc' } },
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       }
     });
 
@@ -463,7 +500,12 @@ export const getTenant = async (req, res) => {
         isActive: fullTenant.status === 'ACTIVE',
         leftAt: lifecycle.leftAt,
         leftReason: lifecycle.leftReason,
-        tenureDays: lifecycle.tenureDays
+        tenureDays: lifecycle.tenureDays,
+        // Freeze info
+        isFrozen: lifecycle.isFrozen,
+        frozenAt: lifecycle.frozenAt,
+        freezeReason: lifecycle.freezeReason,
+        freezeEndDate: lifecycle.freezeEndDate
       },
       lifecycle
     };
@@ -471,6 +513,13 @@ export const getTenant = async (req, res) => {
     // If tenant has left, show a warning
     if (fullTenant.status === 'LEFT') {
       response.warning = 'This tenant has left the property. All records are preserved for historical purposes.';
+    }
+
+    // If tenant is frozen, show a warning
+    if (lifecycle.isFrozen) {
+      response.freezeWarning = `Rent accrual is paused for this tenant${
+        lifecycle.frozenAt ? ` since ${new Date(lifecycle.frozenAt).toISOString().split('T')[0]}` : ''
+      }${lifecycle.freezeEndDate ? ` until ${new Date(lifecycle.freezeEndDate).toISOString().split('T')[0]}` : ''}.`;
     }
 
     res.json(response);
@@ -545,7 +594,8 @@ export const getTenantsByProperty = async (req, res) => {
         incomes: {
           orderBy: { createdAt: 'desc' },
           take: 5
-        }
+        },
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       },
       orderBy: { fullName: 'asc' }
     });
@@ -593,9 +643,10 @@ export const getTenantsByProperty = async (req, res) => {
     });
 
     // Compute counts for this property
-    const [activeCount, leftCount] = await Promise.all([
+    const [activeCount, leftCount, frozenCount] = await Promise.all([
       prisma.tenant.count({ where: { unit: { propertyId }, status: 'ACTIVE' } }),
-      prisma.tenant.count({ where: { unit: { propertyId }, status: 'LEFT' } })
+      prisma.tenant.count({ where: { unit: { propertyId }, status: 'LEFT' } }),
+      prisma.tenant.count({ where: { unit: { propertyId }, status: 'ACTIVE', isFrozen: true } })
     ]);
 
     const response = {
@@ -604,6 +655,7 @@ export const getTenantsByProperty = async (req, res) => {
         totalCount: enhancedTenants.length,
         activeTenantsCount: activeCount,
         leftTenantsCount: leftCount,
+        frozenTenantsCount: frozenCount,
         showLeftTenants: status === 'ALL' || includeLeft === 'true',
         filter: status === 'LEFT'
           ? 'left tenants only'
@@ -772,7 +824,8 @@ export const getOverdueTenants = async (req, res) => {
           serviceCharge: true,
           incomes: {
             orderBy: { createdAt: 'desc' }
-          }
+          },
+          freezePeriods: { orderBy: { startDate: 'desc' } },
         },
         orderBy: { fullName: 'asc' }
       });
@@ -789,6 +842,15 @@ export const getOverdueTenants = async (req, res) => {
         const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
         
         if (balance <= 0.01) {
+          continue;
+        }
+
+        // Skip invoices billed inside a freeze window — these are paused,
+        // not overdue.
+        if (
+          invoice.paymentPeriod &&
+          isTenantFrozenOn(tenant, new Date(invoice.paymentPeriod))
+        ) {
           continue;
         }
         
@@ -818,6 +880,13 @@ export const getOverdueTenants = async (req, res) => {
         const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
         
         if (balance <= 0.01) {
+          continue;
+        }
+
+        if (
+          invoice.paymentPeriod &&
+          isTenantFrozenOn(tenant, new Date(invoice.paymentPeriod))
+        ) {
           continue;
         }
         
@@ -929,6 +998,11 @@ export const getOverdueTenants = async (req, res) => {
         };
       })
       .filter(tenant => {
+        // ── Exclude frozen tenants from overdue lists ──
+        if (tenant.lifecycle?.isFrozen) {
+          return false;
+        }
+
         const invoices = tenant.invoices || [];
         
         const hasOutstandingInvoices = invoices.some(inv => {
@@ -1091,7 +1165,8 @@ export const getNextPaymentsByProperty = async (req, res) => {
                         status: { in: ['UNPAID', 'PARTIAL'] }
                     },
                     orderBy: { dueDate: 'asc' }
-                }
+                },
+                freezePeriods: { orderBy: { startDate: 'desc' } },
             },
             orderBy: { fullName: 'asc' }
         });
@@ -1138,11 +1213,14 @@ export const getNextPaymentsByProperty = async (req, res) => {
 
             const hasOutstandingBalance = outstandingBalance > 0.01;
 
+            // ── Freeze flag ──
+            const frozen = isTenantFrozenOn(tenant, now);
+
             let isTrulyOverdue = false;
             let overdueSinceDate = null;
             let daysOverdue = 0;
 
-            if (hasOutstandingBalance) {
+            if (hasOutstandingBalance && !frozen) {
                 const hasUnpaidInvoices = tenant.invoices && tenant.invoices.some(inv => {
                     const balance = inv.balance || (inv.totalDue - inv.amountPaid);
                     const isUnpaid = inv.status === 'UNPAID' || inv.status === 'OVERDUE';
@@ -1227,7 +1305,7 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     dueDateFormatted = futureDue.toLocaleDateString();
                 }
 
-                if (gracePeriodEnd && hasOutstandingBalance) {
+                if (gracePeriodEnd && hasOutstandingBalance && !frozen) {
                     try {
                         const graceEndInNairobi = new Date(gracePeriodEnd.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
                         const graceEndStart = new Date(graceEndInNairobi);
@@ -1323,7 +1401,9 @@ export const getNextPaymentsByProperty = async (req, res) => {
 
             let statusDisplay = status;
 
-            if (outstandingBalance > 0 && isTrulyOverdue) {
+            if (frozen) {
+                statusDisplay = 'FROZEN';
+            } else if (outstandingBalance > 0 && isTrulyOverdue) {
                 statusDisplay = 'OVERDUE';
             } else if (isInGracePeriod && hasOutstandingBalance) {
                 statusDisplay = 'IN_GRACE_PERIOD';
@@ -1353,6 +1433,7 @@ export const getNextPaymentsByProperty = async (req, res) => {
                     daysUntilDue: daysUntilDue,
                     isOverdue: isTrulyOverdue,
                     isInGracePeriod: isInGracePeriod && hasOutstandingBalance,
+                    isFrozen: frozen,
                     daysUntilGraceEnd: hasOutstandingBalance ? daysUntilGraceEnd : null,
                     gracePeriodEnd: hasOutstandingBalance ? gracePeriodEndFormatted : null,
                     amount: {
@@ -1406,6 +1487,7 @@ export const getNextPaymentsByProperty = async (req, res) => {
             inGracePeriod: tenantsWithNextPayment.filter(t => t.payment.isInGracePeriod).length,
             dueToday: tenantsWithNextPayment.filter(t => t.payment.daysUntilDue === 0).length,
             upcoming: tenantsWithNextPayment.filter(t => !t.payment.isOverdue && t.payment.daysUntilDue > 0).length,
+            frozen: tenantsWithNextPayment.filter(t => t.payment.isFrozen).length,
             amounts: {
                 outstanding: tenantsWithNextPayment.reduce((sum, t) =>
                     sum + (t.payment.isOverdue ? t.payment.amount.total : 0), 0),
@@ -1652,6 +1734,8 @@ export const createTenant = async (req, res) => {
       status: 'ACTIVE',
       leftAt: null,
       leftReason: null,
+      // Freeze: new tenants start unfrozen
+      isFrozen: false,
     };
 
     // Create tenant
@@ -1660,6 +1744,7 @@ export const createTenant = async (req, res) => {
       include: {
         unit: { include: { property: true } },
         serviceCharge: true,
+        freezePeriods: true,
       },
     });
 
@@ -1729,6 +1814,7 @@ export const createTenant = async (req, res) => {
         include: {
           unit: { include: { property: true } },
           serviceCharge: true,
+          freezePeriods: true,
         },
       })
     );
@@ -2105,6 +2191,7 @@ export const updateTenant = async (req, res) => {
           include: {
             unit: { include: { property: true } },
             serviceCharge: true,
+            freezePeriods: { orderBy: { startDate: 'desc' } },
           },
         });
 
@@ -2124,6 +2211,7 @@ export const updateTenant = async (req, res) => {
         include: {
           unit: { include: { property: true } },
           serviceCharge: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
         },
       });
 
@@ -2250,6 +2338,7 @@ export const updateTenant = async (req, res) => {
       include: {
         unit: { include: { property: true } },
         serviceCharge: true,
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       },
     });
 
@@ -2318,7 +2407,8 @@ export const deleteTenant = async (req, res) => {
         bills: true,
         demandLetters: true,
         attachments: true,
-        incomes: true
+        incomes: true,
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       }
     });
 
@@ -2335,6 +2425,26 @@ export const deleteTenant = async (req, res) => {
           leftAt: tenant.leftAt || tenant.updatedAt,
           leftReason: tenant.leftReason
         }
+      });
+    }
+
+    // ── Freeze guard: cannot mark a frozen tenant as LEFT ──
+    if (isTenantFrozenNow(tenant)) {
+      const activePeriod = (tenant.freezePeriods || []).find(
+        (p) => !p.endDate || new Date(p.endDate) >= new Date()
+      );
+      return res.status(400).json({
+        message:
+          'Cannot mark a frozen tenant as LEFT. Unfreeze the tenant first to close the freeze window, then proceed.',
+        isFrozen: true,
+        activeFreeze: activePeriod
+          ? {
+              id: activePeriod.id,
+              startDate: activePeriod.startDate,
+              endDate: activePeriod.endDate,
+              reason: activePeriod.reason,
+            }
+          : null,
       });
     }
 
@@ -2668,7 +2778,8 @@ export const getTenantFinancials = async (req, res) => {
         },
         invoices: {
           orderBy: { createdAt: 'desc' }
-        }
+        },
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       }
     });
 
@@ -3130,7 +3241,8 @@ export const restoreTenant = async (req, res) => {
     const tenant = await prisma.tenant.findUnique({
       where: { id: req.params.id },
       include: {
-        unit: { include: { property: true } }
+        unit: { include: { property: true } },
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       }
     });
 
@@ -3261,7 +3373,8 @@ export const restoreTenant = async (req, res) => {
         },
         include: {
           unit: { include: { property: true } },
-          serviceCharge: true
+          serviceCharge: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
         }
       });
 
@@ -3373,7 +3486,8 @@ export const getLeftTenants = async (req, res) => {
           }
         },
         serviceCharge: true,
-        incomes: true
+        incomes: true,
+        freezePeriods: { orderBy: { startDate: 'desc' } },
       },
       orderBy
     });
@@ -3461,6 +3575,7 @@ export const getTenantStats = async (req, res) => {
         return res.json({
           active: 0,
           left: 0,
+          frozen: 0,
           total: 0,
           byReason: {}
         });
@@ -3478,6 +3593,7 @@ export const getTenantStats = async (req, res) => {
         return res.json({
           active: 0,
           left: 0,
+          frozen: 0,
           total: 0,
           byReason: {}
         });
@@ -3492,12 +3608,15 @@ export const getTenantStats = async (req, res) => {
       };
     }
 
-    const [activeCount, leftCount, leftByReasonRaw] = await Promise.all([
+    const [activeCount, leftCount, frozenCount, leftByReasonRaw] = await Promise.all([
       prisma.tenant.count({
         where: { ...whereClause, status: 'ACTIVE' }
       }),
       prisma.tenant.count({
         where: { ...whereClause, status: 'LEFT' }
+      }),
+      prisma.tenant.count({
+        where: { ...whereClause, status: 'ACTIVE', isFrozen: true }
       }),
       prisma.tenant.groupBy({
         by: ['leftReason'],
@@ -3514,11 +3633,379 @@ export const getTenantStats = async (req, res) => {
     res.json({
       active: activeCount,
       left: leftCount,
+      frozen: frozenCount,
       total: activeCount + leftCount,
       byReason
     });
   } catch (error) {
     console.error('Get tenant stats error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// ======================================================
+// FREEZE / UNFREEZE
+// ======================================================
+
+// @desc    Freeze a tenant (stops rent accrual from effective date)
+// @route   PATCH /api/tenants/:id/freeze
+// @access  Private (ADMIN, MANAGER)
+export const freezeTenant = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
+      return res.status(403).json({
+        message: 'Only ADMIN or MANAGER can freeze tenants.',
+      });
+    }
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: req.params.id },
+      include: {
+        unit: { include: { property: true } },
+        freezePeriods: { orderBy: { startDate: 'desc' } },
+      },
+    });
+
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
+    }
+    if (tenant.status === 'LEFT') {
+      return res.status(400).json({ message: 'Cannot freeze a tenant who has left.' });
+    }
+    if (isTenantFrozenNow(tenant)) {
+      return res.status(400).json({
+        message: 'Tenant is already frozen.',
+        currentFreeze: tenant.freezePeriods.find(
+          (p) => !p.endDate || new Date(p.endDate) >= new Date()
+        ),
+      });
+    }
+
+    // Permission: MANAGER must own the property
+    if (userRole === 'MANAGER') {
+      const property = await prisma.property.findFirst({
+        where: { id: tenant.unit.propertyId, managerId: userId },
+      });
+      if (!property) {
+        return res.status(403).json({
+          message: 'You do not have permission to freeze tenants for this property.',
+        });
+      }
+    }
+
+    const { freezeStartDate, freezeEndDate, reason } = req.body || {};
+
+    const start = freezeStartDate ? new Date(freezeStartDate) : new Date();
+    if (isNaN(start.getTime())) {
+      return res.status(400).json({ message: 'Invalid freezeStartDate.' });
+    }
+
+    let end = null;
+    if (freezeEndDate) {
+      end = new Date(freezeEndDate);
+      if (isNaN(end.getTime())) {
+        return res.status(400).json({ message: 'Invalid freezeEndDate.' });
+      }
+      if (end <= start) {
+        return res.status(400).json({
+          message: 'freezeEndDate must be after freezeStartDate.',
+        });
+      }
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const period = await tx.tenantFreezePeriod.create({
+        data: {
+          tenantId: tenant.id,
+          startDate: start,
+          endDate: end,
+          reason: reason || null,
+          frozenById: userId,
+        },
+      });
+
+      const updated = await tx.tenant.update({
+        where: { id: tenant.id },
+        data: { isFrozen: true },
+        include: {
+          unit: { include: { property: true } },
+          serviceCharge: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
+        },
+      });
+
+      return { period, tenant: updated };
+    });
+
+    res.json({
+      success: true,
+      message: `Tenant '${result.tenant.fullName}' frozen from ${start.toISOString().split('T')[0]}${
+        end ? ` until ${end.toISOString().split('T')[0]}` : ' (open-ended)'
+      }. Rent accrual paused.`,
+      data: {
+        tenant: result.tenant,
+        freezePeriod: result.period,
+        lifecycle: buildLifecycleMetadata(result.tenant),
+      },
+    });
+  } catch (error) {
+    console.error('Freeze tenant error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    Unfreeze a tenant (resumes rent accrual)
+// @route   PATCH /api/tenants/:id/unfreeze
+// @access  Private (ADMIN, MANAGER)
+export const unfreezeTenant = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
+      return res.status(403).json({
+        message: 'Only ADMIN or MANAGER can unfreeze tenants.',
+      });
+    }
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: req.params.id },
+      include: {
+        unit: { include: { property: true } },
+        freezePeriods: { orderBy: { startDate: 'desc' } },
+      },
+    });
+
+    if (!tenant) {
+      return res.status(404).json({ message: 'Tenant not found' });
+    }
+    if (!isTenantFrozenNow(tenant)) {
+      return res.status(400).json({ message: 'Tenant is not currently frozen.' });
+    }
+
+    if (userRole === 'MANAGER') {
+      const property = await prisma.property.findFirst({
+        where: { id: tenant.unit.propertyId, managerId: userId },
+      });
+      if (!property) {
+        return res.status(403).json({
+          message: 'You do not have permission to unfreeze tenants for this property.',
+        });
+      }
+    }
+
+    const { unfreezeDate, reason } = req.body || {};
+    const effectiveEnd = unfreezeDate ? new Date(unfreezeDate) : new Date();
+    if (isNaN(effectiveEnd.getTime())) {
+      return res.status(400).json({ message: 'Invalid unfreezeDate.' });
+    }
+
+    // Find the open freeze period (endDate == null OR endDate >= today)
+    const activePeriod = tenant.freezePeriods.find(
+      (p) => !p.endDate || new Date(p.endDate) >= new Date()
+    );
+
+    if (!activePeriod) {
+      return res.status(400).json({ message: 'No active freeze period found.' });
+    }
+
+    if (effectiveEnd < new Date(activePeriod.startDate)) {
+      return res.status(400).json({
+        message: 'unfreezeDate cannot be before freezeStartDate.',
+      });
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const closed = await tx.tenantFreezePeriod.update({
+        where: { id: activePeriod.id },
+        data: {
+          endDate: effectiveEnd,
+          unfrozenById: userId,
+          reason: reason
+            ? `${activePeriod.reason || ''} | Unfrozen: ${reason}`.trim()
+            : activePeriod.reason,
+        },
+      });
+
+      // Any other still-open periods? (defensive)
+      const stillOpen = await tx.tenantFreezePeriod.count({
+        where: {
+          tenantId: tenant.id,
+          id: { not: activePeriod.id },
+          OR: [{ endDate: null }, { endDate: { gte: new Date() } }],
+        },
+      });
+
+      const updated = await tx.tenant.update({
+        where: { id: tenant.id },
+        data: { isFrozen: stillOpen > 0 },
+        include: {
+          unit: { include: { property: true } },
+          serviceCharge: true,
+          freezePeriods: { orderBy: { startDate: 'desc' } },
+        },
+      });
+
+      return { closed, tenant: updated, stillOpen };
+    });
+
+    res.json({
+      success: true,
+      message: `Tenant '${result.tenant.fullName}' unfrozen effective ${effectiveEnd
+        .toISOString()
+        .split('T')[0]}. Rent accrual resumes.`,
+      data: {
+        tenant: result.tenant,
+        closedFreezePeriod: result.closed,
+        lifecycle: buildLifecycleMetadata(result.tenant),
+      },
+    });
+  } catch (error) {
+    console.error('Unfreeze tenant error:', error);
+    res.status(400).json({ message: error.message });
+  }
+};
+
+// @desc    List a tenant's freeze history + arrears impact
+// @route   GET /api/tenants/:id/freeze-history
+// @access  Private (ADMIN, MANAGER, USER with VIEW_TENANTS)
+export const getTenantFreezeHistory = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    const { hasAccess, tenant } = await checkUserTenantAccess(
+      userId,
+      userRole,
+      req.params.id,
+      'view'
+    );
+    if (!hasAccess || !tenant) {
+      return res.status(403).json({ message: 'Access denied to this tenant.' });
+    }
+
+    const full = await prisma.tenant.findUnique({
+      where: { id: req.params.id },
+      include: {
+        unit: { include: { property: true } },
+        freezePeriods: {
+          orderBy: { startDate: 'desc' },
+          include: {
+            frozenBy: { select: { id: true, name: true, email: true } },
+            unfrozenBy: { select: { id: true, name: true, email: true } },
+          },
+        },
+        invoices: {
+          orderBy: { dueDate: 'asc' },
+          select: {
+            id: true,
+            invoiceNumber: true,
+            paymentPeriod: true,
+            totalDue: true,
+            amountPaid: true,
+            balance: true,
+            status: true,
+            dueDate: true,
+          },
+        },
+        paymentReports: {
+          orderBy: { datePaid: 'desc' },
+          select: {
+            id: true,
+            amountPaid: true,
+            totalDue: true,
+            arrears: true,
+            status: true,
+            paymentPeriod: true,
+            datePaid: true,
+          },
+        },
+      },
+    });
+
+    // ─── Arrears impact per freeze window ───
+    // For each freeze period, compute:
+    //   - frozenMonths          how many billing months were paused
+    //   - arrearsAtFreezeStart  sum of invoice balances with dueDate <= startDate
+    //   - arrearsAtFreezeEnd    sum of invoice balances with dueDate <= endDate
+    //   - collectedDuringFreeze amount of paymentReports whose paymentPeriod
+    //                           falls INSIDE the freeze window
+    const freezeSummaries = full.freezePeriods.map((period) => {
+      const start = new Date(period.startDate);
+      const end = period.endDate ? new Date(period.endDate) : new Date();
+
+      const frozenMonthStarts = frozenMonthStartsBetween(period, start, end);
+
+      const arrearsAtStart = full.invoices
+        .filter((inv) => inv.dueDate && new Date(inv.dueDate) <= start)
+        .reduce(
+          (sum, inv) => sum + Math.max(0, Number(inv.balance) || 0),
+          0
+        );
+
+      const arrearsAtEnd = full.invoices
+        .filter((inv) => inv.dueDate && new Date(inv.dueDate) <= end)
+        .reduce(
+          (sum, inv) => sum + Math.max(0, Number(inv.balance) || 0),
+          0
+        );
+
+      const collectedDuringFreeze = full.paymentReports
+        .filter((r) => {
+          if (r.status === 'CREDIT' || r.status === 'PREPAID') return false;
+          const pd = new Date(r.paymentPeriod);
+          return pd >= start && pd <= end;
+        })
+        .reduce((sum, r) => sum + (Number(r.amountPaid) || 0), 0);
+
+      const isOpen = !period.endDate;
+      return {
+        id: period.id,
+        startDate: period.startDate,
+        endDate: period.endDate,
+        isOpen,
+        reason: period.reason,
+        frozenBy: period.frozenBy,
+        unfrozenBy: period.unfrozenBy,
+        durationDays: Math.max(
+          0,
+          Math.floor((end - start) / (1000 * 60 * 60 * 24))
+        ),
+        frozenMonthsCount: frozenMonthStarts.length,
+        frozenMonths: frozenMonthStarts.map((d) =>
+          d.toISOString().slice(0, 7)
+        ),
+        arrearsAtStart: parseFloat(arrearsAtStart.toFixed(2)),
+        arrearsAtEnd: parseFloat(arrearsAtEnd.toFixed(2)),
+        collectedDuringFreeze: parseFloat(collectedDuringFreeze.toFixed(2)),
+        arrearsDelta: parseFloat((arrearsAtEnd - arrearsAtStart).toFixed(2)),
+      };
+    });
+
+    const currentArrears = full.invoices.reduce(
+      (sum, inv) => sum + Math.max(0, Number(inv.balance) || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      data: {
+        tenant: {
+          id: full.id,
+          fullName: full.fullName,
+          status: full.status,
+          isFrozen: isTenantFrozenNow(full),
+        },
+        currentArrears: parseFloat(currentArrears.toFixed(2)),
+        freezeSummaries,
+        lifecycle: buildLifecycleMetadata(full),
+      },
+    });
+  } catch (error) {
+    console.error('Get tenant freeze history error:', error);
     res.status(400).json({ message: error.message });
   }
 };

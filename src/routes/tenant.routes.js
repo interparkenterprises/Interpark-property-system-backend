@@ -26,7 +26,10 @@ import {
   previewAttachment,
   updateAttachment,
   deleteAttachment,
-  downloadAttachment
+  downloadAttachment,
+  freezeTenant,
+  unfreezeTenant,
+  getTenantFreezeHistory,
 } from '../controllers/tenant.controller.js';
 import { protect } from '../middleware/authMiddleware.js';
 import { authorize } from '../middleware/roleMiddleware.js';
@@ -143,5 +146,17 @@ router.route('/attachments/:attachmentId/download')
 router.route('/attachments/:attachmentId')
   .put(authorize('ADMIN'), updateAttachment)
   .delete(authorize('ADMIN'), deleteAttachment);
+
+// Freeze a tenant (Admin only)
+router.route('/:id/freeze')
+  .patch(authorize('ADMIN', 'MANAGER'), freezeTenant);
+
+// Unfreeze a tenant (Admin only)
+router.route('/:id/unfreeze')
+  .patch(authorize('ADMIN', 'MANAGER'), unfreezeTenant);
+
+// Get tenant freeze history (Admin only)
+router.route('/:id/freeze-history')
+  .get(authorize('ADMIN', 'MANAGER'), getTenantFreezeHistory);
 
 export default router;

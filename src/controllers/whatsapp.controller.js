@@ -1,5 +1,3 @@
-// ES Modules version with formatcontactForWhatsApp
-
 import {
   sendDocumentViaWhatsApp,
   downloadAllPaymentReportsBuffer,

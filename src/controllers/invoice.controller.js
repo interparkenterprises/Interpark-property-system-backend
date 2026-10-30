@@ -16,6 +16,7 @@ import {
 import permissionService from "../services/permissionService.js";
 import { buildInvoiceHtml, buildInvoiceFooterTemplate } from '../services/pdf/invoicePdf.js';
 import { generatePDF } from '../utils/pdfGenerator.js';
+import { isTenantFrozenOn } from '../services/tenantFreeze.js';
 
 // Create __dirname equivalent for ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -197,13 +198,13 @@ function alignBillingDateToCycle(billingDate, tenant) {
  *   - Rent VAT is applied with the TENANT's vatType/vatRate.
  *   - Service charge VAT is applied with the SERVICE CHARGE's own
  *     vatType/vatRate (independent of the tenant's).
- *   - Withholding tax (if configured on the tenant) is deducted so
- *     invoice.totalDue matches what payment reports record.
+ *   - NO withholding tax is applied anywhere. Invoices always show the
+ *     FULL gross amount payable (subtotal + VAT). Any withholding tax
+ *     configuration on the tenant is deliberately ignored.
  *
  * Returns the breakdown the PDF builder needs:
  *   { paymentPolicy, monthlyRent, monthlyServiceCharge,
- *     rent, serviceCharge, vat, subtotal, totalDue,
- *     totalDueWithoutWithholding, totalWithheld }
+ *     rent, serviceCharge, vat, subtotal, totalDue }
  */
 function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
   const paymentPolicy = normalizePaymentPolicy(tenant.paymentPolicy);
@@ -216,7 +217,11 @@ function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
   //   - rent × policy months
   //   - service charge × policy months (with its own VAT)
   //   - VAT on rent per the tenant's vatType/vatRate
-  //   - withholding tax deductions
+  //
+  // NOTE: this pipeline can also compute a withholding-tax deduction when
+  // the tenant has one configured, but that output is intentionally
+  // IGNORED — it is never read below, so `totalDue` is always the full
+  // amount with nothing withheld.
   const breakdown = calculateTotalPaymentWithWithholding(
     tenant,
     monthlyRent,
@@ -250,17 +255,10 @@ function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
   );
   const subtotal = roundMoney(rent + serviceChargeExclusiveOfVat);
 
-  // Withholding tax (if the tenant has any configured)
-  const totalWithheld = roundMoney(
-    breakdown.withholdingTax?.totalWithheld || 0
-  );
-  const totalDueWithoutWithholding = roundMoney(
-    breakdown.total?.paymentByPolicy || (subtotal + vat)
-  );
-
-  // Net payable = what actually goes on the invoice as `totalDue`.
+  // FULL amount payable = gross total before any withholding. Withholding
+  // tax is never deducted from invoices.
   const totalDue = roundMoney(
-    breakdown.withholdingTax?.netPayable || totalDueWithoutWithholding
+    breakdown.total?.paymentByPolicy || (subtotal + vat)
   );
 
   return {
@@ -271,9 +269,7 @@ function calculateInvoiceAmountsFromTenant(tenant, billingDate = new Date()) {
     serviceCharge,          // inclusive of its own VAT
     vat,
     subtotal,               // rent + serviceChargeExclusiveOfVat
-    totalDue,
-    totalDueWithoutWithholding,
-    totalWithheld
+    totalDue
   };
 }
 
@@ -297,6 +293,54 @@ async function deleteFromStorage(fileUrl) {
   }
 }
 
+/**
+ * Parse an explicit `paymentPeriod` label (as stored on Invoice) into a Date
+ * representing the START of that period. Returns null if unparseable.
+ *
+ * Handles the same shapes buildPaymentPeriodLabel emits:
+ *   - "May 2026"                       → 2026-05-01 UTC
+ *   - "May 2026 - July 2026"           → 2026-05-01 UTC
+ *   - "May 1, 2026 - July 31, 2026"    → 2026-05-01 UTC
+ *   - ISO strings                      → parsed directly
+ */
+function parseExplicitPeriodDate(period) {
+  if (!period) return null;
+  if (period instanceof Date && !isNaN(period.getTime())) return period;
+
+  const monthNames = [
+    'january','february','march','april','may','june',
+    'july','august','september','october','november','december'
+  ];
+
+  const str = String(period).trim();
+
+  // "Month YYYY" or "Month YYYY - Month YYYY"
+  const monthYear = str.match(/^([A-Za-z]+)\s+(\d{4})/);
+  if (monthYear) {
+    const idx = monthNames.indexOf(monthYear[1].toLowerCase());
+    if (idx >= 0) {
+      return new Date(Date.UTC(parseInt(monthYear[2], 10), idx, 1));
+    }
+  }
+
+  // "Mon D, YYYY" or "Mon D, YYYY - Mon D, YYYY"
+  const withDay = str.match(/^([A-Za-z]+)\s+\d{1,2},\s+(\d{4})/);
+  if (withDay) {
+    const idx = monthNames.indexOf(withDay[1].toLowerCase());
+    if (idx >= 0) {
+      return new Date(Date.UTC(parseInt(withDay[2], 10), idx, 1));
+    }
+  }
+
+  // Fallback: ISO / native parser
+  const iso = new Date(str);
+  if (!isNaN(iso.getTime())) {
+    return new Date(Date.UTC(iso.getUTCFullYear(), iso.getUTCMonth(), 1));
+  }
+
+  return null;
+}
+
 // @desc    Generate invoice for tenant
 // @route   POST /api/invoices/generate
 // @access  Private (requires CREATE_INVOICES permission)
@@ -314,7 +358,8 @@ export const generateInvoice = async (req, res) => {
             property: true
           }
         },
-        serviceCharge: true
+        serviceCharge: true,
+        freezePeriods: true,       // ── NEW: needed for freeze guard ──
       }
     });
 
@@ -367,19 +412,44 @@ export const generateInvoice = async (req, res) => {
     // so an invoice generated mid-cycle still points at the correct period.
     const billingDate = alignBillingDateToCycle(requestedBillingDate, tenant);
 
+    // ── FREEZE GUARD ──
+    // Block invoice generation for a billing period that falls inside
+    // an active (or historical) freeze window. We check the ALIGNED
+    // billing date so a quarterly tenant mid-cycle still gets blocked
+    // when the quarter's start falls inside a freeze.
+    if (isTenantFrozenOn(tenant, billingDate)) {
+      const activePeriod = (tenant.freezePeriods || []).find(
+        (p) => {
+          const start = new Date(p.startDate);
+          const end = p.endDate ? new Date(p.endDate) : null;
+          return billingDate >= start && (!end || billingDate <= end);
+        }
+      );
+      return res.status(409).json({
+        success: false,
+        code: 'TENANT_FROZEN',
+        message:
+          'Tenant is frozen for the requested billing period. No new rent accrues for frozen periods. Unfreeze first or choose a billingStartDate outside the freeze window.',
+        billingDate: billingDate.toISOString(),
+        freezeWindow: activePeriod
+          ? {
+              id: activePeriod.id,
+              startDate: activePeriod.startDate,
+              endDate: activePeriod.endDate,
+              reason: activePeriod.reason,
+            }
+          : null,
+      });
+    }
+
     const calculated = calculateInvoiceAmountsFromTenant(tenant, billingDate);
     const amountPaid = roundMoney(paymentReport?.amountPaid || 0);
     const balance = roundMoney(calculated.totalDue - amountPaid);
     const invoiceNumber = await generateInvoiceNumber();
     const paymentPeriod = buildPaymentPeriodLabel(billingDate, paymentPolicy);
 
-    // Append withholding info to notes for auditability, if applicable.
-    const withholdingNote = calculated.totalWithheld > 0
-      ? `Withholding tax withheld: ${calculated.totalWithheld.toFixed(2)}. `
-        + `Amount before withholding: ${calculated.totalDueWithoutWithholding.toFixed(2)}.`
-      : null;
-
-    const effectiveNotes = [notes, withholdingNote].filter(Boolean).join(' ') || null;
+    // Withholding tax is not used on invoices — store the caller's notes as-is.
+    const effectiveNotes = notes || null;
 
     const invoice = await prisma.invoice.create({
       data: {
@@ -439,7 +509,6 @@ export const generateInvoice = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
-
 // @desc    Get all invoices for a tenant
 // @route   GET /api/invoices/tenant/:tenantId
 // @access  Private (requires VIEW_INVOICES permission)
@@ -1117,7 +1186,8 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
                 property: true
               }
             },
-            serviceCharge: true
+            serviceCharge: true,
+            freezePeriods: true,   // ── NEW: needed for freeze guard ──
           }
         },
         invoices: true
@@ -1197,6 +1267,37 @@ export const generateInvoiceFromPartialPayment = async (req, res) => {
     } else {
       // Fallback to current month if no payment period
       paymentPeriod = buildPaymentPeriodLabel(new Date(), tenant.paymentPolicy || 'MONTHLY');
+    }
+
+    // ── FREEZE GUARD ──
+    // A "balance invoice" is essentially re-billing the remainder of an
+    // existing period. If that period overlaps a freeze, the tenant is
+    // not on the hook for it — refuse rather than silently mis-bill.
+    const effectivePeriodForGuard = paymentReport.paymentPeriod
+      ? new Date(paymentReport.paymentPeriod)
+      : new Date();
+
+    if (isTenantFrozenOn(tenant, effectivePeriodForGuard)) {
+      const activePeriod = (tenant.freezePeriods || []).find((p) => {
+        const start = new Date(p.startDate);
+        const end = p.endDate ? new Date(p.endDate) : null;
+        return effectivePeriodForGuard >= start && (!end || effectivePeriodForGuard <= end);
+      });
+      return res.status(409).json({
+        success: false,
+        code: 'TENANT_FROZEN',
+        message:
+          'Cannot generate a balance invoice for a frozen period. The tenant is not accruing rent for this period. Unfreeze first or bill a period outside the freeze window.',
+        paymentPeriod: paymentReport.paymentPeriod,
+        freezeWindow: activePeriod
+          ? {
+              id: activePeriod.id,
+              startDate: activePeriod.startDate,
+              endDate: activePeriod.endDate,
+              reason: activePeriod.reason,
+            }
+          : null,
+      });
     }
 
     // Create invoice record for the balance with paymentPolicy
@@ -1396,9 +1497,9 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
     const {
       paymentPolicy,
       billingStartDate,
-      paymentPeriod: explicitPeriod,   // NEW: allow direct period label override
-      dueDate: explicitDueDate,        // NEW: allow direct dueDate override
-      issueDate: explicitIssueDate     // NEW (optional): allow issueDate override
+      paymentPeriod: explicitPeriod,   // allow direct period label override
+      dueDate: explicitDueDate,        // allow direct dueDate override
+      issueDate: explicitIssueDate     // allow issueDate override (optional)
     } = req.body;
 
     const normalizedPolicy = normalizePaymentPolicy(paymentPolicy);
@@ -1409,7 +1510,8 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
         tenant: {
           include: {
             unit: true,
-            serviceCharge: true
+            serviceCharge: true,
+            freezePeriods: true,   // ── NEW: needed for freeze guard ──
           }
         },
         paymentReport: true
@@ -1456,6 +1558,39 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
         ? toValidDate(invoice.paymentReport.paymentPeriod, invoice.issueDate)
         : toValidDate(invoice.issueDate);
 
+    // ── FREEZE GUARD ──
+    // Re-policying moves the invoice into a new period; if that new period
+    // falls inside a freeze window, the resulting invoice would claim rent
+    // for time the tenant was supposed to be paused. Refuse rather than
+    // silently mis-bill. Note: an EXPLICIT `paymentPeriod` override that
+    // resolves outside the freeze window is allowed.
+    const guardDate = explicitPeriod
+      ? toValidDate(parseExplicitPeriodDate(explicitPeriod) || billingDate, billingDate)
+      : billingDate;
+
+    if (isTenantFrozenOn(invoice.tenant, guardDate)) {
+      const activePeriod = (invoice.tenant.freezePeriods || []).find((p) => {
+        const start = new Date(p.startDate);
+        const end = p.endDate ? new Date(p.endDate) : null;
+        return guardDate >= start && (!end || guardDate <= end);
+      });
+      return res.status(409).json({
+        success: false,
+        code: 'TENANT_FROZEN',
+        message:
+          'Cannot re-policy this invoice into a frozen period. Choose a billingStartDate (or explicit paymentPeriod) outside the freeze window, or unfreeze the tenant first.',
+        billingDate: guardDate.toISOString(),
+        freezeWindow: activePeriod
+          ? {
+              id: activePeriod.id,
+              startDate: activePeriod.startDate,
+              endDate: activePeriod.endDate,
+              reason: activePeriod.reason,
+            }
+          : null,
+      });
+    }
+
     const tenantForCalculation = {
       ...invoice.tenant,
       paymentPolicy: normalizedPolicy
@@ -1469,17 +1604,17 @@ export const updateInvoicePaymentPolicy = async (req, res) => {
       : amountPaid > 0 ? 'PARTIAL'
       : 'UNPAID';
 
-    // NEW: allow explicit label override; otherwise derive from billingDate + policy
+    // Allow explicit label override; otherwise derive from billingDate + policy
     const finalPeriod = explicitPeriod
       ? String(explicitPeriod).trim()
       : buildPaymentPeriodLabel(billingDate, normalizedPolicy);
 
-    // NEW: allow explicit dueDate override; otherwise preserve existing
+    // Allow explicit dueDate override; otherwise preserve existing
     const finalDueDate = explicitDueDate
       ? toValidDate(explicitDueDate, invoice.dueDate)
       : invoice.dueDate;
 
-    // NEW (optional): allow explicit issueDate override; otherwise preserve existing
+    // Allow explicit issueDate override; otherwise preserve existing
     const finalIssueDate = explicitIssueDate
       ? toValidDate(explicitIssueDate, invoice.issueDate)
       : invoice.issueDate;

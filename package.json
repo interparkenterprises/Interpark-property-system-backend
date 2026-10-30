@@ -31,7 +31,7 @@
     "multer": "^2.0.2",
     "node-cache": "^5.1.2",
     "node-cron": "^4.2.1",
-    "nodemailer": "^9.0.5",
+    "nodemailer": "^10.3.1",
     "pdfkit": "^0.17.2",
     "pg": "^8.23.0",
     "puppeteer": "^25.8.0",
@@ -47,8 +47,8 @@
   },
   "allowScripts": {
     "@prisma/client@7.10.0": true,
-    "@prisma/engines@7.10.0": true,
-    "prisma@7.10.0": true,
-    "puppeteer@25.8.0": true
+    "prisma@7.10.1": true,
+    "puppeteer@25.16.0": true,
+    "@prisma/engines@7.10.1": true
   }
 }

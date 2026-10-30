@@ -9,6 +9,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { existsSync } from 'fs';
 import permissionService from "../services/permissionService.js";
+import { isTenantFrozenOn, getFreezePeriodFor } from '../services/tenantFreeze.js';
 
 // Helper: Compute expected rent & service charge for a tenant at a given period
 async function computeExpectedCharges(tenantId, periodStart = null) {
@@ -1048,6 +1049,67 @@ async function resolveNextBillingAnchor(tx, tenant) {
   // 3. Nothing at all — fall back to rentStart
   const rentStart = tenant.rentStart ? new Date(tenant.rentStart) : new Date();
   return new Date(rentStart.getFullYear(), rentStart.getMonth(), 1);
+}
+
+// ======================================================
+// TENANT FREEZE HELPERS
+// ======================================================
+
+/**
+ * Derive freeze status from freezePeriods[] — never trusts tenant.isFrozen alone.
+ */
+function resolveTenantFreezeStatus(tenant, date = new Date()) {
+  if (!tenant) {
+    return { frozen: false, period: null, date, isFrozenFlag: false };
+  }
+
+  const period = getFreezePeriodFor(tenant, date);
+  const frozen = period !== null || isTenantFrozenOn(tenant, date);
+
+  return {
+    frozen,
+    period,
+    date,
+    isFrozenFlag: Boolean(tenant.isFrozen),
+  };
+}
+
+/**
+ * Send a 409 and return the response if the tenant is frozen on `date`.
+ * Returns null when the caller should continue.
+ */
+function blockIfFrozen(res, tenant, date, { action = 'record payments' } = {}) {
+  const status = resolveTenantFreezeStatus(tenant, date);
+  if (!status.frozen) return null;
+
+  const start = status.period?.startDate
+    ? new Date(status.period.startDate).toISOString().slice(0, 10)
+    : 'unknown';
+  const end = status.period?.endDate
+    ? new Date(status.period.endDate).toISOString().slice(0, 10)
+    : 'ongoing';
+  const reason = status.period?.reason || 'No reason specified';
+
+  res.status(409).json({
+    success: false,
+    code: 'TENANT_FROZEN',
+    message: `Cannot ${action} for a frozen tenant. Tenant is frozen from ${start} to ${end}. Reason: ${reason}. Unfreeze the tenant before proceeding.`,
+    data: {
+      tenantId: tenant.id,
+      tenantName: tenant.fullName,
+      isFrozen: true,
+      freezePeriod: status.period
+        ? {
+            id: status.period.id,
+            startDate: status.period.startDate,
+            endDate: status.period.endDate,
+            reason: status.period.reason,
+          }
+        : null,
+    },
+  });
+
+  return res;
 }
 // ======================================================
 // PAYMENT REPORT CRUD OPERATIONS WITH PERMISSIONS
@@ -2627,7 +2689,8 @@ export const createPaymentReport = async (req, res) => {
             }
           }
         },
-        serviceCharge: true
+        serviceCharge: true,
+        freezePeriods: true            // <-- REQUIRED for freeze check
       }
     });
 
@@ -2667,6 +2730,13 @@ export const createPaymentReport = async (req, res) => {
         return res.status(400).json({ success: false, message: 'Invalid paymentPeriod date format' });
       }
     }
+
+    //  FREEZE GUARD
+    const freezeCheckDate = paymentPeriodDate ? paymentPeriodDate : new Date();
+    const frozenResponse = blockIfFrozen(res, tenant, freezeCheckDate, {
+      action: 'record payments'
+    });
+    if (frozenResponse) return frozenResponse;
 
     let existingCredit = 0;
     if (handleOverpayment) {
@@ -3816,8 +3886,12 @@ export const previewPayment = async (req, res) => {
 
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
-      select: { 
+      select: {
+        id: true,
+        fullName: true,
         paymentPolicy: true,
+        isFrozen: true,
+        freezePeriods: true,           // <-- ADDED
         unit: {
           select: {
             propertyId: true
@@ -3835,45 +3909,49 @@ export const previewPayment = async (req, res) => {
     if (userRole !== 'ADMIN') {
       const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
       if (!canView) {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to preview payments for this tenant' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to preview payments for this tenant'
         });
       }
-      
+
       const hasPreviewPermission = await permissionService.hasPermission(
-        userId, 
-        'PREVIEW_PAYMENTS', 
+        userId,
+        'PREVIEW_PAYMENTS',
         propertyId
       );
-      
+
       if (!hasPreviewPermission && userRole !== 'MANAGER') {
-        return res.status(403).json({ 
-          success: false, 
-          message: 'You do not have permission to preview payments' 
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to preview payments'
         });
       }
     }
 
+    const previewDate = paymentPeriod ? new Date(paymentPeriod) : new Date();
+
     const preview = await computeExpectedChargesForPolicy(
       tenantId,
-      paymentPeriod ? new Date(paymentPeriod) : null,
+      previewDate,
       tenant.paymentPolicy || 'MONTHLY'
     );
-    
+
     let creditBalance = 0;
     if (includeCredit) {
       creditBalance = await getTenantCreditBalance(prisma, tenantId);
     }
-    
-    res.json({ 
-      success: true, 
+
+    //  FREEZE CONTEXT (non-blocking — preview is read-only)
+    const freezeStatus = resolveTenantFreezeStatus(tenant, previewDate);
+
+    res.json({
+      success: true,
       data: {
         ...preview,
         existingCredit: creditBalance,
         netDueAfterCredit: Math.max(0, parseFloat((preview.totalDue - creditBalance).toFixed(2))),
         totalAvailable: parseFloat((preview.totalDue + creditBalance).toFixed(2)),
-        // Include withholding tax summary
         withholdingTaxSummary: {
           totalWithheld: preview.withholdingTax?.totalWithheld || 0,
           monthlyWithheld: preview.withholdingTax?.monthlyWithheld || 0,
@@ -3882,11 +3960,28 @@ export const previewPayment = async (req, res) => {
           vatRate: preview.withholdingTax?.vat?.rate || 0,
           rentWithheld: preview.withholdingTax?.rent?.amount || 0,
           vatWithheld: preview.withholdingTax?.vat?.amount || 0,
-          note: preview.withholdingTax?.isExempt 
-            ? 'Tenant is exempt from withholding tax' 
+          note: preview.withholdingTax?.isExempt
+            ? 'Tenant is exempt from withholding tax'
             : preview.withholdingTax?.rent?.rate > 0 || preview.withholdingTax?.vat?.rate > 0
               ? 'Withholding tax applied to this payment'
               : 'No withholding tax configured'
+        },
+        //  FREEZE CONTEXT (non-blocking — preview is read-only)
+        freeze: {
+          isFrozen: freezeStatus.frozen,
+          isFrozenFlag: freezeStatus.isFrozenFlag,
+          canRecordPayment: !freezeStatus.frozen,
+          freezePeriod: freezeStatus.period
+            ? {
+                id: freezeStatus.period.id,
+                startDate: freezeStatus.period.startDate,
+                endDate: freezeStatus.period.endDate,
+                reason: freezeStatus.period.reason
+              }
+            : null,
+          warning: freezeStatus.frozen
+            ? `Tenant is frozen${freezeStatus.period?.reason ? ` (${freezeStatus.period.reason})` : ''}. Payments cannot be recorded until unfrozen.`
+            : null
         }
       }
     });
@@ -3922,7 +4017,8 @@ export const updatePaymentReportWithIncome = async (req, res) => {
                 property: true
               }
             },
-            serviceCharge: true
+            serviceCharge: true,
+            freezePeriods: true            // <-- REQUIRED for freeze check
           }
         },
         invoices: true,
@@ -4029,6 +4125,16 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       `(source=${anchorSource})`
     );
 
+    // ⛔ FREEZE GUARD
+    const freezeCheckDate = paymentPeriod 
+      ? new Date(paymentPeriod) 
+      : (existingReport.paymentPeriod ? new Date(existingReport.paymentPeriod) : new Date());
+    
+    const frozenResponse = blockIfFrozen(res, existingReport.tenant, freezeCheckDate, {
+      action: 'update payment records'
+    });
+    if (frozenResponse) return frozenResponse;
+
     const paymentPolicy = existingReport.tenant.paymentPolicy || 'MONTHLY';
 
     // ─────────────────────────────────────────────
@@ -4063,14 +4169,8 @@ export const updatePaymentReportWithIncome = async (req, res) => {
     // this report. We clamp it to the total due for this anchor period
     // so the report can never show more paid than was billed for the
     // period it represents.
-    //
-    // For "anchor" reports of a split payment (one payment covering
-    // multiple invoices), the ANCHOR report should record only the
-    // amount applied to its own invoice; the rest belongs to the
-    // sibling reports/invoices.
     // ─────────────────────────────────────────────
     const appliedToThisReport = Math.min(parsedAmountPaid, safeTotalDue);
-
     const arrears = parseFloat((safeTotalDue - appliedToThisReport).toFixed(2));
     const status =
       appliedToThisReport >= safeTotalDue
@@ -4158,7 +4258,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       // 2. Re-anchor linked rent invoices to the recomputed period & amounts
       if (existingReport.invoices && existingReport.invoices.length > 0) {
         const balanceForInvoice = arrears > 0 ? arrears : 0;
-
         for (const invoice of existingReport.invoices) {
           await tx.invoice.update({
             where: { id: invoice.id },
@@ -4203,13 +4302,6 @@ export const updatePaymentReportWithIncome = async (req, res) => {
       }
 
       // 4. Update the linked income record (best-effort, time-window match)
-      //
-      // LONG-TERM FIX: use `appliedToThisReport` here, since the income
-      // this report represents is what was actually applied to its own
-      // ledger, not the whole transaction. But the original parsedAmountPaid
-      // may still be the full payment if this report is the anchor for
-      // a split. We use parsedAmountPaid for income to keep income records
-      // aligned with cash actually received.
       const income = await tx.income.findFirst({
         where: {
           tenantId: existingReport.tenantId,
@@ -4390,19 +4482,18 @@ export const updatePaymentReportWithIncome = async (req, res) => {
         const freshInvoices = await prisma.invoice.findMany({
           where: { paymentReportId: result.updatedReport.id }
         });
-
         const freshBillInvoices = await prisma.billInvoice.findMany({
           where: { paymentReportId: result.updatedReport.id }
         });
-
         const allInvoices = [...freshInvoices, ...freshBillInvoices];
 
         let overpaymentAmount = 0;
         let creditUsed = 0;
+
         if (result.updatedReport.notes) {
           const overpaymentMatch = result.updatedReport.notes.match(/Overpayment: Ksh ([\d.]+)/);
           if (overpaymentMatch) overpaymentAmount = parseFloat(overpaymentMatch[1]);
-
+          
           const creditMatch = result.updatedReport.notes.match(/Applied Ksh ([\d.]+) from credit balance/);
           if (creditMatch) creditUsed = parseFloat(creditMatch[1]);
         }
@@ -4956,9 +5047,6 @@ export async function getPropertyArrears(req, res) {
     const userRole = req.user.role;
     const { propertyId } = req.params;
 
-    // =============================================
-    // NEW: tenantStatus query param (ACTIVE | LEFT | ALL)
-    // =============================================
     const tenantStatusParam = (req.query.tenantStatus || 'ACTIVE').toUpperCase();
     const allowedStatuses = ['ACTIVE', 'LEFT', 'ALL'];
 
@@ -4973,9 +5061,6 @@ export async function getPropertyArrears(req, res) {
       return res.status(400).json({ error: 'Property ID is required' });
     }
 
-    // =============================================
-    // Permission checks
-    // =============================================
     if (userRole !== 'ADMIN') {
       const canView = await canViewPaymentsForProperty(userId, userRole, propertyId);
       if (!canView) {
@@ -4998,18 +5083,12 @@ export async function getPropertyArrears(req, res) {
         });
       }
 
-      // =============================================
-      // NEW: Only ADMIN (or MANAGER with explicit permission) can query LEFT/ALL
-      // Non-admin users default to ACTIVE-only
-      // =============================================
       if (tenantStatusParam !== 'ACTIVE') {
         const canQueryFormerTenants =
           userRole === 'MANAGER'
             ? await permissionService.hasPermission(userId, 'VIEW_FORMER_TENANT_ARREARS', propertyId)
             : await permissionService.hasPermission(userId, 'VIEW_FORMER_TENANT_ARREARS', propertyId);
 
-        // Fallback: if the permission doesn't exist yet in your system, allow MANAGER
-        // (Remove this fallback once you add VIEW_FORMER_TENANT_ARREARS to your Permission table)
         const isManagerFallback = userRole === 'MANAGER';
 
         if (!canQueryFormerTenants && !isManagerFallback) {
@@ -5021,17 +5100,6 @@ export async function getPropertyArrears(req, res) {
       }
     }
 
-    // =============================================
-    // Build tenant filter based on tenantStatusParam
-    // =============================================
-    // tenantFilter is used BOTH for:
-    //   1. The unit-level `some` filter (ensure unit has matching tenants)
-    //   2. The `include.tenants.where` filter (load only matching tenants)
-    //
-    // When 'ALL' -> {} (no filter, match any tenant)
-    // When 'ACTIVE' -> { status: 'ACTIVE' }
-    // When 'LEFT' -> { status: 'LEFT' }
-    // =============================================
     const tenantFilter =
       tenantStatusParam === 'ALL'
         ? {}
@@ -5040,8 +5108,6 @@ export async function getPropertyArrears(req, res) {
     const units = await prisma.unit.findMany({
       where: {
         propertyId: propertyId,
-        // Note: keep status OCCUPIED for ACTIVE, but for LEFT/ALL we should NOT
-        // restrict to OCCUPIED because a unit may be vacant after a tenant left.
         ...(tenantStatusParam === 'ACTIVE' ? { status: 'OCCUPIED' } : {}),
         tenants: {
           some: tenantFilter
@@ -5051,6 +5117,7 @@ export async function getPropertyArrears(req, res) {
         tenants: {
           where: tenantFilter,
           include: {
+            freezePeriods: true,       // <-- ADDED
             invoices: {
               where: {
                 status: {
@@ -5086,21 +5153,25 @@ export async function getPropertyArrears(req, res) {
       }
     });
 
-    // =============================================
-    // Process units -> tenants -> invoices
-    // =============================================
     const arrearsData = [];
 
     for (const unit of units) {
       for (const tenant of unit.tenants) {
         const creditBalance = await getTenantCreditBalance(prisma, tenant.id);
 
-        // Include tenant's status so frontend can distinguish ACTIVE vs LEFT
         const tenantStatus = tenant.status;
 
-        // =============================================
+        // FREEZE STATUS (derived from periods, not just the boolean)
+        const freezeStatus = resolveTenantFreezeStatus(tenant, new Date());
+        const freezeMeta = {
+          tenantIsFrozen: freezeStatus.frozen,
+          freezePeriodId: freezeStatus.period?.id || null,
+          freezeReason: freezeStatus.period?.reason || null,
+          freezeStartDate: freezeStatus.period?.startDate || null,
+          freezeEndDate: freezeStatus.period?.endDate || null,
+        };
+
         // Rent invoices
-        // =============================================
         for (const invoice of tenant.invoices) {
           const balance = invoice.balance || (invoice.totalDue - invoice.amountPaid);
 
@@ -5110,7 +5181,8 @@ export async function getPropertyArrears(req, res) {
               tenantId: tenant.id,
               tenantName: tenant.fullName,
               tenantContact: tenant.contact,
-              tenantStatus, // NEW: expose tenant status
+              tenantStatus,
+              ...freezeMeta,                       // <-- ADDED
               unitType: unit.type || 'Unit',
               unitNo: unit.unitNo || 'N/A',
               floor: unit.floor || 'N/A',
@@ -5135,9 +5207,7 @@ export async function getPropertyArrears(req, res) {
           }
         }
 
-        // =============================================
-        // Bill invoices (water/electricity)
-        // =============================================
+        // Bill invoices
         for (const billInvoice of tenant.billInvoices) {
           const balance =
             billInvoice.balance || (billInvoice.grandTotal - billInvoice.amountPaid);
@@ -5148,7 +5218,8 @@ export async function getPropertyArrears(req, res) {
               tenantId: tenant.id,
               tenantName: tenant.fullName,
               tenantContact: tenant.contact,
-              tenantStatus, // NEW: expose tenant status
+              tenantStatus,
+              ...freezeMeta,                       // <-- ADDED
               unitType: unit.type || 'Unit',
               unitNo: unit.unitNo || 'N/A',
               floor: unit.floor || 'N/A',
@@ -5174,18 +5245,12 @@ export async function getPropertyArrears(req, res) {
       }
     }
 
-    // =============================================
-    // Sort: oldest due date first, then largest balance
-    // =============================================
     arrearsData.sort((a, b) => {
       const dateDiff = new Date(a.dueDate) - new Date(b.dueDate);
       if (dateDiff !== 0) return dateDiff;
       return b.balance - a.balance;
     });
 
-    // =============================================
-    // Summary calculations
-    // =============================================
     const totalArrears = arrearsData.reduce((sum, item) => sum + item.balance, 0);
     const totalExpected = arrearsData.reduce((sum, item) => sum + item.expectedAmount, 0);
     const totalPaid = arrearsData.reduce((sum, item) => sum + item.paidAmount, 0);
@@ -5198,14 +5263,20 @@ export async function getPropertyArrears(req, res) {
     const rentInvoices = arrearsData.filter((item) => item.invoiceType === 'RENT').length;
     const billInvoices = arrearsData.filter((item) => item.invoiceType === 'BILL').length;
 
-    // =============================================
-    // NEW: Per-status breakdown (helps when tenantStatus=ALL)
-    // =============================================
     const activeArrears = arrearsData.filter((item) => item.tenantStatus === 'ACTIVE');
     const leftArrears = arrearsData.filter((item) => item.tenantStatus === 'LEFT');
 
     const activeArrearsTotal = activeArrears.reduce((sum, item) => sum + item.balance, 0);
     const leftArrearsTotal = leftArrears.reduce((sum, item) => sum + item.balance, 0);
+
+    // FREEZE BREAKDOWN
+    const frozenArrears = arrearsData.filter((item) => item.tenantIsFrozen);
+    const unfrozenArrears = arrearsData.filter((item) => !item.tenantIsFrozen);
+
+    const frozenArrearsTotal = frozenArrears.reduce((sum, item) => sum + item.balance, 0);
+    const unfrozenArrearsTotal = unfrozenArrears.reduce((sum, item) => sum + item.balance, 0);
+
+    const frozenTenantIds = new Set(frozenArrears.map((item) => item.tenantId));
 
     const overdueCategories = {
       '0-30': arrearsData.filter((item) => item.daysOverdue <= 30).length,
@@ -5217,7 +5288,7 @@ export async function getPropertyArrears(req, res) {
     return res.status(200).json({
       success: true,
       data: {
-        tenantStatusFilter: tenantStatusParam, // echo back what was queried
+        tenantStatusFilter: tenantStatusParam,
         arrears: arrearsData,
         summary: {
           totalArrears: parseFloat(totalArrears.toFixed(2)),
@@ -5239,7 +5310,6 @@ export async function getPropertyArrears(req, res) {
                 )
               : 0,
 
-          // NEW: split between active and left tenant arrears
           byTenantStatus: {
             active: {
               itemCount: activeArrears.length,
@@ -5248,6 +5318,19 @@ export async function getPropertyArrears(req, res) {
             left: {
               itemCount: leftArrears.length,
               totalArrears: parseFloat(leftArrearsTotal.toFixed(2))
+            }
+          },
+
+          // NEW
+          byFreezeStatus: {
+            frozen: {
+              itemCount: frozenArrears.length,
+              tenantCount: frozenTenantIds.size,
+              totalArrears: parseFloat(frozenArrearsTotal.toFixed(2))
+            },
+            unfrozen: {
+              itemCount: unfrozenArrears.length,
+              totalArrears: parseFloat(unfrozenArrearsTotal.toFixed(2))
             }
           }
         }

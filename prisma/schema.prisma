@@ -65,6 +65,8 @@ model User {
   otherIncomesCreated        OtherIncome[]               @relation("OtherIncomeCreator")
   otherIncomesManaged        OtherIncome[]               @relation("OtherIncomeManager")
   otherIncomeAttachments     OtherIncomeAttachment[]     @relation("OtherIncomeAttachmentUploader")
+  frozenTenants   TenantFreezePeriod[] @relation("FreezeActor")
+  unfrozenTenants TenantFreezePeriod[] @relation("UnfreezeActor")
 }
 
 model Landlord {
@@ -434,9 +436,36 @@ model Tenant {
   unit                Unit                 @relation(fields: [unitId], references: [id])
   whatsappLogs        WhatsAppLog[]
 
+  // Denormalized fast-filter flag (source of truth = TenantFreezePeriod)
+  isFrozen        Boolean   @default(false)
+  freezePeriods   TenantFreezePeriod[]
+
   @@index([status])
   @@index([unitId, status])
   @@index([leftAt])
+  @@index([isFrozen])
+}
+
+// ========== TENANT FREEZE / SUSPENSION ==========
+
+model TenantFreezePeriod {
+  id            String    @id @default(uuid())
+  tenantId      String
+  startDate     DateTime                       // business-effective start
+  endDate       DateTime?                      // null = currently frozen
+  reason        String?
+  frozenById    String?
+  unfrozenById  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  frozenBy   User?  @relation("FreezeActor",   fields: [frozenById],   references: [id])
+  unfrozenBy User?  @relation("UnfreezeActor", fields: [unfrozenById], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, startDate, endDate])
+  @@index([endDate])
 }
 
 model ServiceCharge {
