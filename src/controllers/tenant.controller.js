@@ -2910,6 +2910,16 @@ export const uploadAttachment = async (req, res) => {
       });
     }
 
+    // 🔍 DEBUG LOGGING: Track exactly where the file is saved
+    console.log('=========================================');
+    console.log('📁 FILE UPLOAD DEBUG INFO');
+    console.log('Current Working Directory (process.cwd()):', process.cwd());
+    console.log('UPLOAD_DIR Env Variable:', process.env.UPLOAD_DIR || 'Not set (defaults to ./uploads)');
+    console.log('Multer File Destination:', req.file.destination);
+    console.log('Multer Stored Filename:', req.file.filename);
+    console.log('Multer Full File Path:', req.file.path);
+    console.log('=========================================');
+
     const { originalname, filename, path: filePath, mimetype, size } = req.file;
 
     const storedFileName = filename;
@@ -2918,7 +2928,7 @@ export const uploadAttachment = async (req, res) => {
       data: {
         name: originalname,
         fileName: storedFileName,
-        url: storedFileName,
+        url: `/uploads/${storedFileName}`,
         mimeType: mimetype,
         size: size,
         tenantId,
@@ -2979,15 +2989,23 @@ export const previewAttachment = async (req, res) => {
     }
 
     let fileName = attachment.fileName || attachment.url;
-    if (fileName.includes('/') || fileName.includes('\\')) {
-      fileName = fileName.replace(/\\/g, '/').split('/').pop();
-    }
-    
+    // Clean leading slashes or 'uploads/' prefix to prevent double paths
+    fileName = fileName.replace(/^\/+/, '').replace(/^uploads\//i, '');
+
     const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-    const fullPath = path.resolve(uploadDir, fileName);
-    
+    let fullPath = path.resolve(uploadDir, fileName);
+
+    // 🔍 ROBUST FALLBACK: If file not found, check if it's in the 'attachments' subfolder
+    // This gracefully fixes any files uploaded before this code change
+    if (!fs.existsSync(fullPath) && !fileName.includes('attachments/')) {
+      const fallbackPath = path.resolve(uploadDir, 'attachments', fileName);
+      if (fs.existsSync(fallbackPath)) {
+        fullPath = fallbackPath;
+      }
+    }
+
     console.log('Preview - Looking for file at:', fullPath);
-    
+
     if (!fs.existsSync(fullPath)) {
       console.error('Preview - File not found at path:', fullPath);
       return res.status(404).json({
@@ -3027,13 +3045,14 @@ export const updateAttachment = async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    if (!isAdmin(userRole)) {
-      return res.status(403).json({
-        message: 'Access denied. Only admins can edit attachments.',
-        requiredPermission: 'ADMIN'
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Attachment name is required'
       });
     }
 
+    // Find the attachment first to get its tenantId for permission checking
     const attachment = await prisma.attachment.findUnique({
       where: { id: attachmentId }
     });
@@ -3045,40 +3064,29 @@ export const updateAttachment = async (req, res) => {
       });
     }
 
+    // Check if user has edit access to this tenant
     const { hasAccess } = await checkUserTenantAccess(userId, userRole, attachment.tenantId, 'edit');
     if (!hasAccess) {
       return res.status(403).json({
-        message: 'Access denied. You do not have permission to edit attachments for this tenant.',
+        success: false,
+        message: 'Access denied. You do not have permission to update attachments for this tenant.',
         requiredPermission: 'EDIT_TENANT'
       });
     }
 
-    if (!name || typeof name !== 'string' || name.trim() === '') {
-      return res.status(400).json({
-        success: false,
-        message: 'Attachment name is required and must be a non-empty string'
-      });
-    }
-
+    // Update ONLY the display 'name' in the database
+    // IMPORTANT: We do NOT update the 'fileName' field to avoid breaking the file path
     const updatedAttachment = await prisma.attachment.update({
       where: { id: attachmentId },
-      data: { name: name.trim() }
+      data: {
+        name: name.trim()
+      }
     });
 
-    const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
-
-    res.json({
+    res.status(200).json({
       success: true,
-      message: 'Attachment updated successfully',
-      data: {
-        ...updatedAttachment,
-        previewUrl: `${baseUrl}/api/tenants/attachments/${updatedAttachment.id}/preview`,
-        downloadUrl: `${baseUrl}/api/tenants/attachments/${updatedAttachment.id}/download`,
-        canEdit: true,
-        canDelete: true,
-        canDownload: true,
-        canPreview: true
-      }
+      message: 'Attachment renamed successfully',
+      data: updatedAttachment
     });
   } catch (error) {
     console.error('Error updating attachment:', error);
@@ -3126,19 +3134,26 @@ export const deleteAttachment = async (req, res) => {
     }
 
     let fileName = attachment.fileName || attachment.url;
-    if (fileName.includes('/') || fileName.includes('\\')) {
-      fileName = fileName.replace(/\\/g, '/').split('/').pop();
+    // Clean leading slashes or 'uploads/' prefix to prevent double paths
+    fileName = fileName.replace(/^\/+/, '').replace(/^uploads\//i, '');
+
+    const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+    let fullPath = path.resolve(uploadDir, fileName);
+
+    // ROBUST FALLBACK: If file not found, check if it's in the 'attachments' subfolder
+    if (!fs.existsSync(fullPath) && !fileName.includes('attachments/')) {
+      const fallbackPath = path.resolve(uploadDir, 'attachments', fileName);
+      if (fs.existsSync(fallbackPath)) {
+        fullPath = fallbackPath;
+      }
     }
-    
+
+    console.log('Deleting file at:', fullPath);
+
     try {
-      const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-      const fullPath = path.resolve(uploadDir, fileName);
-      
-      console.log('Deleting file at:', fullPath);
-      
       if (fs.existsSync(fullPath)) {
         fs.unlinkSync(fullPath);
-        console.log('File deleted successfully');
+        console.log(' File deleted successfully from disk');
       } else {
         console.log('File not found at:', fullPath);
       }
@@ -3193,15 +3208,22 @@ export const downloadAttachment = async (req, res) => {
     }
 
     let fileName = attachment.fileName || attachment.url;
-    if (fileName.includes('/') || fileName.includes('\\')) {
-      fileName = fileName.replace(/\\/g, '/').split('/').pop();
-    }
-    
+    // Clean leading slashes or 'uploads/' prefix to prevent double paths
+    fileName = fileName.replace(/^\/+/, '').replace(/^uploads\//i, '');
+
     const uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-    const fullPath = path.resolve(uploadDir, fileName);
-    
+    let fullPath = path.resolve(uploadDir, fileName);
+
+    // ROBUST FALLBACK: If file not found, check if it's in the 'attachments' subfolder
+    if (!fs.existsSync(fullPath) && !fileName.includes('attachments/')) {
+      const fallbackPath = path.resolve(uploadDir, 'attachments', fileName);
+      if (fs.existsSync(fallbackPath)) {
+        fullPath = fallbackPath;
+      }
+    }
+
     console.log('Download - Looking for file at:', fullPath);
-    
+
     if (!fs.existsSync(fullPath)) {
       console.error('Download - File not found at path:', fullPath);
       return res.status(404).json({
@@ -3709,6 +3731,10 @@ export const freezeTenant = async (req, res) => {
       if (isNaN(end.getTime())) {
         return res.status(400).json({ message: 'Invalid freezeEndDate.' });
       }
+      
+      //  FIX: Set to the very end of the day in UTC to prevent timezone "still frozen" errors
+      end.setUTCHours(23, 59, 59, 999);
+      
       if (end <= start) {
         return res.status(400).json({
           message: 'freezeEndDate must be after freezeStartDate.',
@@ -3798,7 +3824,21 @@ export const unfreezeTenant = async (req, res) => {
     }
 
     const { unfreezeDate, reason } = req.body || {};
-    const effectiveEnd = unfreezeDate ? new Date(unfreezeDate) : new Date();
+    
+    // FIX: Handle date parsing to prevent UTC timezone "lingering freeze" issues
+    let effectiveEnd = new Date();
+    if (unfreezeDate) {
+      const parsed = new Date(unfreezeDate);
+      // Set to the very end of the selected day in UTC
+      parsed.setUTCHours(23, 59, 59, 999);
+      effectiveEnd = parsed;
+      
+      // If the end of the selected day is somehow already in the past, just unfreeze right now
+      if (effectiveEnd < new Date()) {
+        effectiveEnd = new Date();
+      }
+    }
+
     if (isNaN(effectiveEnd.getTime())) {
       return res.status(400).json({ message: 'Invalid unfreezeDate.' });
     }
@@ -3830,7 +3870,7 @@ export const unfreezeTenant = async (req, res) => {
         },
       });
 
-      // Any other still-open periods? (defensive)
+      // Any other still-open periods? (defensive check)
       const stillOpen = await tx.tenantFreezePeriod.count({
         where: {
           tenantId: tenant.id,
@@ -3841,6 +3881,7 @@ export const unfreezeTenant = async (req, res) => {
 
       const updated = await tx.tenant.update({
         where: { id: tenant.id },
+        // 🚨 FIX: Explicitly set isFrozen to false if no other periods are open
         data: { isFrozen: stillOpen > 0 },
         include: {
           unit: { include: { property: true } },
@@ -3868,7 +3909,6 @@ export const unfreezeTenant = async (req, res) => {
     res.status(400).json({ message: error.message });
   }
 };
-
 // @desc    List a tenant's freeze history + arrears impact
 // @route   GET /api/tenants/:id/freeze-history
 // @access  Private (ADMIN, MANAGER, USER with VIEW_TENANTS)
