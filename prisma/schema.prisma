@@ -501,6 +501,9 @@ model PaymentReport {
   invoices      Invoice[]
   tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   receiptUrl    String?
+
+  @@index([status, paymentPeriod]) // Speeds up the cron job's initial fetch
+  @@index([tenantId, status])  
 }
 
 model Income {

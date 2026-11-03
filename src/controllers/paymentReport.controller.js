@@ -549,7 +549,7 @@ function calculateCoveredBillingPeriods(overpaymentAmount, billingPeriodTotal) {
 }
 
 // Helper: Generate and upload receipt PDF
-async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpaymentAmount = 0, creditUsed = 0) {
+export async function generateAndUploadReceipt(paymentReport, tenant, invoices, overpaymentAmount = 0, creditUsed = 0) {
   try {
     // Get fresh invoices with their current state to ensure accuracy
     const freshInvoices = await prisma.invoice.findMany({

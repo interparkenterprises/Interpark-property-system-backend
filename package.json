@@ -3,14 +3,14 @@
   "version": "1.0.0",
   "main": "server.js",
   "type": "module",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
-    "scheduler": "node src/jobs/reminderJob.js",
-    "scheduler:dev": "nodemon src/jobs/reminderJob.js",
-    "start:all": "concurrently \"npm run start\" \"npm run scheduler\"",
-    "dev:all": "concurrently \"npm run dev\" \"npm run scheduler:dev\""
-  },
+"scripts": {
+  "start": "node server.js",
+  "dev": "nodemon server.js",
+  "scheduler": "node src/jobs/runner.js",
+  "scheduler:dev": "nodemon src/jobs/runner.js",
+  "start:all": "concurrently -k -s first \"npm run start\" \"npm run scheduler\"",
+  "dev:all": "concurrently -k -s first \"npm run dev\" \"npm run scheduler:dev\""
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
