@@ -28,6 +28,7 @@ import rbacRoutes from './routes/rbac.routes.js';
 import employeeRoutes from './routes/employee.routes.js';
 import otherIncomeRoutes from './routes/otherIncome.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
+import servicePersonnelRoutes from './routes/servicePersonnel.routes.js';
 import whatsappRoutes from './routes/whatsapp.routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -99,6 +100,7 @@ app.use('/api/rbac', rbacRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/other-income', otherIncomeRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/service-personnel', servicePersonnelRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 // Basic route for health check
 app.get('/api/health', (req, res) => {
