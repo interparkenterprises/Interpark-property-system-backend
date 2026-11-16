@@ -8,6 +8,7 @@
   "dev": "nodemon server.js",
   "scheduler": "node src/jobs/runner.js",
   "scheduler:dev": "nodemon src/jobs/runner.js",
+  "seed:development": "node prisma/seedDevelopment.js",
   "start:all": "concurrently -k -s first \"npm run start\" \"npm run scheduler\"",
   "dev:all": "concurrently -k -s first \"npm run dev\" \"npm run scheduler:dev\""
 },
