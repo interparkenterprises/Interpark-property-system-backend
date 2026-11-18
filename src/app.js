@@ -30,6 +30,8 @@ import otherIncomeRoutes from './routes/otherIncome.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import servicePersonnelRoutes from './routes/servicePersonnel.routes.js';
 import whatsappRoutes from './routes/whatsapp.routes.js';
+import personnelAuthRoutes from './routes/personnelAuth.routes.js';
+import personnelPortalRoutes from './routes/personnelPortal.routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -57,15 +59,15 @@ app.use(cors({
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"]
 }));
 // SAFE OPTIONS HANDLER (NO ROUTES)
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
     res.header("Access-Control-Allow-Origin", req.headers.origin);
     res.header("Access-Control-Allow-Credentials", "true");
-    res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token");
     return res.sendStatus(204);
   }
   next();
@@ -102,6 +104,8 @@ app.use('/api/employees', employeeRoutes);
 app.use('/api/other-income', otherIncomeRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/service-personnel', servicePersonnelRoutes);
+app.use('/api/personnel-auth', personnelAuthRoutes);
+app.use('/api/personnel-portal', personnelPortalRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 // Basic route for health check
 app.get('/api/health', (req, res) => {

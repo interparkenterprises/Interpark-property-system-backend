@@ -148,16 +148,24 @@ test('property personnel queries scope both personnel selection and returned ass
     servicePersonnel: {
       findMany: async query => {
         receivedQuery = query;
-        return [];
+        return [{
+          id: 'personnel-1',
+          assignments: [
+            { id: 'current', status: 'ACTIVE', startDate: new Date('2026-11-01'), endDate: null },
+            { id: 'upcoming', status: 'ACTIVE', startDate: new Date('2099-11-19'), endDate: null },
+            { id: 'ended', status: 'INACTIVE', startDate: new Date('2026-10-01'), endDate: new Date('2026-10-31') }
+          ]
+        }];
       }
     }
   };
   const service = new ServicePersonnelService(prisma, createPermissions());
 
-  await service.getPropertyPersonnel(manager, 'property-1');
+  const result = await service.getPropertyPersonnel(manager, 'property-1');
 
   assert.equal(receivedQuery.where.assignments.some.propertyId, 'property-1');
   assert.equal(receivedQuery.include.assignments.where.propertyId, 'property-1');
+  assert.deepEqual(result[0].assignments.map(item => item.assignmentTiming), ['CURRENT', 'UPCOMING', 'ENDED']);
 });
 
 test('external personnel retain their provider relationship and require provider-property access', async () => {

@@ -1,3 +1,5 @@
+import { getPersonnelAssignmentTiming } from '../utils/personnelAssignmentTiming.js';
+
 export const SERVICE_CATEGORIES = [
   'CLEANING',
   'SECURITY',
@@ -202,7 +204,7 @@ export class ServicePersonnelService {
         : {})
     };
 
-    return this.prisma.servicePersonnel.findMany({
+    const personnel = await this.prisma.servicePersonnel.findMany({
       where: {
         ...(filters.personnelType
           ? { personnelType: requireEnum(filters.personnelType, PERSONNEL_TYPES, 'personnelType') }
@@ -222,6 +224,14 @@ export class ServicePersonnelService {
       },
       orderBy: [{ status: 'asc' }, { name: 'asc' }]
     });
+
+    return personnel.map(person => ({
+      ...person,
+      assignments: person.assignments.map(assignment => ({
+        ...assignment,
+        assignmentTiming: getPersonnelAssignmentTiming(assignment)
+      }))
+    }));
   }
 
   async getOptions(user, propertyId) {

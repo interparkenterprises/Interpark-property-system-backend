@@ -63,6 +63,8 @@ model User {
   servicePersonnelCreated    ServicePersonnel[]           @relation("ServicePersonnelCreator")
   serviceAssignmentsCreated PropertyServiceAssignment[]  @relation("ServiceAssignmentCreator")
   personnelSchedulesCreated PersonnelSchedule[]           @relation("PersonnelScheduleCreator")
+  servicePersonnel          ServicePersonnel?
+  accountTokens             AccountToken[]
 
     // NEW: Other Income Relations - ADD THESE LINES
   otherIncomesCreated        OtherIncome[]               @relation("OtherIncomeCreator")
@@ -759,18 +761,60 @@ model ServicePersonnel {
   jobRole           String
   status            PersonnelStatus @default(ACTIVE)
   createdById       String
+  userId            String?         @unique
+  portalAccessStatus PersonnelPortalAccessStatus?
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
 
   employee        Employee?        @relation(fields: [employeeId], references: [id], onDelete: SetNull)
   serviceProvider ServiceProvider? @relation(fields: [serviceProviderId], references: [id], onDelete: SetNull)
   createdBy       User             @relation("ServicePersonnelCreator", fields: [createdById], references: [id])
+  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
   assignments     PropertyServiceAssignment[]
 
   @@index([personnelType])
   @@index([serviceProviderId])
   @@index([createdById])
   @@index([status])
+  @@index([portalAccessStatus])
+}
+
+enum AccountTokenType {
+  PERSONNEL_ACTIVATION
+  PERSONNEL_PASSWORD_RESET
+}
+
+enum PersonnelPortalAccessStatus {
+  PENDING_ACTIVATION
+  ACTIVE
+  DISABLED
+}
+
+enum AccountTokenDeliveryStatus {
+  PREPARED
+  ACCEPTED
+  FAILED
+}
+
+model AccountToken {
+  id        String           @id @default(uuid())
+  userId    String
+  type      AccountTokenType
+  tokenHash String           @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime         @default(now())
+  deliveryStatus     AccountTokenDeliveryStatus @default(PREPARED)
+  deliveryAttemptedAt DateTime?
+  deliveredAt        DateTime?
+  providerMessageId  String?
+  deliveryErrorCode  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+  @@index([deliveryStatus])
 }
 
 model PropertyServiceAssignment {
@@ -1227,6 +1271,7 @@ enum Role {
   ADMIN
   MANAGER
   USER
+  PERSONNEL
 }
 
 enum PropertyForm {
