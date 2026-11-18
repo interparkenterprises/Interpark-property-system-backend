@@ -60,6 +60,11 @@ model User {
   approvedTasks              ToDo[]                      @relation("ApprovedTasks")
   reviewedTasks              ToDo[]                      @relation("ReviewedTasks")
   serviceProviderAttachments ServiceProviderAttachment[]
+  servicePersonnelCreated    ServicePersonnel[]           @relation("ServicePersonnelCreator")
+  serviceAssignmentsCreated PropertyServiceAssignment[]  @relation("ServiceAssignmentCreator")
+  personnelSchedulesCreated PersonnelSchedule[]           @relation("PersonnelScheduleCreator")
+  servicePersonnel          ServicePersonnel?
+  accountTokens             AccountToken[]
 
     // NEW: Other Income Relations - ADD THESE LINES
   otherIncomesCreated        OtherIncome[]               @relation("OtherIncomeCreator")
@@ -113,6 +118,7 @@ model Property {
   dailyReports       DailyReport[]
   activationRequests ActivationRequest[]
   demandLetters      DemandLetter[]
+  servicePersonnelAssignments PropertyServiceAssignment[]
 
   // RBAC Relations
   roleAccess CustomRolePropertyAccess[]
@@ -698,6 +704,165 @@ model ServiceProvider {
 
   // NEW: Attachments relation
   attachments ServiceProviderAttachment[]
+  personnel   ServicePersonnel[]
+}
+
+enum ServiceCategory {
+  CLEANING
+  SECURITY
+  CARETAKING
+  LANDSCAPING
+  PLUMBING
+  ELECTRICAL
+  MAINTENANCE
+  WASTE_MANAGEMENT
+  OTHER
+}
+
+enum PersonnelType {
+  INTERNAL
+  EXTERNAL
+}
+
+enum PersonnelStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ServiceAssignmentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ServiceShiftType {
+  DAY
+  NIGHT
+  CUSTOM
+}
+
+enum WeekDay {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+model ServicePersonnel {
+  id                String          @id @default(uuid())
+  personnelType     PersonnelType
+  employeeId        String?         @unique
+  serviceProviderId String?
+  name              String
+  phoneNumber       String?
+  email             String?
+  jobRole           String
+  status            PersonnelStatus @default(ACTIVE)
+  createdById       String
+  userId            String?         @unique
+  portalAccessStatus PersonnelPortalAccessStatus?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  employee        Employee?        @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  serviceProvider ServiceProvider? @relation(fields: [serviceProviderId], references: [id], onDelete: SetNull)
+  createdBy       User             @relation("ServicePersonnelCreator", fields: [createdById], references: [id])
+  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  assignments     PropertyServiceAssignment[]
+
+  @@index([personnelType])
+  @@index([serviceProviderId])
+  @@index([createdById])
+  @@index([status])
+  @@index([portalAccessStatus])
+}
+
+enum AccountTokenType {
+  PERSONNEL_ACTIVATION
+  PERSONNEL_PASSWORD_RESET
+}
+
+enum PersonnelPortalAccessStatus {
+  PENDING_ACTIVATION
+  ACTIVE
+  DISABLED
+}
+
+enum AccountTokenDeliveryStatus {
+  PREPARED
+  ACCEPTED
+  FAILED
+}
+
+model AccountToken {
+  id        String           @id @default(uuid())
+  userId    String
+  type      AccountTokenType
+  tokenHash String           @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime         @default(now())
+  deliveryStatus     AccountTokenDeliveryStatus @default(PREPARED)
+  deliveryAttemptedAt DateTime?
+  deliveredAt        DateTime?
+  providerMessageId  String?
+  deliveryErrorCode  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+  @@index([deliveryStatus])
+}
+
+model PropertyServiceAssignment {
+  id              String                  @id @default(uuid())
+  personnelId     String
+  propertyId      String
+  serviceCategory ServiceCategory
+  jobRole         String
+  startDate       DateTime                @default(now())
+  endDate         DateTime?
+  status          ServiceAssignmentStatus @default(ACTIVE)
+  notes           String?
+  createdById     String
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  personnel ServicePersonnel @relation(fields: [personnelId], references: [id], onDelete: Cascade)
+  property  Property         @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  createdBy User             @relation("ServiceAssignmentCreator", fields: [createdById], references: [id])
+  schedules PersonnelSchedule[]
+
+  @@index([personnelId])
+  @@index([propertyId, status])
+  @@index([serviceCategory])
+  @@index([startDate, endDate])
+}
+
+model PersonnelSchedule {
+  id            String           @id @default(uuid())
+  assignmentId  String
+  dayOfWeek     WeekDay
+  shiftType     ServiceShiftType @default(DAY)
+  startTime     String?
+  endTime       String?
+  effectiveFrom DateTime         @default(now())
+  effectiveTo   DateTime?
+  isActive      Boolean          @default(true)
+  notes         String?
+  createdById   String
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  assignment PropertyServiceAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  createdBy  User                      @relation("PersonnelScheduleCreator", fields: [createdById], references: [id])
+
+  @@index([assignmentId, isActive])
+  @@index([dayOfWeek, shiftType])
+  @@index([effectiveFrom, effectiveTo])
 }
 
 model Bill {
@@ -1106,6 +1271,7 @@ enum Role {
   ADMIN
   MANAGER
   USER
+  PERSONNEL
 }
 
 enum PropertyForm {
@@ -1298,6 +1464,7 @@ model Employee {
   status           EmployeeStatus   @default(ACTIVE)
 
   salaryPayments SalaryPayment[]
+  servicePersonnel ServicePersonnel?
 
   createdBy User @relation("EmployeeCreator", fields: [createdById], references: [id])
 

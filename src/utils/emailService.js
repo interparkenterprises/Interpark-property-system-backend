@@ -1,8 +1,13 @@
 // utils/emailService.js
 import { Resend } from 'resend';
 
-// Initialize Resend
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Initialize lazily so missing email credentials never prevent API startup.
+let resend;
+const getResend = () => {
+  if (!process.env.RESEND_API_KEY) return null;
+  resend ||= new Resend(process.env.RESEND_API_KEY);
+  return resend;
+};
 
 export function generateSecurePassword() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%';
@@ -30,6 +35,7 @@ export async function sendWelcomeEmail({ email, name, temporaryPassword, role, l
     console.log(`====================`);
     return { success: false, error: 'Missing API key' };
   }
+  const emailClient = getResend();
   
   // Format the FROM email properly
   let fromEmail = process.env.EMAIL_FROM;
@@ -53,7 +59,7 @@ export async function sendWelcomeEmail({ email, name, temporaryPassword, role, l
   try {
     console.log(`📧 Sending via Resend from: ${fromEmail}`);
     
-    const { data, error } = await resend.emails.send({
+    const { data, error } = await emailClient.emails.send({
       from: fromEmail,
       to: email,
       subject: `Welcome to Interpark Property System - ${role} Access`,

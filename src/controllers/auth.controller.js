@@ -203,6 +203,13 @@ export const loginUser = async (req, res) => {
     });
 
     if (user && (await comparePassword(password, user.password))) {
+      // Personnel authentication is intentionally isolated from the ERP login flow.
+      // A dedicated portal login endpoint will be introduced in a later milestone.
+      if (user.role === 'PERSONNEL') {
+        return res.status(403).json({
+          message: 'Personnel accounts cannot sign in through the ERP login.'
+        });
+      }
       
       // Check if managed user's creator still exists and is active
       // Allow both MANAGER and ADMIN as valid creators
