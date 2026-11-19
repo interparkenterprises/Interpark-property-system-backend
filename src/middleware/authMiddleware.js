@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import prisma from '../lib/prisma.js';
+import permissionService from '../services/permissionService.js';
 
 export const protect = async (req, res, next) => {
   try {
@@ -20,7 +21,7 @@ export const protect = async (req, res, next) => {
 
     // If no token found, return unauthorized
     if (!token) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         message: 'Not authorized, no token',
         debug: {
           hasAuthHeader: !!req.headers.authorization,
@@ -32,17 +33,19 @@ export const protect = async (req, res, next) => {
 
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      
+
       // Handle both userId and id from token
       const userId = decoded.userId || decoded.id;
-      
-      // Select only fields that exist in your User model
+
+      // Select only fields that exist in your User model.
+      // accountStatus + *ProfileId are new (Stage 1 migration) and are
+      // what the portal scope middleware will read downstream.
       const user = await prisma.user.findUnique({
         where: { id: userId },
-        select: { 
-          id: true, 
-          email: true, 
-          name: true, 
+        select: {
+          id: true,
+          email: true,
+          name: true,
           role: true,
           isApproved: true,
           isManagedUser: true,
@@ -51,7 +54,11 @@ export const protect = async (req, res, next) => {
           updatedAt: true,
           lastLoginAt: true,
           passwordChangedAt: true,
-          // Remove requiresPasswordChange - it doesn't exist
+          // ── New: portal plumbing ──────────────────────
+          accountStatus: true,
+          landlordProfileId: true,
+          tenantProfileId: true,
+          serviceProviderProfileId: true,
         }
       });
 
@@ -59,18 +66,31 @@ export const protect = async (req, res, next) => {
         return res.status(401).json({ message: 'Not authorized, user not found' });
       }
 
+      // Account-status gate (defense in depth). A user who is suspended,
+      // disabled, or still pending invitation MUST NOT be able to use any
+      // endpoint, even with an unexpired JWT. For staff roles this field
+      // is always 'ACTIVE', so staff behavior is unchanged.
+      if (user.accountStatus && user.accountStatus !== 'ACTIVE') {
+        return res.status(403).json({
+          message: 'Account is not active. Please contact your administrator.',
+          accountStatus: user.accountStatus,
+        });
+      }
+
       // Check if user is approved
       if (user.isApproved === false) {
-        return res.status(403).json({ message: 'Account is not approved. Please wait for admin approval.' });
+        return res.status(403).json({
+          message: 'Account is not approved. Please wait for admin approval.'
+        });
       }
 
       req.user = user;
       next();
     } catch (error) {
       console.error('Token verification error:', error.message);
-      return res.status(401).json({ 
+      return res.status(401).json({
         message: 'Not authorized, token failed',
-        error: error.message 
+        error: error.message
       });
     }
   } catch (error) {
@@ -91,38 +111,43 @@ export const adminProtect = async (req, res, next) => {
   }
 };
 
-// Optional: Middleware to check if user has specific permissions
+// Middleware to check if the user has a specific permission code.
+//
+// Delegates to permissionService.hasPermission, which already knows how
+// to (a) grant ADMIN unconditionally, (b) honour custom-role permissions
+// granted via CustomRolePermission, and (c) honour property-scoped
+// overrides when a propertyId is supplied. The previous implementation
+// tried to `include: { role: ... }` on User, which is a Prisma error
+// because `User.role` is an enum, not a relation — so every route using
+// this middleware previously returned a 500. This rewrite is a strict
+// fix; the call signature requirePermission('CODE') is unchanged.
 export const requirePermission = (permissionCode) => {
   return async (req, res, next) => {
     try {
-      const userId = req.user.id;
-      
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        include: {
-          role: {
-            include: {
-              permissions: true
-            }
-          }
-        }
-      });
-      
-      const hasPermission = user?.role?.permissions?.some(
-        p => p.code === permissionCode || p.code === '*'
-      );
-      
-      const isAdmin = user?.role === 'ADMIN';
-      const isManager = user?.role === 'MANAGER';
-      
-      if (hasPermission || isAdmin || isManager) {
-        next();
-      } else {
-        res.status(403).json({ 
-          message: 'Permission denied',
-          requiredPermission: permissionCode
-        });
+      if (!req.user || !req.user.id) {
+        return res.status(401).json({ message: 'Not authorized' });
       }
+
+      // Allow callers to scope by property when they have it.
+      // Falls back to a global check when not supplied.
+      const propertyId =
+        req.params?.propertyId ||
+        req.params?.id ||
+        req.body?.propertyId ||
+        null;
+
+      const has = await permissionService.hasPermission(
+        req.user.id,
+        permissionCode,
+        propertyId || null
+      );
+
+      if (has) return next();
+
+      return res.status(403).json({
+        message: 'Permission denied',
+        requiredPermission: permissionCode,
+      });
     } catch (error) {
       console.error('Permission check error:', error);
       res.status(500).json({ message: 'Server error checking permissions' });

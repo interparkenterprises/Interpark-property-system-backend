@@ -67,6 +67,18 @@ model User {
   otherIncomeAttachments     OtherIncomeAttachment[]     @relation("OtherIncomeAttachmentUploader")
   frozenTenants   TenantFreezePeriod[] @relation("FreezeActor")
   unfrozenTenants TenantFreezePeriod[] @relation("UnfreezeActor")
+
+    // ── Portal account state ──────────────────────────────
+  accountStatus           UserAccountStatus @default(ACTIVE)
+
+  // ── Portal profile links (one profile per portal user) ─
+  landlordProfileId        String?  @unique
+  tenantProfileId          String?  @unique
+  serviceProviderProfileId String?  @unique
+
+  landlordProfile          Landlord?        @relation("LandlordUser",         fields: [landlordProfileId],        references: [id])
+  tenantProfile            Tenant?          @relation("TenantUser",           fields: [tenantProfileId],          references: [id])
+  serviceProviderProfile   ServiceProvider? @relation("ServiceProviderUser",  fields: [serviceProviderProfileId], references: [id])
 }
 
 model Landlord {
@@ -81,6 +93,7 @@ model Landlord {
   offerLetters  OfferLetter[]
   properties    Property[]
   demandLetters DemandLetter[]
+  users  User[]  @relation("LandlordUser")
 }
 
 model Property {
@@ -117,6 +130,7 @@ model Property {
   // RBAC Relations
   roleAccess CustomRolePropertyAccess[]
   userAccess PropertyAccess[]
+  serviceProviderLinks  ServiceProviderProperty[]
 }
 
 
@@ -440,6 +454,8 @@ model Tenant {
   isFrozen        Boolean   @default(false)
   freezePeriods   TenantFreezePeriod[]
 
+  users  User[]  @relation("TenantUser")
+
   @@index([status])
   @@index([unitId, status])
   @@index([leftAt])
@@ -687,6 +703,7 @@ model ServiceProvider {
   id              String          @id @default(uuid())
   propertyId      String
   name            String
+  email           String?
   contact         String?
   contractPeriod  String?
   serviceContract String?
@@ -698,6 +715,24 @@ model ServiceProvider {
 
   // NEW: Attachments relation
   attachments ServiceProviderAttachment[]
+  users             User[]                      @relation("ServiceProviderUser")
+  propertyLinks     ServiceProviderProperty[]
+}
+
+model ServiceProviderProperty {
+  id                String    @id @default(uuid())
+  serviceProviderId String
+  propertyId        String
+  isActive          Boolean   @default(true)
+  assignedAt        DateTime  @default(now())
+  assignedById      String?
+
+  serviceProvider ServiceProvider @relation(fields: [serviceProviderId], references: [id], onDelete: Cascade)
+  property        Property        @relation(fields: [propertyId],        references: [id], onDelete: Cascade)
+
+  @@unique([serviceProviderId, propertyId])
+  @@index([serviceProviderId, isActive])
+  @@index([propertyId, isActive])
 }
 
 model Bill {
@@ -1106,6 +1141,16 @@ enum Role {
   ADMIN
   MANAGER
   USER
+  LANDLORD
+  TENANT
+  SERVICE_PROVIDER
+}
+
+enum UserAccountStatus {
+  PENDING_INVITATION
+  ACTIVE
+  SUSPENDED
+  DISABLED
 }
 
 enum PropertyForm {

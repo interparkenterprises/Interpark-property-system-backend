@@ -29,7 +29,10 @@ import employeeRoutes from './routes/employee.routes.js';
 import otherIncomeRoutes from './routes/otherIncome.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import whatsappRoutes from './routes/whatsapp.routes.js';
-
+import landlordPortalRoutes from './routes/landlordPortal.routes.js';
+import tenantPortalRoutes from './routes/tenantPortal.routes.js';
+import servicePortalRoutes from './routes/serviceProviderPortal.routes.js';
+import serviceProviderAssignmentRoutes from './routes/serviceProviderAssignment.routes.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -37,7 +40,7 @@ const app = express();
 
 // Middleware
 const allowedOrigins = [
-  "https://interpark-property-system-frontend-chi.vercel.app",
+  //"https://interpark-property-system-frontend-chi.vercel.app",
   "https://www.interparkpropertysystem.co.ke",
   "http://localhost:3000"
 ];
@@ -79,6 +82,7 @@ app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/api/auth', authRoutes);
 app.use('/api/landlords', landlordRoutes);
 app.use('/api/properties', propertyRoutes);
+app.use('/api/properties/:propertyId/service-providers', serviceProviderAssignmentRoutes);
 app.use('/api/units', unitRoutes);
 app.use('/api/tenants', tenantRoutes);
 app.use('/api/payments', paymentRoutes);
@@ -100,6 +104,9 @@ app.use('/api/employees', employeeRoutes);
 app.use('/api/other-income', otherIncomeRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
+app.use('/api/portal/landlord', landlordPortalRoutes);
+app.use('/api/portal/tenant', tenantPortalRoutes);
+app.use('/api/portal/provider', servicePortalRoutes);
 // Basic route for health check
 app.get('/api/health', (req, res) => {
   res.json({ message: 'Property Management API is running!' });

@@ -283,6 +283,12 @@ class PermissionService {
 
   // ======================================================
   // PROPERTY ACCESS CHECK (WITH CACHE)
+  //   - Loads the user once, before branching, so we can honour
+  //     portal-role profile links without a second DB hit.
+  //   - Adds explicit branches for LANDLORD / TENANT /
+  //     SERVICE_PROVIDER. Those branches return before the
+  //     existing MANAGER/ADMIN logic and are keyed on role name,
+  //     so ADMIN / MANAGER / USER behavior is unchanged.
   // ======================================================
   async checkPropertyAccess(userId, propertyId, requiredPermission = 'canView') {
     const cacheKey = cacheService.getPropertyAccessKey(userId, propertyId);
@@ -291,6 +297,99 @@ class PermissionService {
     const cached = cacheService.get(cacheKey);
     if (cached && cached[requiredPermission] !== undefined) {
       return cached[requiredPermission];
+    }
+
+    // -------------------------------
+    // Load user role + portal links once
+    // -------------------------------
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        role: true,
+        landlordProfileId: true,
+        tenantProfileId: true,
+        serviceProviderProfileId: true
+      }
+    });
+
+    // ======================================================
+    // PORTAL ROLE BRANCHES
+    // Semantics:
+    //   LANDLORD         → property.landlordId === user.landlordProfileId
+    //   TENANT           → user.tenantProfileId has an ACTIVE tenancy on a
+    //                      Unit of this property. TENANT can only ever
+    //                      satisfy canView; canEdit/canDelete/canExport
+    //                      return false unconditionally.
+    //   SERVICE_PROVIDER → user.serviceProviderProfileId has an ACTIVE
+    //                      ServiceProviderProperty row (or the legacy
+    //                      single propertyId) for this property. Same
+    //                      read-only restriction as TENANT.
+    // ======================================================
+    if (user?.role === 'LANDLORD') {
+      if (!user.landlordProfileId) {
+        cacheService.set(cacheKey, { [requiredPermission]: false });
+        return false;
+      }
+      const property = await prisma.property.findUnique({
+        where: { id: propertyId },
+        select: { landlordId: true }
+      });
+      const isOwner = property?.landlordId === user.landlordProfileId;
+      cacheService.set(cacheKey, { [requiredPermission]: isOwner });
+      return isOwner;
+    }
+
+    if (user?.role === 'TENANT') {
+      if (!user.tenantProfileId) {
+        cacheService.set(cacheKey, { [requiredPermission]: false });
+        return false;
+      }
+      // Tenants never get edit/delete/export on a property.
+      if (requiredPermission !== 'canView') {
+        cacheService.set(cacheKey, { [requiredPermission]: false });
+        return false;
+      }
+      const tenant = await prisma.tenant.findUnique({
+        where: { id: user.tenantProfileId },
+        select: {
+          status: true,
+          unit: { select: { propertyId: true } }
+        }
+      });
+      const isOwnActiveTenancy =
+        tenant?.status === 'ACTIVE' &&
+        tenant?.unit?.propertyId === propertyId;
+      cacheService.set(cacheKey, { [requiredPermission]: isOwnActiveTenancy });
+      return isOwnActiveTenancy;
+    }
+
+    if (user?.role === 'SERVICE_PROVIDER') {
+      if (!user.serviceProviderProfileId) {
+        cacheService.set(cacheKey, { [requiredPermission]: false });
+        return false;
+      }
+      // Service providers never get edit/delete/export on a property.
+      if (requiredPermission !== 'canView') {
+        cacheService.set(cacheKey, { [requiredPermission]: false });
+        return false;
+      }
+      const [link, provider] = await Promise.all([
+        prisma.serviceProviderProperty.findFirst({
+          where: {
+            serviceProviderId: user.serviceProviderProfileId,
+            propertyId,
+            isActive: true
+          },
+          select: { id: true }
+        }),
+        prisma.serviceProvider.findUnique({
+          where: { id: user.serviceProviderProfileId },
+          select: { propertyId: true }
+        })
+      ]);
+      const hasAccess = !!link || provider?.propertyId === propertyId;
+      cacheService.set(cacheKey, { [requiredPermission]: hasAccess });
+      return hasAccess;
     }
 
     // -------------------------------
@@ -405,11 +504,6 @@ class PermissionService {
     // -------------------------------
     // ADMIN CHECK
     // -------------------------------
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { role: true }
-    });
-
     const isAdmin = user?.role === 'ADMIN';
 
     cacheService.set(cacheKey, { [requiredPermission]: isAdmin });
@@ -662,12 +756,31 @@ class PermissionService {
 
   // ======================================================
   // ACCESSIBLE PROPERTIES (WITH CACHE)
+  //
+  // Stage 3:
+  //   - Portal roles short-circuit to getPortalAccessiblePropertyIds.
+  //   - ADMIN / MANAGER / USER flow through the existing logic
+  //     unchanged (the portal branch is keyed on role name, so it
+  //     cannot be reached by a staff role).
   // ======================================================
   async getAccessiblePropertyIds(userId, userRole) {
     const cacheKey = cacheService.getAccessiblePropertiesKey(userId, userRole);
 
     const cached = cacheService.get(cacheKey);
     if (cached) return cached;
+
+    // ======================================================
+    // PORTAL ROLE BRANCHES (Stage 3)
+    // ======================================================
+    if (
+      userRole === 'LANDLORD' ||
+      userRole === 'TENANT' ||
+      userRole === 'SERVICE_PROVIDER'
+    ) {
+      const portalIds = await this.getPortalAccessiblePropertyIds(userId, userRole);
+      cacheService.set(cacheKey, portalIds);
+      return portalIds;
+    }
 
     if (userRole === 'ADMIN') {
       const all = await prisma.property.findMany({ select: { id: true } });
@@ -714,6 +827,82 @@ class PermissionService {
     cacheService.set(cacheKey, ids);
 
     return ids;
+  }
+
+  // ======================================================
+  // PORTAL ACCESSIBLE PROPERTIES (Stage 3 — NEW)
+  //
+  // Reachable set for a portal user is derived exclusively from
+  // their profile link on User. No PropertyAccess, no CustomRole,
+  // no managerId. This is what portalScopeMiddleware attaches to
+  // req.<scope>PropertyIds.
+  // ======================================================
+  async getPortalAccessiblePropertyIds(userId, userRole) {
+    if (userRole === 'LANDLORD') {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { landlordProfileId: true }
+      });
+      if (!user?.landlordProfileId) return [];
+
+      const properties = await prisma.property.findMany({
+        where: { landlordId: user.landlordProfileId },
+        select: { id: true }
+      });
+      return properties.map(p => p.id);
+    }
+
+    if (userRole === 'TENANT') {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { tenantProfileId: true }
+      });
+      if (!user?.tenantProfileId) return [];
+
+      const tenant = await prisma.tenant.findUnique({
+        where: { id: user.tenantProfileId },
+        select: {
+          status: true,
+          unit: { select: { propertyId: true } }
+        }
+      });
+
+      if (!tenant?.unit?.propertyId) return [];
+
+      // A tenant keeps read access to their own property even after
+      // leaving, so they can still reach their own historical records.
+      // Whether a specific endpoint should stop returning data after
+      // `leftAt` is a controller-level decision.
+      return [tenant.unit.propertyId];
+    }
+
+    if (userRole === 'SERVICE_PROVIDER') {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { serviceProviderProfileId: true }
+      });
+      if (!user?.serviceProviderProfileId) return [];
+
+      const [links, provider] = await Promise.all([
+        prisma.serviceProviderProperty.findMany({
+          where: {
+            serviceProviderId: user.serviceProviderProfileId,
+            isActive: true
+          },
+          select: { propertyId: true }
+        }),
+        prisma.serviceProvider.findUnique({
+          where: { id: user.serviceProviderProfileId },
+          select: { propertyId: true }
+        })
+      ]);
+
+      const ids = new Set(links.map(l => l.propertyId));
+      if (provider?.propertyId) ids.add(provider.propertyId);
+      return Array.from(ids);
+    }
+
+    return [];
   }
 
   // ======================================================
