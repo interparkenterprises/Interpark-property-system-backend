@@ -512,20 +512,20 @@ export const generateOfferLetterPDF = async (req, res) => {
       propertyAddress: offerLetter.property.address,
       propertyPOBox: propertyAddressData.poBox,
       propertyLRNumber: offerLetter.property.lrNumber,
-      
+
       // Landlord details - FIXED P.O. Box handling
       landlordName: offerLetter.property.landlord?.name,
       landlordPOBox: landlordAddressData.poBox, // Now properly extracted
       landlordAddress: offerLetter.property.landlord?.address,
       landlordIDNumber: offerLetter.property.landlord?.idNumber,
-      
+
       // Bank details from property
       landlordBankAccount: offerLetter.property.accountNo,
       landlordAccountName: offerLetter.property.accountName,
       landlordBankName: offerLetter.property.bank,
       landlordBankBranch: offerLetter.property.branch,
       landlordBankBranchCode: offerLetter.property.branchCode,
-      
+
       // Lead details - FIXED P.O. Box handling
       leadName: offerLetter.lead.name,
       leadEmail: offerLetter.lead.email,
@@ -535,7 +535,7 @@ export const generateOfferLetterPDF = async (req, res) => {
       leadPINNumber: offerLetter.lead.pinNumber,
       leadCompanyName: offerLetter.lead.companyName,
       leadPhone: offerLetter.lead.phone,
-      
+
       // Offer details - FIXED: Always provide valid dates
       date: new Date().toISOString(), // Current date for the agreement
       offerNumber: offerLetter.offerNumber,
@@ -546,14 +546,14 @@ export const generateOfferLetterPDF = async (req, res) => {
       escalationRate: offerLetter.escalationRate,
       leaseStartDate: offerLetter.leaseStartDate || new Date().toISOString(), // Fallback to current date
       rentStartDate: offerLetter.rentStartDate || new Date().toISOString(), // Fallback to current date
-      
+
       // Additional terms
       additionalTerms: offerLetter.additionalTerms
     };
 
     // Generate HTML based on letter type
     let htmlContent;
-    
+
     if (offerLetter.letterType === 'COMMERCIAL') {
       const commercialData = {
         ...baseTemplateData,
@@ -562,20 +562,20 @@ export const generateOfferLetterPDF = async (req, res) => {
         areaSqFt: offerLetter.unit?.sizeSqFt,
         rentPerSqFt: metadata.rentPerSqFt || (offerLetter.unit?.sizeSqFt ? offerLetter.rentAmount / offerLetter.unit.sizeSqFt : null),
         serviceChargePerSqFt: metadata.serviceChargePerSqFt,
-        
+
         // Commercial-specific
         useOfPremises: metadata.useOfPremises || offerLetter.unit?.usage || 'General Business',
         fitOutPeriod: metadata.fitOutPeriodMonths ? true : false,
         fitOutPeriodMonths: metadata.fitOutPeriodMonths,
         depositMonths: metadata.depositMonths || 1,
         advanceRentMonths: metadata.advanceRentMonths || 1,
-        
+
         // Calculate advance rent
         advanceRent: (offerLetter.rentAmount + (offerLetter.serviceCharge || 0)) * (metadata.advanceRentMonths || 1),
-        
+
         // Escalation
         serviceChargeEscalationRate: metadata.serviceChargeEscalationRate || 5,
-        
+
         // Defaults
         vatRate: 16,
         interestRate: 15,
@@ -587,7 +587,7 @@ export const generateOfferLetterPDF = async (req, res) => {
         includeTerraceArea: false,
         separateWaterElectricity: true
       };
-      
+
       htmlContent = generateCommercialOfferLetter(commercialData);
     } else {
       // RESIDENTIAL - FIXED field mappings and DATE FIXES
@@ -598,11 +598,11 @@ export const generateOfferLetterPDF = async (req, res) => {
         bedrooms: offerLetter.unit?.bedrooms,  // FIXED: Now properly passed
         bathrooms: offerLetter.unit?.bathrooms, // FIXED: Now properly passed
         floorNumber: offerLetter.unit?.floor,   // FIXED: Now properly passed
-        
+
         // Residential-specific
         escalationFrequency: metadata.escalationFrequency || 'ANNUALLY'
       };
-      
+
       htmlContent = generateResidentialOfferLetter(residentialData);
     }
 
@@ -610,12 +610,22 @@ export const generateOfferLetterPDF = async (req, res) => {
     const pdfBuffer = await generatePDF(htmlContent);
 
     // Upload to storage
-    const documentUrl = await uploadDocument(
+    // FIX: uploadDocument returns { url, fullPath } — extract the url string
+    const uploadResult = await uploadDocument(
       pdfBuffer,
       `offer-letters/${offerLetter.offerNumber}.pdf`
     );
 
-    // Update offer letter with document URL
+    // Handle both possible return shapes for safety
+    // (string if helper changes, or { url } object)
+    const documentUrl =
+      typeof uploadResult === 'string' ? uploadResult : uploadResult?.url;
+
+    if (!documentUrl) {
+      throw new Error('uploadDocument did not return a valid URL');
+    }
+
+    // Update offer letter with document URL (String field in schema)
     const updatedOfferLetter = await prisma.offerLetter.update({
       where: { id: offerLetter.id },
       data: { documentUrl }
